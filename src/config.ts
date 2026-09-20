@@ -106,10 +106,19 @@ function readPositiveIntList(
 
 function readUrl(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
   const value = readString(env, key, fallback);
+  let parsed: URL;
   try {
-    new URL(value);
+    parsed = new URL(value);
   } catch {
     throw new Error(`Invalid ${key}: "${value}" is not a valid URL`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(
+      `Invalid ${key}: expected an http:// or https:// URL, got "${value}" (protocol "${parsed.protocol}")`,
+    );
+  }
+  if (parsed.hostname === "") {
+    throw new Error(`Invalid ${key}: expected a non-empty hostname, got "${value}"`);
   }
   return value;
 }
