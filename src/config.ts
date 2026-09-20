@@ -104,7 +104,7 @@ function readPositiveIntList(
   });
 }
 
-function readHttpUrl(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
+function readUrl(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
   const value = readString(env, key, fallback);
   let parsed: URL;
   try {
@@ -149,7 +149,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SplashConfig {
   const repoRoot = readString(env, "SPLASH_REPO_ROOT", "");
   return {
     backend: {
-      baseUrl: readHttpUrl(env, "SPLASH_BACKEND_BASE_URL", CONFIG_DEFAULTS.backend.baseUrl),
+      baseUrl: readUrl(env, "SPLASH_BACKEND_BASE_URL", CONFIG_DEFAULTS.backend.baseUrl),
       model: readString(env, "SPLASH_BACKEND_MODEL", CONFIG_DEFAULTS.backend.model),
     },
     repoRoot: repoRoot !== "" ? path.resolve(expandHome(repoRoot)) : undefined,
