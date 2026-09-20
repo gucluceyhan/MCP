@@ -1,0 +1,27 @@
+{
+  "name": "splash-mcp",
+  "version": "0.1.0",
+  "description": "Splash — local LLM coding worker behind MCP (stdio). The frontier orchestrator delegates implementation; see DESIGN.md.",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/index.js",
+  "bin": {
+    "splash-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^5.5.0"
+  }
+}
