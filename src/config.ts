@@ -132,7 +132,29 @@ function readUrl(env: NodeJS.ProcessEnv, key: string, fallback: string): string 
   if (parsed.hostname === "") {
     throw new Error(`Invalid ${key}: expected a non-empty hostname, got "${value}"`);
   }
-  return value;
+  // Gömülü kimlik bilgisi (user:pass@) bir yanlış yapılandırmadır —
+  // kanonik formda sessizce düşerdi; auth `SPLASH_API_KEY` ile taşınır.
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new Error(
+      `Invalid ${key}: expected a server origin (no embedded credentials; use SPLASH_API_KEY for auth), got "${value}"`,
+    );
+  }
+  // v1 kararı (DESIGN.md 2.5): base URL yalnızca sunucu KÖKENİ'dir.
+  // Kök dışı path prefix'i, query string ve fragment config load'da reddedilir —
+  // sessizce atılmaz (adapter prefix'siz istek üretirdi; şimdi açık hata).
+  if (parsed.pathname !== "" && parsed.pathname !== "/") {
+    throw new Error(`Invalid ${key}: expected a server origin (no path prefix), got "${value}"`);
+  }
+  if (parsed.search !== "") {
+    throw new Error(`Invalid ${key}: expected a server origin (no query string), got "${value}"`);
+  }
+  if (parsed.hash !== "") {
+    throw new Error(`Invalid ${key}: expected a server origin (no fragment), got "${value}"`);
+  }
+  // Kanonik form: kök slash düşer — `new URL(absolutePath, baseUrl)` her
+  // çağrıda aynı, deterministik sonucu versin. Varsayılan
+  // `http://127.0.0.1:8000` bu biçimde birebir kendine eşit.
+  return `${parsed.protocol}//${parsed.host}`;
 }
 
 function expandHome(value: string): string {

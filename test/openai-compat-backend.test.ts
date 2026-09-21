@@ -5,9 +5,11 @@
  * her istek (metot, yol, header'lar, gövde) yakalanır ve test bazında hazır
  * (canned) JSON döndürülür. Gerçek modele hiç dokunulmaz.
  *
- * Testler BUILT çıktıyı (dist/) import eder: `npm test` önce build çalıştırır
- * (pretest) ve `tsconfig.test.json` bu dosyayı emit edilmiş deklarasyon
- * dosyaları karşısında tip kontrolü yapar.
+ * Testler BUILT çıktıyı (dist/) import eder: `npm test` önce build + test
+ * derlemesini çalıştırır (pretest: dist/ ve dist-test/) ve `node --test`
+ * dist-test/*.test.js dosyalarını çalıştırır — Node ≥20 yeterlidir, yerel
+ * TypeScript strip'ine gerek yoktur. `tsconfig.test.json` bu dosyayı emit
+ * edilmiş deklarasyon dosyaları (dist/*.d.ts) karşısında tip kontrolü yapar.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -811,42 +813,33 @@ test("http error detail: top-level message, truncation boundary, and unparseable
 
 // ── baseUrl biçimleri ────────────────────────────────────────────────────
 
-test("baseUrl with a path prefix or a trailing slash: requests still land on the exact absolute endpoint paths", async () => {
-  const forms: { name: string; suffix: string }[] = [
-    { name: "trailing slash", suffix: "/" },
-    // ⚠️ MEVCUT DAVRANIŞ PIN'İ: URL spesifikasyonu gereği
-    // `new URL("/status", "http://host/proxy")` base'in pathname'ini ATAR —
-    // istek `http://host/status`'e gider, prefix SİLİNİR. Config katmanı
-    // (readUrl) path'li değerleri reddetmediği için path'li bir baseUrl
-    // (örn. reverse-proxy arkasındaki runtime) bugün sessizce prefix'siz
-    // istek üretir. Step 3+ kararı: prefix'i desteklemek (ön-ekleme) ya da
-    // config doğrulamasında reddetmek. Test bugünkü (prefix'siz) davranışı
-    // sabitler; kaynağın davranışı değişirse bu test bilinçli olarak kırılır.
-    { name: "path prefix", suffix: "/proxy" },
-  ];
-  for (const { name, suffix } of forms) {
-    const mock = await startMockRuntime((req) => {
-      if (req.path === "/status") {
-        return { status: 200, body: STATUS_OK };
-      }
-      if (req.path === "/v1/models") {
-        return { status: 200, body: MODELS_OK };
-      }
-      // Beklenmedik bir yola düşerse (çift slash, korunan prefix) 404 → red.
-      return { status: 404, body: { error: { message: `unexpected path ${req.path}` } } };
-    });
-    try {
-      const backend = new OpenAICompatBackend({ baseUrl: `${mock.baseUrl}${suffix}`, model: MODEL });
-      await backend.refreshRuntimeInfo();
-      assert.deepEqual(
-        mock.requests.map((r) => r.path),
-        ["/status", "/v1/models"],
-        `${name}: requests must land on the exact absolute paths`,
-      );
-    } finally {
-      await mock.close();
+test("baseUrl with a trailing slash: requests still land on the exact absolute endpoint paths", async (t) => {
+  // v1 kararı (DESIGN.md 2.5): path prefix'li base URL'ler config
+  // KATMANINDA (readUrl) reddedilir — prefix'in adaptörde sessizce atılması
+  // senaryosu artık config load'da açık hatadır, burada pin'lenemez.
+  // Adaptör düzeyinde kalan tek anlamlı biçim kök slash'tır:
+  // `new URL("/status", "http://host/")` yine tam `/status`'e düşer.
+  // (Direkt BackendConfig, loadConfig'i atlatır — bu test yalnız adaptörün
+  // URL çözümleme davranışını sabitler.)
+  const mock = await startMockRuntime((req) => {
+    if (req.path === "/status") {
+      return { status: 200, body: STATUS_OK };
     }
-  }
+    if (req.path === "/v1/models") {
+      return { status: 200, body: MODELS_OK };
+    }
+    // Beklenmedik bir yola düşerse (örn. çift slash) 404 → red.
+    return { status: 404, body: { error: { message: `unexpected path ${req.path}` } } };
+  });
+  t.after(() => mock.close());
+
+  const backend = new OpenAICompatBackend({ baseUrl: `${mock.baseUrl}/`, model: MODEL });
+  await backend.refreshRuntimeInfo();
+  assert.deepEqual(
+    mock.requests.map((r) => r.path),
+    ["/status", "/v1/models"],
+    "requests must land on the exact absolute paths",
+  );
 });
 
 // ── API key / hata güvenliği ─────────────────────────────────────────────
@@ -892,6 +885,68 @@ test("error messages never contain the API key", async (t) => {
   const err = await expectBackendError(backend.tokenize("hello"), "http", 500);
   assert.ok(!err.message.includes(key), "the key must never appear in the message");
   assert.ok(!String(err.cause ?? "").includes(key), "the key must never appear in the cause");
+});
+
+test("http error detail: a key reflected in the error body is redacted — it appears in NEITHER message NOR cause", async (t) => {
+  // Tehdit modeli: runtime/proxy, gönderilen bearer token'ı hata gövdesine
+  // yansıtıyor (örn. geçersiz token yanıtı). Detay `cause` kanalına geçtiği
+  // için anahtar burada `[REDACTED]` ile değiştirilmiş olmalı.
+  const key = "sk-test-secret-should-never-leak";
+  const mock = await startMockRuntime(() => ({
+    status: 401,
+    body: { error: { message: `invalid token ${key}` } },
+  }));
+  t.after(() => mock.close());
+
+  const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl, key));
+  const err = await expectBackendError(backend.run(MESSAGES), "http", 401);
+
+  assert.ok(!err.message.includes(key), "the key must never appear in the message");
+  assert.ok(!String(err.cause ?? "").includes(key), "the key must never appear in the cause");
+  // Detay hâlâ taşınır; anahtarın yerinde redaksiyon işareti durur.
+  assert.equal(err.cause, "invalid token [REDACTED]");
+});
+
+test("http error detail (audit S9): a key reflected in the error body is redacted on both GET endpoints (/status, /v1/models)", async () => {
+  // Tehdit modeli: runtime/proxy, gönderilen bearer token'ı hata gövdesine
+  // yansıtıyor (örn. geçersiz token yanıtı). Redaksiyon, `requestJson`'in
+  // TEK 2xx-dışı dalında yaşar ve tüm uçlarla paylaşıldığı halde mevcut
+  // test yalnız POST /v1/chat/completions üzerinden pin'liyordu; GET uçlar
+  // açıkça pin'sizdi (audit S9). Burası o boşluğu kapatır.
+  const key = "sk-test-secret-should-never-leak";
+  const endpoints = ["/status", "/v1/models"] as const;
+  for (const endpoint of endpoints) {
+    const mock = await startMockRuntime((req) => {
+      if (req.path === endpoint) {
+        return { status: 401, body: { error: { message: `invalid token ${key}` } } };
+      }
+      // Hedef uç dışındaki çağrı sağlıklı döner. /status vakasında zincir
+      // 401'de durur; /v1/models vakasında önce /status 200'ını görürüz.
+      return req.path === "/status" ? { status: 200, body: STATUS_OK } : { status: 200, body: MODELS_OK };
+    });
+    try {
+      const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl, key));
+      const err = await expectBackendError(backend.refreshRuntimeInfo(), "http", 401);
+
+      assert.equal(err.message, `Inference runtime returned HTTP 401 from ${endpoint}`);
+      assert.ok(!err.message.includes(key), "the key must never appear in the message");
+      assert.ok(!String(err.cause ?? "").includes(key), "the key must never appear in the cause");
+      // Tehdit gerçekten yürütüldü: anahtar telde (Bearer) gitti.
+      assert.equal(
+        mock.requests[mock.requests.length - 1]?.headers.authorization,
+        `Bearer ${key}`,
+        "the failing GET must carry the configured key",
+      );
+      // Detay hâlâ taşınır; anahtarın yerinde redaksiyon işareti durur.
+      assert.ok(
+        String(err.cause ?? "").includes("[REDACTED]"),
+        "the redaction marker must stand where the key was",
+      );
+      assert.equal(err.cause, "invalid token [REDACTED]");
+    } finally {
+      await mock.close();
+    }
+  }
 });
 
 // ── contextTier ──────────────────────────────────────────────────────────

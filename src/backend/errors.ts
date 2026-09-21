@@ -12,9 +12,16 @@
  *   - `kind: "network"`      → orijinal hata nesnesi (fetch hatası / AbortError)
  *   - `kind: "http"`         → yanıt gövdesinden ≤200 karakterlik detay dizesi
  *     (`error.message` / üst düzey `message`) ya da parse edilemezse `undefined`
- *   - `kind: "invalid_response"` → JSON parse hatası (yalnızca parse
- *     başarısızlığında); şekil hatalarında `undefined`
+ *   - `kind: "invalid_response"` → `undefined` — JSON parse hatası
+ *     (V8 `SyntaxError`) mesajında gövde snippet'i barındıracağı için
+ *     ASLA saklanmaz; şekil hatalarında da `undefined`
  *   - diğer türler           → genellikle `undefined`
+ *
+ * Redaksiyon kuralı: API anahtarı yapılandırıldıysa, 2xx-dışı bir yanıt
+ * gövdesinden çıkarılan detayda anahtarın her birebir geçişi
+ * `[REDACTED]` ile değiştirilir (kırpamadan ÖNCE) — böylece anahtar,
+ * runtime/proxy onu hata gövdesine yansıtsa bile ne `message`'de ne
+ * `cause`'ta asla görünmez.
  */
 
 export type BackendErrorKind =
@@ -36,8 +43,10 @@ export interface BackendErrorOptions {
   status?: number;
   /**
    * Teknik kanal (bkz. dosya başlığı): `kind: "http"` için yanıt gövdesinden
-   * ≤200 karakterlik detay dizesi; diğer türler için orijinal hata nesnesi.
-   * `message` her zaman GÜVENLİ kalır; detay yalnız burada durur.
+   * ≤200 karakterlik detay dizesi; `kind: "network"` için orijinal hata
+   * nesnesi; `invalid_response` için her zaman `undefined` (parse hatası
+   * gövde snippet'i taşır). `message` her zaman GÜVENLİ kalır; detay
+   * yalnız burada durur.
    */
   cause?: unknown;
 }
