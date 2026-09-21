@@ -116,40 +116,48 @@ function readPositiveIntList(
   });
 }
 
+/**
+ * Ortam değişkeninden URL okur ve doğrular (v1: yalnızca sunucu kökeni).
+ *
+ * Güvenlik kuralı (Step 2): URL config hataları YALNIZCA alan adını ve neden'i
+ * belirtir; ham URL — ne kendisi ne de parse edilmiş herhangi bir parçası —
+ * hata mesajında ASLA yer almaz. Bir URL credential (`user:pass@`),
+ * query-string token'ı (`?token=...`) veya fragment (`#...`) taşıyabilir;
+ * boot anındaki hata stderr'e yazıldığı için ham değerin oraya sızması
+ * gizli verinin açığa çıkması demektir.
+ */
 function readUrl(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
   const value = readString(env, key, fallback);
   let parsed: URL;
   try {
     parsed = new URL(value);
   } catch {
-    throw new Error(`Invalid ${key}: "${value}" is not a valid URL`);
+    throw new Error(`Invalid ${key}: expected a valid URL`);
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(
-      `Invalid ${key}: expected an http:// or https:// URL, got "${value}" (protocol "${parsed.protocol}")`,
-    );
+    throw new Error(`Invalid ${key}: expected an http:// or https:// server origin`);
   }
   if (parsed.hostname === "") {
-    throw new Error(`Invalid ${key}: expected a non-empty hostname, got "${value}"`);
+    throw new Error(`Invalid ${key}: expected a non-empty hostname`);
   }
   // Gömülü kimlik bilgisi (user:pass@) bir yanlış yapılandırmadır —
   // kanonik formda sessizce düşerdi; auth `SPLASH_API_KEY` ile taşınır.
   if (parsed.username !== "" || parsed.password !== "") {
     throw new Error(
-      `Invalid ${key}: expected a server origin (no embedded credentials; use SPLASH_API_KEY for auth), got "${value}"`,
+      `Invalid ${key}: embedded credentials are not allowed; use SPLASH_API_KEY`,
     );
   }
   // v1 kararı (DESIGN.md 2.5): base URL yalnızca sunucu KÖKENİ'dir.
   // Kök dışı path prefix'i, query string ve fragment config load'da reddedilir —
   // sessizce atılmaz (adapter prefix'siz istek üretirdi; şimdi açık hata).
   if (parsed.pathname !== "" && parsed.pathname !== "/") {
-    throw new Error(`Invalid ${key}: expected a server origin (no path prefix), got "${value}"`);
+    throw new Error(`Invalid ${key}: expected a server origin (no path prefix)`);
   }
   if (parsed.search !== "") {
-    throw new Error(`Invalid ${key}: expected a server origin (no query string), got "${value}"`);
+    throw new Error(`Invalid ${key}: expected a server origin (no query string)`);
   }
   if (parsed.hash !== "") {
-    throw new Error(`Invalid ${key}: expected a server origin (no fragment), got "${value}"`);
+    throw new Error(`Invalid ${key}: expected a server origin (no fragment)`);
   }
   // Kanonik form: kök slash düşer — `new URL(absolutePath, baseUrl)` her
   // çağrıda aynı, deterministik sonucu versin. Varsayılan
