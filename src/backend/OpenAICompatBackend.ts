@@ -25,7 +25,10 @@ import type { BackendConfig } from "../config.js";
  * - `reasoning_effort` / `max_completion_tokens` yalnızca verildiğinde
  *   gövdeye girer; `reasoning_effort` ayrıca beyaz listededir.
  * - API anahtarı, ayarlıysa BİR kere, `Authorization` header'ı olarak
- *   gönderilir; hiçbir log ya da hata mesajına ASLA girmez.
+ *   gönderilir; hiçbir log ya da hata mesajına ASLA girmez. Runtime/proxy
+ *   anahtarı bir hata gövdesine yansıtırsa bile, o gövdeden çıkarılan
+ *   teknik detayda anahtar `[REDACTED]` ile değiştirilir (bkz.
+ *   `extractHttpDetail`) — anahtar ne `message`'de ne `cause`'ta yaşar.
  * - Her çağında caller'ın `AbortSignal`'i korunur; otomatik retry YOK.
  *
  * Uçlar (tam olarak, runtime'ın canlı API'sine göre):
@@ -278,13 +281,36 @@ function truncateSafe(value: string): string {
 }
 
 /**
- * 2xx-dışı bir yanıt gövdesinden teknik detay çıkarır: parse edilebilirse
- * `error.message` ya da üst düzey `message` alanı, `SAFE_DETAIL_LIMIT`
- * karaktere kırpılmış. Bu dize YALNIZCA `BackendError.cause` kanalında
- * taşınır — `message` hiçbir yanıt/istek içeriği taşımaz (DESIGN.md bölüm 9).
- * Gövde parse edilemezse ya da mesaj alanı yoksa `undefined`.
+ * Yapılandırılmış API anahtarını detay dizesinden deterministik olarak
+ * çıkarır: anahtarın her birebir geçişi `[REDACTED]` ile değiştirilir.
+ * Runtime ya da bir proxy, gönderilen bearer token'ı hata gövdesine
+ * yansıtabilirse (örn. `{"error":{"message":"invalid token <key>"}}`) bu
+ * detay `BackendError.cause`'a gireceğinden, anahtar ASLA hata kanalında
+ * yaşamasın diye kırpamadan ÖNCE redaksiyon uygulanır. Anahtar kendisi
+ * hiçbir yeni hata dizesine yazılmaz/eklenmez — yalnızca yer değiştirilir.
+ * Anahtar ayarlı değilse, boşsa ya da yalnızca boşluk içeriyorsa dize
+ * dokunulmaz — boşluk-only bir anahtar `replaceAll` ile detayı bozmasın.
+ * (`loadConfig` boş anahtarı zaten `undefined`'a düşürür; bu koruma,
+ * BackendConfig'i doğrudan kuran çağrılar içindir.)
  */
-function extractHttpDetail(bodyText: string): string | undefined {
+function redactSecret(detail: string, apiKey: string | undefined): string {
+  if (apiKey === undefined || apiKey.trim().length === 0) {
+    return detail;
+  }
+  return detail.replaceAll(apiKey, "[REDACTED]");
+}
+
+/**
+ * 2xx-dışı bir yanıt gövdesinden teknik detay çıkarır: parse edilebilirse
+ * `error.message` ya da üst düzey `message` alanı; yapılandırılmış API
+ * anahtarı ayarlıysa önce `redactSecret` ile `[REDACTED]`'a çevrilir,
+ * sonra `SAFE_DETAIL_LIMIT` karaktere kırpılır. Bu dize YALNIZCA
+ * `BackendError.cause` kanalında taşınır — `message` hiçbir yanıt/istek
+ * içeriği taşımaz (DESIGN.md bölüm 9) ve anahtar ne `message`'de ne
+ * `cause`'ta asla görünmez. Gövde parse edilemezse ya da mesaj alanı yoksa
+ * `undefined`.
+ */
+function extractHttpDetail(bodyText: string, apiKey: string | undefined): string | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText);
@@ -300,7 +326,7 @@ function extractHttpDetail(bodyText: string): string | undefined {
   if (typeof message !== "string" || message.length === 0) {
     return undefined;
   }
-  return truncateSafe(message);
+  return truncateSafe(redactSecret(message, apiKey));
 }
 
 /**
@@ -311,11 +337,18 @@ function extractHttpDetail(bodyText: string): string | undefined {
  *   bağlantı hatası                     → BackendError("network")
  *   iptal (fetch ya da gövde okuması)   → BackendError("network") + "aborted"
  *   2xx dışı durum                      → BackendError("http") + `status`;
- *                                        gövde detayı (≤200) YALNIZCA `cause`'ta
- *   2xx ama parse edilemeyen gövde      → BackendError("invalid_response")
+ *                                        gövde detayı (≤200) YALNIZCA `cause`'ta;
+ *                                        API anahtarı ayarlıysa detaydaki anahtar
+ *                                        geçişleri `[REDACTED]` yapılır
+ *   2xx ama parse edilemeyen gövde      → BackendError("invalid_response");
+ *                                        `cause` `undefined` (parse hatası
+ *                                        gövde snippet'i taşır — saklanmaz)
  *
  * DESIGN.md bölüm 9: `message` hiçbir durumda istek/yanıt içeriği taşımaz —
  * coordinator bunu frontier'a yüzeyine taşır; teknik detay `cause`'tadır.
+ * Redaksiyon kuralı: `config.apiKey` ayarlıysa, 2xx-dışı gövdeden çıkarılan
+ * detayda anahtarın birebir geçişleri kırpamadan önce `[REDACTED]`'a
+ * değiştirilir — anahtar ne `message`'de ne `cause`'ta asla görünmez.
  */
 async function requestJson(
   config: BackendConfig,
@@ -365,19 +398,22 @@ async function requestJson(
 
   if (!response.ok) {
     // `message` fragment-taşıyan değildir; gövde detayı yalnız `cause`'ta.
+    // Anahtar ayarlıysa detayda redakte edilir (bkz. extractHttpDetail).
     throw new BackendError(
       "http",
       `Inference runtime returned HTTP ${response.status} from ${path}`,
-      { status: response.status, cause: extractHttpDetail(bodyText) },
+      { status: response.status, cause: extractHttpDetail(bodyText, config.apiKey) },
     );
   }
 
   try {
     return JSON.parse(bodyText);
-  } catch (err) {
-    throw new BackendError("invalid_response", `Response from ${path} was not valid JSON`, {
-      cause: err,
-    });
+  } catch {
+    // `cause`: bilinçli olarak `undefined` — V8 `SyntaxError`'ın mesajı
+    // gövdenin başından ~10 karakterlik bir snippet taşır; 2xx gövdesi
+    // anahtarla başlıyorsa o prefix `cause`'a sızardı. Gövde içeriği
+    // hiçbir hata kanalına girmez.
+    throw new BackendError("invalid_response", `Response from ${path} was not valid JSON`);
   }
 }
 
