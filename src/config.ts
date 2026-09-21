@@ -14,6 +14,12 @@ export interface BackendConfig {
   baseUrl: string;
   /** Model id served at `baseUrl`. */
   model: string;
+  /**
+   * Optional bearer token for the inference API. When set, it is sent as
+   * `Authorization: Bearer <key>` on every request; it is never logged and
+   * never part of any error message.
+   */
+  apiKey?: string;
 }
 
 export interface ContextConfig {
@@ -68,6 +74,12 @@ export const CONFIG_DEFAULTS = {
 function readString(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
   const trimmed = env[key]?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : fallback;
+}
+
+/** Optional string: set and non-blank after trimming, otherwise `undefined`. */
+function readOptionalString(env: NodeJS.ProcessEnv, key: string): string | undefined {
+  const trimmed = env[key]?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
 function readPositiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
@@ -137,12 +149,13 @@ function expandHome(value: string): string {
  * Loads the Splash configuration. Deterministic: a pure function of the
  * provided environment mapping (defaults to `process.env`).
  *
- * Recognized variables (all optional, all with finalized defaults):
- *   SPLASH_BACKEND_BASE_URL, SPLASH_BACKEND_MODEL, SPLASH_REPO_ROOT,
- *   SPLASH_OUTPUT_ROOT, SPLASH_MAX_ROUNDS, SPLASH_CONTEXT_TIERS,
- *   SPLASH_CONTEXT_MIN_OUTPUT_RESERVE, SPLASH_CONTEXT_PREFERRED_OUTPUT_RESERVE,
- *   SPLASH_CONTEXT_RULES_SOFT_BUDGET
+ * Recognized variables (all optional):
+ *   SPLASH_BACKEND_BASE_URL, SPLASH_BACKEND_MODEL, SPLASH_API_KEY,
+ *   SPLASH_REPO_ROOT, SPLASH_OUTPUT_ROOT, SPLASH_MAX_ROUNDS,
+ *   SPLASH_CONTEXT_TIERS, SPLASH_CONTEXT_MIN_OUTPUT_RESERVE,
+ *   SPLASH_CONTEXT_PREFERRED_OUTPUT_RESERVE, SPLASH_CONTEXT_RULES_SOFT_BUDGET
  *
+ * All have finalized defaults, except SPLASH_API_KEY which defaults to unset.
  * Invalid values throw; the entry point reports them and refuses to start.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): SplashConfig {
@@ -151,6 +164,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SplashConfig {
     backend: {
       baseUrl: readUrl(env, "SPLASH_BACKEND_BASE_URL", CONFIG_DEFAULTS.backend.baseUrl),
       model: readString(env, "SPLASH_BACKEND_MODEL", CONFIG_DEFAULTS.backend.model),
+      apiKey: readOptionalString(env, "SPLASH_API_KEY"),
     },
     repoRoot: repoRoot !== "" ? path.resolve(expandHome(repoRoot)) : undefined,
     outputRoot: path.resolve(
