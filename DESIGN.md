@@ -1,6 +1,6 @@
 # Splash — Architecture & Design (v2)
 
-Status: **Design only. No implementation.**
+Status: **Steps 1-2 implemented; rest design-only.**
 
 Purpose: let a frontier orchestrator (Claude Code, OpenAI Codex) delegate
 *implementation* work to a **local LLM worker** to **significantly reduce
@@ -255,8 +255,12 @@ Seven components. Deliberately few; each is small.
   served model. **`OllamaBackend` is deliberately NOT in v1.** The
   interface is what's permanent: Ollama or other engines can be added
   later as leaf adapters without touching the core.
-- **Configurable:** `base_url` and `model` come from config. Defaults:
-  `base_url = http://127.0.0.1:8000`, `model = incoai/Qwen3.8-27B-Splash`.
+  - **Configurable:** `base_url` and `model` come from config. Defaults:
+    `base_url = http://127.0.0.1:8000`, `model = incoai/Qwen3.8-27B-Splash`.
+  - **Optional API key (final):** `api_key` from the `SPLASH_API_KEY`
+    environment variable (trimmed; blank = unset). When set it is sent as
+    `Authorization: Bearer <key>`; it is never logged and never part of any
+    error message.
 - **Runtime capacity (authoritative, final):** at startup / backend
   readiness, query the runtime's status endpoint for
   `maximum_context_tokens` (it depends on the current model, hardware, and
@@ -270,9 +274,13 @@ Seven components. Deliberately few; each is small.
   request at a time and **implements no parallel scheduling of its own** —
   all serialization is the Inference Coordinator's job (Section 2.7); the
   adapter is a leaf, reached only through the coordinator.
-- **Core independence:** no Splash core component references the concrete
-  engine or the model name — those are config data consumed only by the
-  backend adapter.
+  - **Core independence:** no Splash core component references the concrete
+    engine or the model name — those are config data consumed only by the
+    backend adapter.
+  - **Error handling (final):** a non-2xx answer is a typed `http` error that
+    carries the HTTP status in `message`; the response-body detail (≤200 chars)
+    travels in the technical `cause` only — `message` never carries request or
+    response content (Section 9 boundary).
 - Carries `usage` (tokens in/out) back; `run()` accepts the selected context
   tier (and output reserve) as options.
 
@@ -939,6 +947,11 @@ automatically — only when it genuinely cannot fit.
 - The full diff exists *only* inside the workspace, retrievable solely via
   `splash_diff` (which the orchestrator calls when — and only when — it
   decides to review content) or the exported patch file on disk.
+- **Typed error metadata only** — MCP tool responses carry only the typed
+  error metadata: `kind` (closed vocabulary) + the safe `message` (HTTP status
+  + endpoint path) + `status`; response-body fragments (≤200 chars) exist only
+  in the technical `BackendError.cause` channel, which never appears in MCP
+  responses — `cause` is developer-log-only.
 
 Enforcement: Splash is the only reader of the main repo (explicit files,
 redaction) and **never a writer** (v1 has no apply operation); the worker has
@@ -1006,8 +1019,8 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
 
 1. **Server skeleton** — MCP core + stdio adapter + config + no-op tool.
 2. **Inference Backend** — the `InferenceBackend` interface +
-   `OpenAICompatBackend` (the only v1 impl; `base_url` + `model` from
-   config); a `run()` round-trip; **runtime status**
+    `OpenAICompatBackend` (the only v1 impl; `base_url` + `model` + optional
+    `api_key` from config); a `run()` round-trip; **runtime status**
    (`maximum_context_tokens`, refreshed on reconnect) + **tokenizer
    endpoint** (Section 5); **single-flight adapter, no internal scheduling**.
 3. **Inference Coordinator** — global single-flight FIFO queue (same-process
@@ -1097,7 +1110,7 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
 2. **Session Manager** — session lifecycle, round history, pinned rules/task, adaptive budget enforcement + reduction priority, **max_rounds guardrail**, **immutable base + fingerprint stale check**, **disk persistence (source of truth, `~/.splash/sessions/<session-id>/`) + recovery (surviving worktree reused if it matches, else recreated; never depends on volatile state)**.
 3. **Context Assembler** — read-only main-repo reader, rules (soft budget), **adaptive context budget** (exact tokenization, tiers, headroom, reduction priority, `needs_split`), secret redaction.
 4. **Workspace Manager** — **git-only v1, one implementation (`GitWorktreeWorkspace`)**; isolated workspace lifecycle; repo-root discovery (read-only git query); immutable base-capture (exact working-tree delta + selected untracked; hooks off, deterministic Splash identity; fingerprints = existence+type+mode+content); patch validation (unique match, overlap rejection); apply + `add -N` intent-to-add; **scoped reset cleanup** (never a broad `git clean`); diff/stat; complete `--binary --full-index` export; destroy. The only writer/git runner, confined to the workspace (+ read-only main-repo queries).
-5. **Inference Backend** — pluggable local-model adapter; **v1: `OpenAICompatBackend` only** (OpenAI-compatible HTTP; `base_url` + `model` configurable, defaults `http://127.0.0.1:8000` + `incoai/Qwen3.8-27B-Splash`; Ollama etc. = later leaf adapters); **runtime `maximum_context_tokens` (authoritative, refreshed on reconnect) + tokenizer endpoint**; **single-flight, reached only through the coordinator (no internal scheduling)**.
+5. **Inference Backend** — pluggable local-model adapter; **v1: `OpenAICompatBackend` only** (OpenAI-compatible HTTP; `base_url` + `model` + optional `api_key` configurable, defaults `http://127.0.0.1:8000` + `incoai/Qwen3.8-27B-Splash`; Ollama etc. = later leaf adapters); **runtime `maximum_context_tokens` (authoritative, refreshed on reconnect) + tokenizer endpoint**; **single-flight, reached only through the coordinator (no internal scheduling)**.
 6. **Worker Contract** — worker prompt + policy + patch output schema.
 7. **Inference Coordinator** — process-wide **single-flight FIFO** queue over the backend (same-process waits are ordinary queue waits); **host runtime conflict check** (another Splash / MLX / Ollama; re-checked before every dispatch; never competes, never falls back) → **immediate `inference_busy`** (no hidden background queue); lock/state under `~/.splash/runtime/`; conflicts never destroy session/workspace/state.
 
