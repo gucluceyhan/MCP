@@ -468,6 +468,96 @@ test("refreshRuntimeInfo: /v1/models structural failures (object, data, entry) e
   }
 });
 
+// ── runtimeProcessId (Step 3: yapılandırılmış runtime kimliği) ─────────
+
+/** Resmi /status biçimi: zorunlu alanlar + identity bloğu. */
+const STATUS_WITH_INSTANCE = {
+  ...STATUS_OK,
+  instance: {
+    id: "opaque-runtime-instance",
+    pid: 12345,
+    model: MODEL,
+    host: "127.0.0.1",
+    port: 8000,
+  },
+};
+
+test("refreshRuntimeInfo: a valid instance.pid is surfaced as runtimeProcessId; the raw instance is NOT exposed", async (t) => {
+  const mock = await startMockRuntime((req) =>
+    req.path === "/status" ? { status: 200, body: STATUS_WITH_INSTANCE } : { status: 200, body: MODELS_OK },
+  );
+  t.after(() => mock.close());
+
+  const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl));
+  const info = await backend.refreshRuntimeInfo();
+
+  assert.deepEqual(info, {
+    ready: true,
+    maximumContextTokens: 262144,
+    servedModel: MODEL,
+    runtimeProcessId: 12345,
+  });
+  // deepStrictEqual aynı anahtar SETİNİ de pin'ler: ham `instance`
+  // nesnesi (ya da herhangi bir ek alan) burada görünemez.
+  assert.equal(backend.runtimeInfo, info);
+});
+
+test("refreshRuntimeInfo: a malformed instance.pid is NOT trusted — the property is omitted (not undefined) and the refresh still succeeds", async () => {
+  const cases: { name: string; instance: unknown }[] = [
+    { name: "string pid", instance: { id: "x", pid: "12345" } },
+    { name: "zero pid", instance: { id: "x", pid: 0 } },
+    { name: "negative pid", instance: { id: "x", pid: -5 } },
+    { name: "fractional pid", instance: { id: "x", pid: 123.5 } },
+    { name: "missing pid", instance: { id: "x" } },
+    { name: "non-object instance", instance: "instance" },
+    { name: "null instance", instance: null },
+  ];
+  for (const { name, instance } of cases) {
+    const mock = await startMockRuntime((req) =>
+      req.path === "/status"
+        ? { status: 200, body: { ...STATUS_OK, instance } }
+        : { status: 200, body: MODELS_OK },
+    );
+    try {
+      const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl));
+      const info = await backend.refreshRuntimeInfo();
+      assert.equal(info.ready, true, `${name}: the refresh still succeeds`);
+      assert.ok(
+        !("runtimeProcessId" in info),
+        `${name}: the property must be ABSENT, not explicitly undefined`,
+      );
+      assert.deepEqual(
+        info,
+        { ready: true, maximumContextTokens: 262144, servedModel: MODEL },
+        name,
+      );
+    } finally {
+      await mock.close();
+    }
+  }
+});
+
+test("refreshRuntimeInfo: the identity follows the runtime — a pid change is picked up on the next refresh", async (t) => {
+  let statusCalls = 0;
+  const instance = STATUS_WITH_INSTANCE.instance;
+  const mock = await startMockRuntime((req) => {
+    if (req.path !== "/status") {
+      return { status: 200, body: MODELS_OK };
+    }
+    statusCalls += 1;
+    // Runtime yeniden başladı: yeni PID raporluyor.
+    return { status: 200, body: { ...STATUS_OK, instance: { ...instance, pid: statusCalls === 1 ? 111 : 222 } } };
+  });
+  t.after(() => mock.close());
+
+  const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl));
+  const first = await backend.refreshRuntimeInfo();
+  assert.equal(first.runtimeProcessId, 111);
+  const second = await backend.refreshRuntimeInfo();
+  assert.equal(second.runtimeProcessId, 222, "the refreshed identity must follow the runtime");
+  assert.equal(backend.runtimeInfo, second);
+});
+
 // ── tokenize ─────────────────────────────────────────────────────────────
 
 test("tokenize: ok returns tokens and count; body carries content and add_special", async (t) => {

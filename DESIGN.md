@@ -1,6 +1,6 @@
 # Splash — Architecture & Design (v2)
 
-Status: **Steps 1-2 implemented; rest design-only.**
+Status: **Steps 1-3 implemented; rest design-only.**
 
 Purpose: let a frontier orchestrator (Claude Code, OpenAI Codex) delegate
 *implementation* work to a **local LLM worker** to **significantly reduce
@@ -340,7 +340,11 @@ Seven components. Deliberately few; each is small.
   Splash cannot prevent the OS user from manually launching an unrelated
   runtime *after* Splash has started — so the check runs **again before every
   inference dispatch**, and Splash **refuses to compete** rather than assume
-  exclusivity.
+  exclusivity. The coordinator identifies the *configured* Splash runtime
+  from the backend's `/status` `instance.pid` (read on every refresh, never
+  assumed) and excludes that PID **and all of its descendants** (e.g. the
+  native `serve-native` child runtime) from the conflict scan, so the
+  intentional backend process tree is never reported as a conflict.
 - **Lock/state location:** process-wide lock + state under the existing
   Splash root — **`~/.splash/runtime/`** (user-level; config-overridable;
   **never inside the project repository**). The lock protects Splash from
