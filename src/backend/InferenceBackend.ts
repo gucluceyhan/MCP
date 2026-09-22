@@ -44,6 +44,16 @@ export interface RuntimeInfo {
   maximumContextTokens: number;
   /** Runtime'ın sunduğunu onayladığı model kimliği. */
   servedModel: string;
+  /**
+   * Sunan sürecin PID'si, `/status.instance.pid`'den (Step 3): YALNIZCA
+   * runtime geçerli bir pozitif tam sayı raporluyorsa dolu. Inference
+   * Coordinator host taramasında yapılandırılmış runtime'ın kendi
+   * süreç ağacını (PID + torunlar) çakışma dışı bırakmak için kullanır.
+   * Kayıt eksik/bozuk ise özellik ASLA `undefined` olarak konulmaz —
+   * tamamen DÜŞÜRÜLÜR; coordinator bunu "kullanılır kimlik yok"
+   * (fail closed) olarak okur.
+   */
+  runtimeProcessId?: number;
 }
 
 /** `run()` için işaretleyici seçenekleri. */

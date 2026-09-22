@@ -33,7 +33,10 @@ import type { BackendConfig } from "../config.js";
  *
  * Uçlar (tam olarak, runtime'ın canlı API'sine göre):
  *   GET  /status                 → ready + maximum_context_tokens
- *                                   (bilinmeyen ek alanlar kabul edilir)
+ *                                   (bilinmeyen ek alanlar kabul edilir;
+ *                                   Step 3: instance.pid yalnızca geçerli
+ *                                   pozitif tam sayıyken kimlik olarak
+ *                                   alınır — ham instance taşınmaz)
  *   GET  /v1/models              → sunulan model listesi (tam eşleşme zorunlu)
  *   POST /v1/chat/completions    → tek non-stream tamamlanma
  *   POST /tokenize               → ham içeriğin tam token kimlikleri
@@ -97,12 +100,31 @@ export class OpenAICompatBackend implements InferenceBackend {
       );
     }
 
+    // 3) Runtime kimliği (Step 3): `/status.instance.pid` — sunan
+    //    süreç. Sıkı doğrulama (pozitif tam sayı); eksik ya da bozuk
+    //    değer `runtimeProcessId`'yi boşta BIRAKIR (özellik konulmaz,
+    //    `undefined` yazılmaz) — coordinator "kullanılır kimlik yok"
+    //    deyip fail-closed davranır; asla tahmin edilmez. Ham
+    //    `instance` nesnesi BÜTÜN HÂLİYLE asla dışarı taşınmaz
+    //    (içindeki alanlar bilinenden genişleyebilir).
+    let runtimeProcessId: number | undefined;
+    const instance = status.instance;
+    if (isRecord(instance)) {
+      const pid = instance.pid;
+      if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+        runtimeProcessId = pid;
+      }
+    }
+
     // İki çağrı da başarılı: on-bellek YALNIZCA burada (yeniden) atanır.
     const info: RuntimeInfo = {
       ready: true,
       maximumContextTokens: maximum,
       servedModel: this.#config.model,
     };
+    if (runtimeProcessId !== undefined) {
+      info.runtimeProcessId = runtimeProcessId;
+    }
     this.#runtimeInfo = info;
     return info;
   }
