@@ -345,11 +345,19 @@ Seven components. Deliberately few; each is small.
   assumed) and excludes that PID **and all of its descendants** (e.g. the
   native `serve-native` child runtime) from the conflict scan, so the
   intentional backend process tree is never reported as a conflict.
+  Detection signatures are token-based: MLX counts an `mlx_lm`/`mlx_vlm`
+  entry point invoked through any CPython interpreter form (including
+  versioned interpreters such as `python3.13` and virtualenv paths);
+  Ollama counts only the actual serving/runner daemon processes
+  (`ollama serve` / `ollama runner`) — administrative CLI commands
+  (`ollama list`, `ollama ps`, ...) are not conflicts.
 - **Lock/state location:** process-wide lock + state under the existing
   Splash root — **`~/.splash/runtime/`** (user-level; config-overridable;
   **never inside the project repository**). The lock protects Splash from
   concurrent *Splash* inference; the external-runtime detection is the
-  additional guard against other known runtimes.
+  additional guard against other known runtimes. The lock is released after
+  every dispatch; a failed release is surfaced as a typed lock-cleanup error
+  — never silently reported as success.
 - **On a detected conflict** — do **not** start another model and do **not**
   send the request: preserve the Splash session and **immediately return a
   compact `inference_busy` status** (Section 3) — the metadata names the

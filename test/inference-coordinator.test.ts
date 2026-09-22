@@ -2,7 +2,8 @@
  * InferenceCoordinator testleri (Step 3).
  *
  * Kompozisyon: FAKE InferenceBackend + GERÇEK FIFO (coordinator) +
- * GERÇEK RuntimeLock (geçici outputRoot) + ENJEKTE scanner/liveness/now.
+ * GERÇEK RuntimeLock (geçici outputRoot; release-failure senaryoları
+ * `lock` dikişiyle FAKE kilit) + ENJEKTE scanner/liveness/now.
  * Gerçek model runtime'ına, gerçek `ps` tablosuna ya da duvar saati
  * yarışlarına BAĞIMLI DEĞİL: tüm testler deterministiktir (2-3 sn
  * güvenlik ceketi yalnızca takılma korumasıdır).
@@ -20,6 +21,7 @@ import {
   InferenceCoordinator,
   type CoordinatedInferenceRequest,
   type CoordinatedInferenceResult,
+  type RuntimeLockLike,
 } from "../dist/backend/InferenceCoordinator.js";
 import { BackendError } from "../dist/backend/errors.js";
 import type {
@@ -34,7 +36,9 @@ import type {
 } from "../dist/backend/InferenceBackend.js";
 import {
   INFERENCE_LOCK_DIR,
+  LockError,
   OWNER_FILE_NAME,
+  type LockAcquireResult,
   type PidLiveness,
 } from "../dist/backend/RuntimeLock.js";
 import type { ProcessInfo, ProcessScanner } from "../dist/backend/RuntimeConflictDetector.js";
@@ -172,6 +176,40 @@ class FakeBackend implements InferenceBackend {
   }
 }
 
+// ── sahte kilit (release-failure dikişi) ─────────────────────────────────
+
+/**
+ * Release hatası senaryoları için sahte kilit: `lock` enjeksiyon dikişi
+ * üzerinden coordinator'a verilir; hiçbir fs işlemi yapmaz.
+ * `failReleases` kadar `release` çağrısı tip'li `LockError` fırlatır.
+ */
+class FakeLock implements RuntimeLockLike {
+  acquireCalls = 0;
+  releaseCalls: string[] = [];
+  /** Bu kadar `release` çağrısını reddet (geri kalanı başarılı). */
+  failReleases = 0;
+  /** `release`'ın fırlattığı en son hata (`cause` doğrulaması için). */
+  lastReleaseError: Error | null = null;
+
+  async acquire(ownerId: string): Promise<LockAcquireResult> {
+    this.acquireCalls += 1;
+    return { acquired: true, token: `tok-${this.acquireCalls}-${ownerId}` };
+  }
+
+  async release(token: string): Promise<void> {
+    this.releaseCalls.push(token);
+    if (this.failReleases > 0) {
+      this.failReleases -= 1;
+      const err = new LockError(
+        "token_mismatch",
+        "The inference lock is owned by another session; refusing to remove it",
+      );
+      this.lastReleaseError = err;
+      throw err;
+    }
+  }
+}
+
 // ── test takımı (harness) ───────────────────────────────────────────────
 
 /** Yapılandırılmış Splash runtime'ın tipik süreç ağacı (temiz host). */
@@ -191,6 +229,8 @@ interface HarnessOptions {
   scanner?: ProcessScanner;
   liveness?: PidLiveness;
   now?: () => number;
+  /** `lock` enjeksiyon dikişi (release-failure senaryoları). */
+  lock?: RuntimeLockLike;
 }
 
 async function makeHarness(
@@ -214,6 +254,7 @@ async function makeHarness(
     scanner,
     liveness: opts.liveness,
     now: opts.now,
+    lock: opts.lock,
   });
   // Güvenlik ağı: test bitiminde henüz çözülmüş latch'ları bırak —
   // bekleyen promise'ler olay döngüsünü (ve diğer testleri) asla
@@ -557,6 +598,198 @@ test("a stale lock (dead owner) is reclaimed: dispatch proceeds, the old record 
   assert.equal(result.status, "completed");
   await waitForIdle(h);
   assert.equal(await lockDirExists(h.runtimeDir), false, "released after the run");
+});
+
+// ── release hatası asla yutulmaz (öncelik A-D) ───────────────────────────
+
+test("successful inference + failed release → dispatch rejects with lock_release_failed (never a false 'completed')", async (t) => {
+  const lock = new FakeLock();
+  lock.failReleases = 1;
+  const h = await makeHarness(t, { lock });
+
+  const p = h.coordinator.dispatch(request("A"));
+  await waitFor(() => h.backend.runStartOrder.length === 1, "A to start");
+  h.backend.releaseRun("A");
+
+  const caught = await p.then(
+    () => {
+      throw new Error(
+        "dispatch must REJECT — a failed release is never a false 'completed'",
+      );
+    },
+    (err: unknown) => err,
+  );
+  assert.ok(
+    caught instanceof CoordinatorError,
+    `expected a CoordinatorError, got: ${String(caught)}`,
+  );
+  assert.equal((caught as CoordinatorError).kind, "lock_release_failed");
+  // Mesaj KISA ve güvenlidir: token, yol, istek içeriği YOK.
+  const msg = (caught as CoordinatorError).message;
+  assert.ok(!msg.includes("tok-"), "no lock token in the message");
+  assert.ok(!msg.includes(h.runtimeDir), "no runtime path in the message");
+  assert.equal(lock.releaseCalls.length, 1, "release was attempted");
+  // `cause`'ta kilit katmanının kendi tip'li hatası (güvenli mesaj).
+  assert.equal((caught as CoordinatorError).cause, lock.lastReleaseError);
+
+  await waitForIdle(h);
+  assert.equal(h.coordinator.activeOwnerId, null);
+  assert.equal(h.coordinator.queueDepth, 0);
+});
+
+test("failed inference + successful release → the original BackendError propagates verbatim (release-ok path unchanged)", async (t) => {
+  const h = await makeHarness(t, { lock: new FakeLock() });
+  h.backend.failingOwner = "A";
+  const pa = h.coordinator.dispatch(request("A"));
+  const pb = h.coordinator.dispatch(request("B"));
+
+  let caught: unknown = null;
+  await pa.then(
+    () => {
+      throw new Error("A was supposed to fail");
+    },
+    (err: unknown) => {
+      caught = err;
+    },
+  );
+  assert.ok(
+    caught instanceof BackendError,
+    `expected the original BackendError, got: ${String(caught)}`,
+  );
+  assert.equal((caught as BackendError).kind, "http");
+  assert.equal((caught as BackendError).status, 500);
+
+  // Kuyruk zehirlenmedi: B normal devam etti ve tamamladı.
+  const rb = await runToCompletion(h, pb, "B");
+  assert.equal(rb.status, "completed");
+  await waitForIdle(h);
+});
+
+test("failed inference + failed release → lock_release_failed surfaces; the original error is only in cause", async (t) => {
+  const lock = new FakeLock();
+  lock.failReleases = 1;
+  const h = await makeHarness(t, { lock });
+  h.backend.failingOwner = "A";
+
+  const pa = h.coordinator.dispatch(request("A"));
+
+  const caught = await pa.then(
+    () => {
+      throw new Error("A was supposed to fail");
+    },
+    (err: unknown) => err,
+  );
+  assert.ok(
+    caught instanceof CoordinatorError,
+    `expected a CoordinatorError, got: ${String(caught)}`,
+  );
+  assert.equal((caught as CoordinatorError).kind, "lock_release_failed");
+  // Orijinal inference hatası YALNIZ `cause`'ta (tek red — çift hata yok).
+  assert.ok(
+    (caught as CoordinatorError).cause instanceof BackendError,
+    "the original inference error is preserved in cause",
+  );
+  assert.equal(((caught as CoordinatorError).cause as BackendError).kind, "http");
+
+  await waitForIdle(h);
+});
+
+test("host conflict (mlx) + failed release → the cleanup error surfaces instead of a clean inference_busy/mlx", async (t) => {
+  const lock = new FakeLock();
+  lock.failReleases = 1;
+  const h = await makeHarness(t, {
+    scanner: () =>
+      Promise.resolve([
+        ...CONFIGURED_TREE,
+        { pid: 700, ppid: 1, command: "python3 -m mlx_lm.server --port 8080" },
+      ]),
+    lock,
+  });
+
+  const p = h.coordinator.dispatch(request("A"));
+
+  const caught = await p.then(
+    () => {
+      throw new Error("a failed release must surface — no clean inference_busy");
+    },
+    (err: unknown) => err,
+  );
+  assert.ok(
+    caught instanceof CoordinatorError,
+    `expected a CoordinatorError, got: ${String(caught)}`,
+  );
+  assert.equal((caught as CoordinatorError).kind, "lock_release_failed");
+  assert.equal(h.backend.runStartOrder.length, 0, "no generation under a host conflict");
+  assert.equal(h.scannerCounts.count, 1, "the scan ran");
+  assert.equal(lock.releaseCalls.length, 1, "release was attempted after the conflict decision");
+
+  await waitForIdle(h);
+});
+
+test("aborted active inference + failed release → the cleanup error surfaces (typed)", async (t) => {
+  const lock = new FakeLock();
+  lock.failReleases = 1;
+  const h = await makeHarness(t, { lock });
+  const controller = new AbortController();
+  const pa = h.coordinator.dispatch(request("A", { signal: controller.signal }));
+  await waitFor(() => h.backend.runStartOrder.length === 1, "A to start");
+
+  controller.abort();
+
+  const caught = await pa.then(
+    () => {
+      throw new Error("a failed release must surface — not reported as success");
+    },
+    (err: unknown) => err,
+  );
+  assert.ok(
+    caught instanceof CoordinatorError,
+    `expected a CoordinatorError, got: ${String(caught)}`,
+  );
+  assert.equal((caught as CoordinatorError).kind, "lock_release_failed");
+  // Orijinal iptal hatası (tip'li BackendError) `cause`'ta korunur.
+  assert.ok(
+    (caught as CoordinatorError).cause instanceof BackendError,
+    "the original abort error is preserved in cause",
+  );
+  assert.equal(((caught as CoordinatorError).cause as BackendError).kind, "network");
+
+  await waitForIdle(h);
+});
+
+test("a release failure does not poison the FIFO: the next job acquires fresh and completes normally", async (t) => {
+  const lock = new FakeLock();
+  lock.failReleases = 1; // yalnız ilk `release` çağrısı başarısız
+  const h = await makeHarness(t, { lock });
+
+  const pa = h.coordinator.dispatch(request("A"));
+  const pb = h.coordinator.dispatch(request("B"));
+
+  await waitFor(() => h.backend.runStartOrder.length === 1, "A to start");
+  h.backend.releaseRun("A");
+
+  // A tip'li cleanup hatasıyla reddedilir…
+  const caught = await pa.then(
+    () => {
+      throw new Error("A must reject");
+    },
+    (err: unknown) => err,
+  );
+  assert.ok(
+    caught instanceof CoordinatorError && (caught as CoordinatorError).kind === "lock_release_failed",
+    `expected lock_release_failed, got: ${String(caught)}`,
+  );
+
+  // …ve kuyruk devam eder: B kendi acquire'ını yapar, normal tamamlanır.
+  const rb = await runToCompletion(h, pb, "B");
+  assert.deepEqual(h.backend.runStartOrder, ["A", "B"], "strict FIFO after the failure");
+  assert.equal(rb.status, "completed");
+  assert.equal(lock.acquireCalls, 2, "the next job acquires the lock fresh");
+  assert.equal(lock.releaseCalls.length, 2, "both jobs attempted release");
+
+  await waitForIdle(h);
+  assert.equal(h.coordinator.activeOwnerId, null);
+  assert.equal(h.coordinator.queueDepth, 0);
 });
 
 // ── dispatch sırası (madde 19/20/30) ────────────────────────────────────

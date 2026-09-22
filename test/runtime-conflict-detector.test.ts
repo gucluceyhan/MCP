@@ -172,6 +172,40 @@ test("a path/argument merely CONTAINING `mlx` (notes file, project dir) is NOT a
   }
 });
 
+// ── versioned Python yorumlayıcıları (paylaşılan kapı) ───────────────────
+
+test("MLX via versioned Python interpreters (python3.13 / venv paths) → mlx", async () => {
+  for (const command of [
+    "python3.13 -m mlx_lm.server --port 8080",
+    "python3.12 -m mlx_vlm.generate --prompt hello",
+    "/opt/homebrew/bin/python3.13 -m mlx_lm.generate --model foo",
+    "/venv/bin/python3.12 -m mlx_vlm.generate",
+  ]) {
+    const kind = await detectorFor([proc(704, 1, command)]).detect(500);
+    assert.equal(kind, "mlx", `expected mlx for: ${command}`);
+  }
+});
+
+test("interpreter-LIKE names that are not interpreters are NOT mlx (no false positive)", async () => {
+  for (const command of [
+    "python3.13 /project/mlx_notes.py", // script yolu — modül formu değil
+    "python3-helper -m mlx_lm.server", // `python3-helper` yorumlayıcı değil
+    "python3.13-debug-wrapper -m mlx_lm.server",
+    "python3-notes",
+    "mypython3",
+  ]) {
+    const kind = await detectorFor([proc(705, 1, command)]).detect(500);
+    assert.equal(kind, "none", `must not conflict: ${command}`);
+  }
+});
+
+test("the shared interpreter gate also feeds the Splash side: versioned interpreter + `splash` → splash", async () => {
+  const kind = await detectorFor([
+    proc(900, 1, "python3.13 -m splash serve --port 8000"),
+  ]).detect(500);
+  assert.equal(kind, "splash");
+});
+
 // ── ollama ───────────────────────────────────────────────────────────────
 
 test("an Ollama serving/runner process → ollama", async () => {
@@ -186,15 +220,54 @@ test("an Ollama serving/runner process → ollama", async () => {
 test("`ollama` as a NON-executable argument (echo, script path) is NOT a conflict", async () => {
   for (const command of [
     "echo ollama",
+    "echo ollama serve", // `serve` token'ı var ama yürütülebilir `echo`
     "bash /home/u/ollama-notes.sh",
     "grep ollama /home/u/dotfiles",
     // Tasarımın SPEC'TE LİTE listelenen hali: editör bir `ollama`
     // notu DOSYASI AÇIYOR — yürütülebilir `code`, argüman metni.
     "code /project/ollama-notes.txt",
+    "bash /tmp/ollama serve", // kabuk bir betik AÇIYOR — yürütülebilir `bash`
+    "code /project/ollama/serve-notes.txt",
   ]) {
     const kind = await detectorFor([proc(802, 1, command)]).detect(500);
     assert.equal(kind, "none", `must not conflict: ${command}`);
   }
+});
+
+test("Ollama serve/runner processes (including full paths) → ollama", async () => {
+  for (const command of [
+    "ollama serve",
+    "/usr/local/bin/ollama serve",
+    "/opt/homebrew/bin/ollama serve",
+    "ollama runner --port 11435",
+    "/Applications/Ollama.app/Contents/Resources/rosetta/bin/ollama runner --port 11435",
+  ]) {
+    const kind = await detectorFor([proc(800, 1, command)]).detect(500);
+    assert.equal(kind, "ollama", `expected ollama for: ${command}`);
+  }
+});
+
+test("Ollama administrative CLI commands (list/ps/show/pull/rm/--help) are NOT conflicts", async () => {
+  for (const command of [
+    "ollama", // argümansız (tek token) — `tokens.length < 2` kenar durumu
+    "ollama list",
+    "ollama ps",
+    "ollama show llama3",
+    "ollama pull llama3",
+    "ollama rm llama3",
+    "ollama --help",
+  ]) {
+    const kind = await detectorFor([proc(803, 1, command)]).detect(500);
+    assert.equal(kind, "none", `must not conflict: ${command}`);
+  }
+});
+
+test("an `ollama list` CLI next to a real `ollama serve` daemon → still ollama (the daemon is detected; the CLI does not change the class)", async () => {
+  const kind = await detectorFor([
+    proc(804, 1, "ollama list"),
+    proc(805, 1, "ollama serve"),
+  ]).detect(500);
+  assert.equal(kind, "ollama");
 });
 
 // ── sıradan süreçler + öncelik ───────────────────────────────────────────

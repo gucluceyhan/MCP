@@ -40,10 +40,14 @@ export type ProcessScanner = () => Promise<ProcessInfo[]>;
 export type ConflictKind = "none" | "splash" | "mlx" | "ollama";
 
 /**
- * Python ailesi yorumlayıcı + `uv`/`uvx` çalıştırıcıları: bunların
- * hemen arkasındaki betik/modül argümanları "çalıştırılan şey"dir.
+ * Python ailesi yorumlayıcı basename deseni: `python`, `python2`,
+ * `python3`, `python2.7`, `python3.12`, `python3.13`, ... — yani
+ * `python` + isteğe bağlı major (`2`/`3`) + sıfır ya da daha fazla `.N`
+ * versiyon segmenti. `^…$` sınırları sayesinde `python-helper`,
+ * `python3-notes`, `mypython3`, `python3.13-debug-wrapper` gibi
+ * benzer isimli yürütülebilirler yorumlayıcı DEĞİLDİR.
  */
-const INTERPRETER_BASENAMES = new Set(["python", "python2", "python3", "uv", "uvx"]);
+const PYTHON_INTERPRETER_BASENAME = /^python(?:2|3)?(\.\d+)*$/;
 
 /** Bir token'ın basename'ı: son `/` (ya da `\`) parçası. */
 function basenameOf(token: string): string {
@@ -55,11 +59,23 @@ function tokenizeCommand(command: string): string[] {
   return command.split(/\s+/).filter((token) => token.length > 0);
 }
 
-/** Komutun çalıştırılabiliri (ilk token) Python/uv ailesinden mi? */
+/**
+ * Komutun çalıştırılabiliri (ilk token) Python/uv ailesinden mi?
+ *
+ * Yorumlayıcı basename'ı YOL bağımsızdır: `/opt/homebrew/bin/python3.13` ya da
+ * `/venv/bin/python3.12` aynı yorumlayıcıdır — basename deseniyle
+ * tanınır (versioned formlar da dahil). `uv`/`uvx` çalıştırıcıları
+ * literal olarak korunur. Bu kapı hem `isSplashRuntime` (b) dalını hem de
+ * `isMlxRuntime`'u besler.
+ */
 function usesInterpreterLauncher(command: string): boolean {
   const tokens = tokenizeCommand(command);
   const first = tokens[0];
-  return first !== undefined && INTERPRETER_BASENAMES.has(basenameOf(first));
+  if (first === undefined) {
+    return false;
+  }
+  const base = basenameOf(first);
+  return base === "uv" || base === "uvx" || PYTHON_INTERPRETER_BASENAME.test(base);
 }
 
 /**
@@ -69,7 +85,9 @@ function usesInterpreterLauncher(command: string): boolean {
  *  - `splash serve ...`            (CLI runtime)
  *  - `... serve-native`            (yerel native runtime formu)
  *  - `--mode=serve-native`         (native runtime bayrağı formu)
- *  - `python3 .../splash serve`    (Python launcher formu)
+ *  - `python3 .../splash serve`    (Python launcher formu; versioned
+ *                                   yorumlayıcılar da — `python3.13`,
+ *                                   venv yolları — aynı kapıdan geçer)
  *  - `python -m splash ...`        (modül formu)
  *  - `uvx splash serve`            (uv/uvx formu)
  *
@@ -130,11 +148,13 @@ function isSplashRuntime(command: string): boolean {
  *
  * Tanıma: yürütülebilir basename `mlx_lm`/`mlx_vlm` (ya da
  * `mlx_lm.*`/`mlx_vlm.*` venv giriş noktaları, örn. `mlx_lm.server`)
- * ya da bir Python/uv yorumlayıcısının argümanlarından biri TAM
- * `mlx_lm`/`mlx_vlm` modül adı ya da `mlx_lm.*`/`mlx_vlm.*` biçiminde
- * (`python ... -m mlx_lm.server`, `-m mlx_vlm.generate`).
- * `python3 mlx_lm_utils.py` gibi yalnız ön-ecesi aynı dosya adları ve
- * `code /project/mlx-notes.txt` gibi argüman içi metinler eşleşmez.
+ * ya da bir Python/uv yorumlayıcısının — her formu: `python`, `python3`,
+ * versioned (`python3.13`), venv yolu (`/venv/bin/python3.12`), `uv`/`uvx` —
+ * argümanlarından biri TAM `mlx_lm`/`mlx_vlm` modül adı ya da
+ * `mlx_lm.*`/`mlx_vlm.*` biçiminde (`python ... -m mlx_lm.server`,
+ * `-m mlx_vlm.generate`). `python3 mlx_lm_utils.py` gibi yalnız ön-ecesi
+ * aynı dosya adları ve `code /project/mlx-notes.txt` gibi argüman içi
+ * metinler eşleşmez.
  */
 function isMlxRuntime(command: string): boolean {
   const tokens = tokenizeCommand(command);
@@ -166,18 +186,33 @@ function isMlxRuntime(command: string): boolean {
 }
 
 /**
- * Bir komut gerçek bir Ollama runtime/sunucu süreci mi?
+ * Bir komut gerçek bir Ollama serve/runtime süreci mi?
  *
- * Tanıma: yürütülebilir basename TAM `ollama` (herhangi bir alt
- * komut: `serve`, `runner`, ...). Argüman içindeki "ollama" metni
- * (`echo ollama`) YETMEZ — yürütülebilir konumu şarttır.
+ * Tanıma (token-bilinçli): yürütülebilir basename TAM `ollama` OLMALI ve
+ * ilk argüman token'ı `serve` (daemon) ya da `runner` (model yürüten
+ * subprocess) OLMALI. Güncel Ollama'da daemon `ollama serve`, model
+ * yürüten subprocess `ollama runner --port …` şeklindedir; restructure
+ * edilmiş repo (mlxrunner/discover) için argv'si doğrulanamayan ek formlar
+ * icat EDİLMEZ — sınıflayıcı minimal kalır.
+ *
+ * İdari CLI komutları (`ollama list`, `ollama ps`, `ollama pull …`,
+ * `ollama --help`, ...) daemon'u SORGULAR/işletir — kendisi long-running
+ * inference runtime'ı DEĞİLDİR ve Splash inference'ı bloklamamalı.
+ *
+ * Argüman içindeki "ollama" metni (`echo ollama`, `code
+ * /project/ollama-notes.txt`) YETMEZ — yürütülebilir konumu şarttır.
  */
 function isOllamaRuntime(command: string): boolean {
   const tokens = tokenizeCommand(command);
-  if (tokens.length === 0) {
+  if (tokens.length < 2) {
     return false;
   }
-  return basenameOf(tokens[0] ?? "") === "ollama";
+  const executable = basenameOf(tokens[0] ?? "");
+  if (executable !== "ollama") {
+    return false;
+  }
+  const subcommand = tokens[1] ?? "";
+  return subcommand === "serve" || subcommand === "runner";
 }
 
 /**
