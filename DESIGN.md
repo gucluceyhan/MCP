@@ -1,6 +1,6 @@
 # Splash — Architecture & Design (v2)
 
-Status: **Steps 1-3 implemented; rest design-only.**
+Status: **Steps 1–4 implemented; rest design-only.**
 
 Purpose: let a frontier orchestrator (Claude Code, OpenAI Codex) delegate
 *implementation* work to a **local LLM worker** to **significantly reduce
