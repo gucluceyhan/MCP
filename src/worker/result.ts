@@ -357,7 +357,11 @@ export type CompactStatus =
   | "max_rounds"
   | "inference_busy";
 
-/** Taban tazelik durumu (parmak izi denetimi, DESIGN.md 7.5). */
+/**
+ * Taban tazelik durumu (parmak izi denetimi, DESIGN.md 7.5) —
+ * `BaseMetadata`'ın literalleri bu sözlüktür; wire-vocabulary export'u
+ * olarak korunur (Step 6+ close/serialize yüzeyi kullanır).
+ */
 export type BaseStatus = "fresh" | "stale";
 
 /** Kuralların provenance değeri — kurallar İÇERİĞİ asla döndürülmez. */
@@ -431,13 +435,32 @@ export interface CompactUsage {
   out: number;
 }
 
+/**
+ * Taban tazelik metadata'sı — AYRIMLI (discriminated) union:
+ * `baseStatus` ile `staleFiles`'in varlığı birbirini ASLA çeliştiremez
+ * (DESIGN.md 3: `stale_files` present only when stale):
+ * - `fresh` → `staleFiles` olamaz (`never`);
+ * - `stale` → `staleFiles` ZORUNLUDUR (sürüklenmiş taban dosyaları).
+ */
+interface FreshBaseMetadata {
+  baseStatus: "fresh";
+  staleFiles?: never;
+}
+
+interface StaleBaseMetadata {
+  baseStatus: "stale";
+  /** Sürüklenmiş taban dosyaları — stale tabanda zorunlu. */
+  staleFiles: string[];
+}
+
+type BaseMetadata = FreshBaseMetadata | StaleBaseMetadata;
+
 /** Compact result'ın tüm durumlarında ortak alanları. */
-interface CompactResultBase {
+interface CompactResultCommon {
   /** Opa oturum kimliği (Splash üretir; worker asla bilmez). */
   sessionId: string;
   /** 1'den başlayan tur sayacı. */
   round: number;
-  baseStatus: BaseStatus;
   rulesSource: RulesSource;
   context: CompactContextMetadata;
   warnings: string[];
@@ -456,28 +479,30 @@ interface CompactRoundOutcome {
  * Compact result — `status` üzerinden ayrımlı union (discriminated).
  *
  * - `applied` / `partial` / `failed` / `max_rounds` → sonuç (outcome)
- *   taşır; `staleFiles` yalnız taban stale ise bulunur.
- * - `stale_base` → sonuç, son BAŞARILI turun çıktısını tanımlar ve
- *   `staleFiles` ZORUNLUDUR (hangi taban dosyaları sürüklendi).
- * - `needs_split` → `splitHint` koşullu metadatası; model çağrılmamıştır.
- * - `inference_busy` → `inference` koşullu metadatası; model çağrılmamıştır.
+ *   taşır; taban tazelik `BaseMetadata` üzerinden (fresh ⇔ staleFiles
+ *   yok; stale ⇔ staleFiles zorunlu).
+ * - `stale_base` → taban stale OLARAK TANIMLANIR (tur model çağrılmadan
+ *   iptal edildi, DESIGN.md 3): `baseStatus: "stale"` + `staleFiles`
+ *   zorunlu; "fresh" ile kurulamaz.
+ * - `needs_split` → tur kapısı (stale-base denetimi) ÖNCESİ geçilmiştir —
+ *   stale olsaydı durum `stale_base` olurdu; dolayısıyla tasarım gereği
+ *   HER ZAMAN fresh. `splitHint` koşullu metadatası; model çağrılmamıştır.
+ * - `inference_busy` → aynı gerekçe: dispatch'te (denetimin arkasında)
+ *   tespit edilir; HER ZAMAN fresh. `inference` koşullu metadatası;
+ *   model çağrılmamıştır.
  */
 export type CompactResult =
-  | (CompactResultBase & CompactRoundOutcome & {
+  | (CompactResultCommon & CompactRoundOutcome & BaseMetadata & {
       status: "applied" | "partial" | "failed" | "max_rounds";
-      /** Yalnızca stale tabanda bulunur. */
-      staleFiles?: string[];
     })
-  | (CompactResultBase & CompactRoundOutcome & {
+  | (CompactResultCommon & CompactRoundOutcome & StaleBaseMetadata & {
       status: "stale_base";
-      /** Sürüklenen taban dosyaları — bu durumda zorunlu. */
-      staleFiles: string[];
     })
-  | (CompactResultBase & CompactRoundOutcome & {
+  | (CompactResultCommon & CompactRoundOutcome & FreshBaseMetadata & {
       status: "needs_split";
       splitHint: SplitHint;
     })
-  | (CompactResultBase & CompactRoundOutcome & {
+  | (CompactResultCommon & CompactRoundOutcome & FreshBaseMetadata & {
       status: "inference_busy";
       inference: InferenceBusyMetadata;
     });

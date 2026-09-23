@@ -653,6 +653,74 @@ test("compact-result types: invalid constructions are rejected at compile time",
   assert.equal(badRules.rulesSource, "CLAUDE.md and AGENTS.md");
 });
 
+test("compact-result base freshness: baseStatus and staleFiles cannot contradict (Fix 2)", () => {
+  const base = {
+    sessionId: "opaque",
+    round: 3,
+    rulesSource: "none" as const,
+    context: {
+      runtimeMaxTokens: 262144,
+      inputTokens: 1000,
+      outputReserveTokens: 32768,
+      selectedContextTier: "64k" as const,
+      truncatedReadonlyContext: false,
+    },
+    warnings: [],
+  };
+  const outcome = {
+    summary: "done",
+    filesChanged: ["src/a.ts"],
+    diffStats: { files: 1, insertions: 2, deletions: 1 } satisfies DiffStats,
+    validation: {
+      editsRequested: 1,
+      editsApplied: 1,
+      rejected: [],
+    } satisfies ValidationResult,
+    usage: { in: 50, out: 60 },
+  };
+
+  // GEÇERLİ — fresh ⇔ staleFiles yok:
+  const validFresh: CompactResult = { ...base, ...outcome, status: "applied", baseStatus: "fresh" };
+  // GEÇERLİ — stale ⇔ staleFiles var:
+  const validStale: CompactResult = { ...base, ...outcome, status: "applied", baseStatus: "stale", staleFiles: ["src/a.ts"] };
+  // GEÇERLİ — stale_base stale OLARAK TANIMLANIR (DESIGN.md 3): stale + staleFiles:
+  const validStaleBase: CompactResult = { ...base, ...outcome, status: "stale_base", baseStatus: "stale", staleFiles: ["src/a.ts"] };
+  // GEÇERLİ — needs_split / inference_busy tasarım gereği HER ZAMAN fresh
+  // (tur kapısı önce; stale olsaydı stale_base olurdu): baseStatus DIRECT
+  // olarak girer — spread ile değil (M5 pini: union üyesinden alan
+  // silinse de direct literal yine hatasıyla yakalanır):
+  const needsSplitFresh: CompactResult = { ...base, ...outcome, status: "needs_split", baseStatus: "fresh", splitHint: { requiredInputTokens: 1, availableMaxTokens: 1, outputReserveTokens: 1, pressureFiles: [] } };
+  const busyFresh: CompactResult = { ...base, ...outcome, status: "inference_busy", baseStatus: "fresh", inference: { conflict: "splash" } };
+  void validFresh;
+  void validStale;
+  void validStaleBase;
+  void needsSplitFresh;
+  void busyFresh;
+
+  // Not: `@ts-expect-error` yalnız bir SONRAKİ satırdaki hatayı bastırdığı
+  // için çelişkili literal'lar TEK SATIRDA yazılır.
+  // @ts-expect-error — fresh taban staleFiles TAŞIYAMAZ
+  const freshWithStaleFiles: CompactResult = { ...base, ...outcome, status: "applied", baseStatus: "fresh", staleFiles: ["src/a.ts"] };
+  // @ts-expect-error — stale taban staleFiles'sİZ kurulamaz
+  const staleWithoutFiles: CompactResult = { ...base, ...outcome, status: "applied", baseStatus: "stale" };
+  // @ts-expect-error — stale_base fresh OLAMAZ
+  const staleBaseFresh: CompactResult = { ...base, ...outcome, status: "stale_base", baseStatus: "fresh" };
+  // @ts-expect-error — stale_base + fresh + staleFiles (çifte çelişki)
+  const staleBaseFreshWithFiles: CompactResult = { ...base, ...outcome, status: "stale_base", baseStatus: "fresh", staleFiles: ["src/a.ts"] };
+  // @ts-expect-error — needs_split: tur kapısı (stale-base denetimi) assembly ÖNCE; stale olsaydı stale_base olurdu ⇒ her zaman fresh
+  const needsSplitStale: CompactResult = { ...base, ...outcome, status: "needs_split", baseStatus: "stale", staleFiles: ["src/a.ts"], splitHint: { requiredInputTokens: 1, availableMaxTokens: 1, outputReserveTokens: 1, pressureFiles: [] } };
+  // @ts-expect-error — inference_busy: dispatch denetimin ARKASINDA ⇒ her zaman fresh
+  const busyStale: CompactResult = { ...base, ...outcome, status: "inference_busy", baseStatus: "stale", staleFiles: ["src/a.ts"], inference: { conflict: "splash" } };
+
+  // runtime: literal'lar tip hatalı olsa da inşaa edilebilir (type-level test)
+  assert.equal(freshWithStaleFiles.status, "applied");
+  assert.equal(staleWithoutFiles.status, "applied");
+  assert.equal(staleBaseFresh.status, "stale_base");
+  assert.equal(staleBaseFreshWithFiles.status, "stale_base");
+  assert.equal(needsSplitStale.status, "needs_split");
+  assert.equal(busyStale.status, "inference_busy");
+});
+
 // ── Tam (exact) anahtar kümesi pinleri — audit takibi ─────────────────────
 //
 // Parserın tek koruması `hasExactKeySet`'in UZUNLUK kontrolüdür; bu

@@ -87,6 +87,48 @@ test("blank supplied rules are normalized as absent — the prompt does not inve
   assert.equal(prompt, omitted);
 });
 
+test("nonblank rules with meaningful leading/trailing whitespace are injected VERBATIM — trim is only for emptiness detection (Fix 1)", () => {
+  const rules =
+    "    indented example\n" +
+    "\n" +
+    "Follow this rule.\n";
+  const prompt = systemPromptOf({ ...baseInput(), rules });
+  // tam orijinal metin (baştaki 4 boşluk + sondaki yeni satır dahil)
+  // marker'lar arasında aynen bulunur:
+  assert.ok(
+    prompt.includes("PROJECT RULES\n" + rules + "\nEND PROJECT RULES"),
+    "original rules bytes must reach the prompt unchanged",
+  );
+  // VE trim edilmiş hâliyle DEĞİL — eski davranış ("PROJECT RULES\n" +
+  // rules.trim() + "\nEND PROJECT RULES") bu girişte gözlemlenebilir
+  // fark yaratırdı (baş bozukluğundan ve son satır yapısından):
+  assert.ok(
+    !prompt.includes("PROJECT RULES\n" + rules.trim() + "\nEND PROJECT RULES"),
+    "the trimmed variant must not be what reached the prompt",
+  );
+});
+
+test("nonblank rules body preserves leading/trailing spaces exactly", () => {
+  const prompt = systemPromptOf({ ...baseInput(), rules: "  Use tabs.  " });
+  // kurallar gövdesi TAM olarak "  Use tabs.  " (boşluklarla) — render:
+  assert.ok(prompt.includes("PROJECT RULES\n  Use tabs.  \nEND PROJECT RULES"));
+  // trim edilmiş gövde ("Use tabs.") marker'lara bu şekilde yapışmaz:
+  assert.ok(!prompt.includes("PROJECT RULES\nUse tabs.\nEND PROJECT RULES"));
+});
+
+test("rules byte preservation: tabs, CRLF and trailing whitespace survive (Fix 1)", () => {
+  const rules = "\r\n\ttabbed rule\t  \r\n  \t";
+  const prompt = systemPromptOf({ ...baseInput(), rules });
+  assert.ok(
+    prompt.includes("PROJECT RULES\n" + rules + "\nEND PROJECT RULES"),
+    "CRLF/tab/trailing-space bytes must survive verbatim",
+  );
+  // trim sonucunda tek bir "tabbed rule" kalırdı — o hâl promptta YOK:
+  assert.ok(
+    !prompt.includes("PROJECT RULES\n" + rules.trim() + "\nEND PROJECT RULES"),
+  );
+});
+
 test("non-string rules / context are rejected", () => {
   inputFail(asInput({ ...baseInput(), rules: 42 }));
   inputFail(asInput({ ...baseInput(), context: 42 }));

@@ -41,9 +41,12 @@ export interface WorkerHistoryMessage {
  * Worker mesaj inşasının yapılandırılmış girdisi — tüm değerler BURAYA
  * hazırlanmış hâlle gelir:
  * - `task`: görev bildirimi (boş değil).
- * - `rules`: çözülMÜŞ proje kuralları (Step 8 çözer — Step 4 CLAUDE.md /
- *   AGENTS.md aramaz). Boşluk-tek başına değer = YOK sayılır (kurallar
- *   bloğu prompt'ta yer almaz).
+  * - `rules`: çözülMÜŞ proje kuralları (Step 8 çözer — Step 4 CLAUDE.md /
+  *   AGENTS.md aramaz). Boşluk-tek başına değer = YOK sayılır (kurallar
+  *   bloğu prompt'ta yer almaz); boş-olmayan değer AYNEN (bayt-bayt,
+  *   trim/normalize edilmeden) enjekte edilir — trim yalnız boşluk-tek
+  *   denetimi içindir; içerik yeniden yazılmaz (girinti/boşluk anlamlı
+  *   olabilir).
  * - `context`: hazır repository bağlam bloğu (Step 7 kurar — Step 4 yalnız
  *   verilen stringi user mesajına yerleştirir).
  * - `history`: önceki turlar (çağrı sırasıyla; sırası aynen korunur).
@@ -155,6 +158,10 @@ const EDITING_SECTION = `EDITING
  * Proje kuralları bloğu — SADECE kurallar verildiyse var.
  * Kurallar "proje kuralları" olarak etiketlenir ve izlenmesi söylenir;
  * ancak sözleşmenin yapısal/güvenlik sınırını ASLA geçersiz kılamazlar.
+ *
+ * Kural metni AYNI KALIR (verbatim): bu fonksiyon içeriği ASLA trim /
+ * normalize etmez — yalnızca marker'ların arasına koyar (indentation,
+ * CRLF, tab, trailing boşluk aynen taşınır).
  */
 function rulesSection(rules: string): string {
   return `PROJECT RULES
@@ -235,10 +242,13 @@ function headroomLine(outputReserveTokens: number): string {
 function buildSystemPrompt(input: WorkerPromptInput): string {
   const sections: string[] = [ROLE_SECTION, POLICY_SECTION, EDITING_SECTION];
   // Boşluk-tek kurallar YOK sayılır (belgelenen girdi sözleşmesi) —
-  // prompt kuralları "icat" etmez.
-  const rules = input.rules === undefined ? "" : input.rules.trim();
-  if (rules !== "") {
-    sections.push(rulesSection(rules));
+  // prompt kuralları "icat" etmez. Trim YALNIZCA boşluk-tek denetimi
+  // içindir: enjeksiyona ORİJİNAL string girer (kurallar caller tarafından
+  // hazırdır; WorkerContract içeriği asla yeniden yazmaz — baş/son
+  // boşluklar anlamlı olabilir).
+  const suppliedRules = input.rules;
+  if (suppliedRules !== undefined && suppliedRules.trim().length > 0) {
+    sections.push(rulesSection(suppliedRules));
   }
   sections.push(
     CONTEXT_SECTION,
