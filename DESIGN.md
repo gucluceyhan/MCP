@@ -744,7 +744,11 @@ structure and checked before any effect:
    (create). Additional read-only context files are **not** writable — edits
    targeting them are rejected. Nothing else.
 3. **Path bounds**: workspace-relative, no `..` escape, no absolute paths, no
-   symlink targets outside the workspace.
+   symlink targets outside the workspace. Any path handed to Git as a pathspec
+   is pinned with `:(literal)`, so pathspec magic (glob, `:(exclude)`, …) can
+   never act on a path — a path is a path, not a directive (normalization
+   deliberately does not reject the magic characters: legitimate file names
+   may contain them; the pin is the control).
 4. **Match (pre-apply)**: every `search` string is validated against the
    **immutable base** content of that file; each required match must be
    **unique**; **overlapping edit ranges are detected and rejected** (an
