@@ -5,17 +5,31 @@
  * Bu dosyada İKİ yakalama yolu yaşar:
  *
  * 1. Base yakalama desteği (`gitModeType`/`normalizeGitFileMode`/`sha256Hex`):
- *    `GitWorktreeWorkspace` geçici base commit'i oluşturduktan sonra base
- *    commit'in `ls-tree`/`cat-file` verisinden parmak izi üretir. İçerik
- *    özetleri git blob baytlarından alınır — workspace dosya baytları DEĞİL
- *    (base commit tek doğruluk kaynağı; eol/textconv ayarları iki tarafı
- *    farklı baytlara soksa bile base kendisiyle tutarlı kalır).
+ *    `GitWorktreeWorkspace` geçici base commit'i oluşturduktan sonra seçili
+ *    yolların parmak izini worktree'nin ÇALIŞMA DOSYALARINDAN yakalar —
+ *    `captureLiveFingerprint` ile BİREBİR aynı alan (PR #24):
+ *    varlık (base commit'in `ls-tree`'i) + tip/mod (çalışma dosyasının
+ *    `lstat`'ı: `0o100` bit → `100755`/`100644`; link → `120000`) + içerik
+ *    SHA-256'ı (düzenli dosyanın baytları / link hedef metni).
+ *
+ *    İKİ ALAN KARIŞTIRILMAZ:
+ *    - base parmak izi + tam-eşleşme içeriği = **working-tree baytları**
+ *      (worker'a gösterilen şey birebir budur; `text`/`eol` normalizasyonu
+ *      blob ile working tree'yi FARKLI baytlara sokabilir — ör. working
+ *      tree CRLF vs blob LF — bu beklenen ve tam eşleşmeyi bozmaz);
+ *    - geçici base commit = **diff/reset/export tabanı** (`git diff <base>`,
+ *      `git reset --hard <base>`, `git apply`) — git kendi I/O'sunu bu
+ *      commit etrafında tutarlı normalize eder.
+ *    Base commit'in `ls-tree`'i yapısal doğruluk kaynağı olarak kalır
+ *    (varlık + git modu → `basePaths`; create/delete denetimleri).
  *
  * 2. `captureLiveFingerprint`: bir yolun ANLIK (live) durumunu parmak iziye
  *    çevirir — Step 9'un stale-base denetimi bu yardımcıyı kullanacak
- *    (ana working-tree'deki canlı durum ↔ immutable base parmak izi).
- *    Step 5 karşılaştırma/MANTIĞI YAPMAZ; yalnızca yeniden kullanılabilir
- *    yakalama sağlar (spec 31: "Do NOT implement stale comparison yet").
+ *    (ana working-tree'deki canlı durum ↔ immutable base parmak izi —
+ *    PR #24'tan itibaren base YENİDEN aynı alandan yakalandığı için iki
+ *    taraf aynı ölçekte karşılaştırılır). Step 5 karşılaştırma/MANTIĞI
+ *    YAPMAZ; yalnızca yeniden kullanılabilir yakalama sağlar (spec 31:
+ *    "Do NOT implement stale comparison yet").
  *
  * Sembolik bağlantılar ASLA takip edilmez: link'in parmak izi = hedef metin.
  */

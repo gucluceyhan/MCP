@@ -20,7 +20,7 @@ import {
   WorkspaceError,
   type WorkspaceErrorKind,
 } from "../dist/workspace/Workspace.js";
-import { computeRepoId, discoverRepoRoot, runGit } from "../dist/workspace/git.js";
+import { computeRepoId, discoverRepoRoot, parseCatFileBatch, runGit } from "../dist/workspace/git.js";
 
 let tmp: string;
 let emptyConfigFile: string;
@@ -137,7 +137,7 @@ test("runGit: failed command → safe fixed message; raw stderr stays in cause o
   const err = await expectWorkspaceError("git_operation_failed", () =>
     runGit(["rev-parse", "--verify", "definitely-not-a-ref-xyz"], { cwd: repo }),
   );
-  // Message SABİТ (git sürümünden bağımsız) — ham çıktı message'da ASLA yok.
+  // Message SABİT (git sürümünden bağımsız) — ham çıktı message'da ASLA yok.
   assert.equal(err.message, "A Git operation failed");
   assert.ok(!err.message.includes("fatal"), "raw git output must not leak into message");
   assert.ok(!err.message.includes("definitely-not-a-ref-xyz"), "raw git output must not leak into message");
@@ -172,4 +172,60 @@ test("runGit: stdin payload is piped without a shell (git apply via stdin)", asy
   const res = await runGit(["apply"], { cwd: repo, stdin: diff.stdout });
   assert.ok(Buffer.isBuffer(res.stdout));
   assert.equal((await readFile(path.join(repo, "patched.txt"))).toString("utf8"), "after\n");
+});
+
+// ── parseCatFileBatch ───────────────────────────────────────────────────────
+
+test("parseCatFileBatch: size-framed records (incl. newline-filled blobs); malformed/truncated/separator-missing rejected", () => {
+  const oidA = "a".repeat(40);
+  const oidB = "b".repeat(40);
+  const oidC = "c".repeat(40);
+  const hello = Buffer.from("hello");
+  const abc = Buffer.from("abc");
+  const newlines = Buffer.from([0x0a, 0x0a, 0x0a]); // ayracı ANDA içeren binary
+
+  const good = Buffer.concat([
+    Buffer.from(`${oidA} blob ${hello.length}\n`, "utf8"),
+    hello,
+    Buffer.from("\n", "utf8"),
+    Buffer.from(`${oidB} blob ${abc.length}\n`, "utf8"),
+    abc,
+    Buffer.from("\n", "utf8"),
+    Buffer.from(`${oidC} blob ${newlines.length}\n`, "utf8"),
+    newlines,
+    Buffer.from("\n", "utf8"),
+  ]);
+  const map = parseCatFileBatch(good);
+  assert.equal(map.size, 3);
+  assert.deepEqual(map.get(oidA), hello);
+  assert.deepEqual(map.get(oidB), abc);
+  assert.deepEqual(map.get(oidC), newlines, "newline-filled content is framed by the header size, not by separators");
+
+  // kesik gövde (header 10 bayt diyor, 2 bayt var) → güvenli hata
+  assert.throws(
+    () => parseCatFileBatch(Buffer.concat([Buffer.from(`${oidA} blob 10\n`, "utf8"), Buffer.from("hi")])),
+    WorkspaceError,
+  );
+  // bozuk header → güvenli hata
+  assert.throws(() => parseCatFileBatch(Buffer.from("garbage\nxxxx\n")), WorkspaceError);
+  // kayıt ayracı eksik (ikisi de olmayan bir bayt) → güvenli hata
+  const noSeparator = Buffer.concat([
+    Buffer.from(`${oidA} blob ${hello.length}\n`, "utf8"),
+    hello,
+    Buffer.from("x", "utf8"), // ne \n ne \0
+    Buffer.from(`${oidB} blob ${abc.length}\n`, "utf8"),
+    abc,
+  ]);
+  assert.throws(() => parseCatFileBatch(noSeparator), WorkspaceError);
+  // boş girdi → boş harita (hata YOK)
+  assert.equal(parseCatFileBatch(Buffer.alloc(0)).size, 0);
+});
+
+test("parseCatFileBatch: real git cat-file --batch round-trip", async () => {
+  const repo = await makeRepo("catbatch");
+  const oid = (await runGit(["rev-parse", "HEAD:f.txt"], { cwd: repo })).stdout.toString("utf8").trim();
+  assert.match(oid, /^[0-9a-f]{40}$/);
+  const res = await runGit(["cat-file", "--batch"], { cwd: repo, stdin: `${oid}\n` });
+  const map = parseCatFileBatch(res.stdout);
+  assert.deepEqual(map.get(oid), Buffer.from("hello\n"), "blob bytes round-trip exactly");
 });

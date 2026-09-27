@@ -12,11 +12,12 @@
  *
  * ANA DEPO invarianti (spec 4): worker kaynak değişiklikleri asla ana
  * checkout'a yazılmaz. Ana depoda yalnızca salt-okunur git sorguları
- * (`rev-parse`, `diff`, `ls-files`) + dosya okumaları yapılır; `git worktree
- * add/remove` paylaşılan `.git/worktrees/` yönetim alanını doğal olarak
- * günceller — `.git`'in bayt-bayt dokunulmadığı iddia edilmez. Ana
- * working-tree dosyaları, index, dal referansları, tag'lar ve içerik
- * DEĞİŞMEZ (test: spec 75).
+ * (`rev-parse`, `diff`, `ls-files`, `ls-tree`, `check-attr`, `config --get`)
+ * + dosya okumaları yapılır; `git worktree add/remove` paylaşılan
+ * `.git/worktrees/`
+ * yönetim alanını doğal olarak günceller — `.git`'in bayt-bayt dokunulmadığı
+ * iddia edilmez. Ana working-tree dosyaları, index, dal referansları,
+ * tag'lar ve içerik DEĞİŞMEZ (test: spec 75).
  *
  * Base'in BİREBİR yakalanması (spec 18, DESIGN.md 7.3) — zorunlu sıra:
  *   1.  ana depodan tracked delta: `git diff HEAD --binary --full-index`
@@ -27,8 +28,30 @@
  *   5.  `git add -A` (+ seçilen ignored yollar için tekil `git add -f`)
  *   6.  geçici base commit: hook yok, imza yok, deterministik Splash kimliği,
  *       detached, `--allow-empty` — branch/tag/ref YOK (spec 24/25/26)
- *   7.  base SHA kaydedilir → immutable (spec 27); parmak izleri + base
- *       ağaç haritası base COMMIT'TEN yakalanır (tek doğruluk kaynağı)
+ *   7.  base SHA kaydedilir → immutable (spec 27); base AĞAÇ HARİTASI
+ *       (`basePaths`) base commit'in `ls-tree`'inden; parmak izlerinin
+ *       tip/mod/içeriği worktree'nin ÇALIŞMA DOSYALARINDAN (lstat +
+ *       dosya baytları / link hedef metni) — canlı parmak iziyle BİREBİR
+ *       aynı alan (PR #24: `text`/`eol` normalizasyonu blob ile working
+ *       tree'yi farklı baytlara sokabilir; iki alan karıştırılmaz)
+ *
+ * v1 güvenlik politikası (PR #24 — tamamı SABİT mesajlı fail-closed red):
+ * - seçili yol, sembolik-bağlantı ATALI üzerinden izlenemez — ne ana
+ *   depoda (kopya kaynağı) ne workspace'te (kopya hedefi);
+ * - seçili sembolik bağlantının (tracked VEYA untracked) hedefi repo
+ *   SINIRI içinde olmalı; dış/kaçan hedef → oluşum red;
+ * - repo-tanımlı DIŞ Git filter'ları (`filter.<d>.clean/smudge/process`)
+ *   v1'de YÜRÜTÜLMEZ — İKİ attribute yüzeyi denetlenir: working-tree
+ *   (delta/clean) + HEAD ağacı (checkout/smudge — `git worktree add`
+ *   committed attribute yüzeyini TAM ağaca uygular); ilksel
+ *   filter-yürütebilecek komuttan ÖNCE fail-closed red (builtin
+ *   `text`/`eol` normalizasyonu filter DEĞİLDİR).
+ * - Aynı fail-closed filter check HER TURDA worktree yüzeyinde yeniden
+ *   koşular (PR #24 audit F-6): worker yazıları UYGULANDIKTAN, turun ilk
+ *   filter-capable komutundan (add -N / diff) ÖNCE + export diff'inden
+ *   önce — worktree'nin attribute yüzeyi worker-YAZILABİLİR (worker
+ *   `.gitattributes` eker; config'de önceden tanımlı driver — LFS dahi —
+ *   tur içi diff/stat/export komutlarında host'ta yürütülürdü).
  *
  * Her diff/stat/export `baseCommit`'e görecelidir (spec 64) — main'in
  * mevcut değişiklikleri base'e dahil edildiği için worker diff'inde
@@ -50,6 +73,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { DiffStats, WorkerResult } from "../worker/result.js";
@@ -66,7 +90,6 @@ import {
   HOOKS_DISABLED_CONFIG,
   computeRepoId,
   literalPathspec,
-  parseCatFileBatch,
   runGit,
   splitNul,
   type GitRunResult,
@@ -89,6 +112,35 @@ const SPLASH_GIT_IDENTITY: NodeJS.ProcessEnv = {
   GIT_COMMITTER_NAME: "Splash",
   GIT_COMMITTER_EMAIL: "splash@local.invalid",
 };
+
+// ── fs seam (PR #24 Fix 4 — küçük test enjeksiyonu noktası; DI framework YOK) ──
+
+/**
+ * Worker-oluşturulan yol temizliğinin fs arayüzü: yalnız `lstat` + `unlink`.
+ * `removeWorkerCreatedPaths` bu aktif fs üzerinden çalışır — testler
+ * `setWorkspaceFs` ile arıza senaryoları (ENOENT/EACCES/...) enjekte eder;
+ * `null` gerçek fs'e döner. Modülün geri kalanı node:fs'i doğrudan kullanır.
+ */
+export interface WorkspaceFs {
+  lstat(path: string): Promise<Stats>;
+  unlink(path: string): Promise<void>;
+}
+
+const realFs: WorkspaceFs = { lstat, unlink };
+let activeFs: WorkspaceFs = realFs;
+
+/** Test enjeksiyonu seam'i: `null` → gerçek node:fs. */
+export function setWorkspaceFs(ops: WorkspaceFs | null): void {
+  activeFs = ops === null ? realFs : ops;
+}
+
+/** `err`'ın `NodeJS.ErrnoException.code`'u verilen errno'ya eşit mi? */
+function isErrnoCode(err: unknown, code: string): boolean {
+  if (typeof err !== "object" || err === null) {
+    return false;
+  }
+  return (err as NodeJS.ErrnoException).code === code;
+}
 
 interface LsTreeEntry {
   mode: string;
@@ -135,7 +187,12 @@ export class GitWorktreeWorkspace implements Workspace {
   readonly base: WorkspaceBaseInfo;
 
   private destroyed = false;
-  /** Son başarılı patch set'in kabul edilen create hedefleri (kapsamlı sıfırlama için, spec 59). */
+  /**
+   * Bilinen worker-oluşturulan yollar (kapsamlı sıfırlama için, spec 59):
+   * son başarılı turun create'ları; başarısız rollback/temizlik sonrası
+   * BİLİNEN KALINTI kümesi (bir sonraki temizlik yeniden dener —
+   * küme yalnız temizlik BAŞARILI bitince temizlenir, PR #24 Fix 4).
+   */
   private workerCreatedPaths = new Set<string>();
   /** Doğrulamanın immutable base girdisi (kamuya açık `base`'in genişlemesi). */
   private validationBase: WorkspaceBase;
@@ -196,11 +253,21 @@ export class GitWorktreeWorkspace implements Workspace {
 
   /**
    * Worker sonucu uygular (spec 35 yaşam döngüsü):
-   *   1) tracked durumu immutable base'e sıfırla
-   *   2) ÖNCEKİ turun worker-oluşturduğu yolları KAPSAMLI kaldır (geniş
-   *      `git clean` ASLA, spec 37)
+   *   1) ÖNCEKİ turun worker-oluşturduğu yolları KAPSAMLI kaldır (geniş
+   *      `git clean` ASLA, spec 37) — sıfırlamadan ÖNCE (audit F-6:
+   *      worker bitkisi `reset --hard`'ın racy doğrulamasında filter
+   *      yürütebilir) — temizlik hatası → yöntem RED; küme eski (bilinen
+   *      kalıntı) setiyle KALIR, başarı raporlanmaz
+   *   2) tracked durumu immutable base'e sıfırla — işletimsel hata →
+   *      `workspace_operation_failed` (ana checkout'a asla dokunulmaz)
    *   3) TÜM WorkerResult'ı immutable base'e karşı semantik doğrula
    *   4) yalnız kabul edilen düzenlemeleri uygula
+   *   4b) fail-closed filter re-check (PR #24 audit F-6): worker yazıları
+   *       worktree'de UYGULANDIKTAN, turun ilk filter-capable komutundan
+   *       (add -N / diff) ÖNCE — worker-ekli `.gitattributes` + config'de
+   *       önceden tanımlı driver (LFS dahi) → `invalid_repository` red;
+   *       rollback (bu turun create temizliği → reset, audit F-6 sırası)
+   *       devreye girer
    *   5) kabul edilen create'ları intent-to-add işaretle (spec 60)
    *   6) workerCreatedPaths = bu turun kabul edilen create'ları (spec 59)
    *   7) filesChanged/diffStats git'ten hesapla (worker beyanına güvenilmez, spec 62)
@@ -209,17 +276,52 @@ export class GitWorktreeWorkspace implements Workspace {
    * base'e karşı TAM ikame patch set'idir (spec 35/88 — drift imkânsız).
    *
    * Atımlar sırasında beklenmeyen işletimsel hata (spec 58): workspace base
-   * durumuna geri Restore edilir, güvenli tip'li `WorkspaceError` atılır —
-   * yarım patch "başarı" olarak raporlanmaz; ana checkout'a DOKUNULMAZ.
+   * durumuna geri Restore edilir + bu turun kalıntıları temizlenir, güvenli
+   * tip'li `WorkspaceError` atılır — yarım patch "başarı" olarak raporlanmaz;
+   * ana checkout'a DOKUNULMAZ. Rollback SIRASI (audit F-6): önce bu turun
+   * worker-oluşturdukları (bitki dahil) saf fs ile kaldırılır, SONRA
+   * `reset --hard` — kaldırma hata verirse reset YÜRÜTÜLMEZ (bitki attr
+   * yüzeyiyle filter çalışmaz). Rollback'in kendisi başarısız olursa
+   * (temizlik veya reset): bilinen kalıntı `workerCreatedPaths`'a
+   * KAYDEDİLİR (union — unutulmaz, sonraki reset/apply yeniden dener) ve
+   * güvenli işletimsel hata atılır (PR #24 Fix 4).
    */
   async applyPatchSet(workerResult: WorkerResult): Promise<WorkspaceApplyResult> {
     this.assertUsable();
 
-    // (1) Tracked durum → immutable base. (Asla main'e, asla main HEAD'e değil — spec 36.)
-    await this.git(["reset", "--hard", this.baseCommit]);
+    // (1) Önceki turun worker-oluşturduğu yollar — yalnız bilinen küme (spec 37/38).
+    // Sıfırlamadan ÖNCE (PR #24 audit F-6): worktree'de worker-ekili bir
+    // attribute dosyası (örn. `.gitattributes`) kalıntısı varsa `git reset
+    // --hard`'ın racy içerik doğrulaması (ölçüldü, Apple Git 2.50:
+    // checkout → stat-aynı-saniye → içerik yeniden doğrulama) o yüzeydeki
+    // CLEAN filter'ı host'ta yürütür. Worker yazıları (saf fs, `activeFs`
+    // seam'i) git komutundan ÖNCE kaldırılır; temizlik hatası → yöntem RED —
+    // reset YÜRÜTÜLMEZ, küme bilinen kalıntı olarak KALIR.
+    const previousCreated = this.workerCreatedPaths;
+    try {
+      await this.removeWorkerCreatedPaths(previousCreated);
+    } catch (err) {
+      if (err instanceof WorkspaceError) {
+        throw err;
+      }
+      throw new WorkspaceError("workspace_operation_failed", "Cleaning the worker-created paths failed", {
+        cause: err,
+      });
+    }
 
-    // (2) Önceki turun worker-oluşturduğu yollar — yalnız bilinen küme (spec 37/38).
-    await this.removeWorkerCreatedPaths(this.workerCreatedPaths);
+    // (2) Tracked durum → immutable base. (Asla main'e, asla main HEAD'e değil — spec 36.)
+    // (1) yalnızca bilinen worker yollarını (untracked) kaldırdığı için tracked
+    // durum hâlâ bu adımda sıfırlanır; worker bitkisi git'in önünde gitmiş
+    // olmalı (yukarıdaki gerekçe). İşletimsel hata → güvenli tip'li red
+    // (ana checkout'a asla dokunulmaz); küme temizlenMEZ (kalıntı unutulmaz).
+    try {
+      await this.git(["reset", "--hard", this.baseCommit]);
+    } catch (err) {
+      throw new WorkspaceError("workspace_operation_failed", "Resetting the workspace to base failed", {
+        cause: err,
+      });
+    }
+    // Küme yalnız temizlik + sıfırlama TAMAMEN başarılı bitince temizlenir.
     this.workerCreatedPaths = new Set<string>();
 
     // (3) TÜM seti immutable base'e karşı doğrula — yazmadan ÖNCE (spec 39).
@@ -298,6 +400,28 @@ export class GitWorktreeWorkspace implements Workspace {
         }
       }
 
+      // (4b) PR #24 audit F-6 — fail-closed filter re-check, TEK çağrı:
+      // worker yazıları (create/modify/delete) worktree'de UYGULANDI; buradan
+      // sonraki her filter-capable komut (add -N, diff --name-only/--numstat)
+      // worktree attribute yüzeyiyle içerik okur. Worker o yüzeyi YAZABİLİR
+      // (`.gitattributes` create/modify — `create` allow-list'ten BAĞIMSIZ,
+      // spec 81): config'de önceden tanımlı driver'ın (LFS dahi)
+      // clean/smudge komutu tur içinde host'ta yürütülürdü (RCE). Yüzey:
+      // worktree'nin `ls-files`'i ∪ bu turun plan yolları (create+modify+
+      // delete) ∪ bilinen kalıntı kümesi (`workerCreatedPaths` — başarısız
+      // cleanup'tan arta kalan worker yazıları; round'lar arası fail-closed).
+      // Tehdit → `invalid_repository` (SABİT); doğrulanamayan yüzey →
+      // `git_operation_failed` — ikisi de filter-capable komuttan ÖNCE.
+      // Buradaki `throw`, mevcut rollback yoluna düşer (aşağıdaki sırayla):
+      // bu turun worker yazıları (bitki dahil) saf fs ile KALDIRILIR, SONRA
+      // `reset --hard` — worker yazıları worktree'den gider, yarım state
+      // KALMAZ, filter hiçbir git komutunda yürümez.
+      await assertNoExternalFilters(
+        this.workspaceDir,
+        [...validation.plan.map((plan) => plan.canonical), ...this.workerCreatedPaths],
+        this.baseCommit,
+      );
+
       // (5) intent-to-add: worker içerik index'e TAMAMLANMIŞ değişiklik olarak
       // DEĞİL, görünürlük için işaretlenir (spec 60) — diff/stat/export
       // create'ları içerir; base commit DEĞİŞMEZ. `:(literal)` pin'i:
@@ -310,18 +434,42 @@ export class GitWorktreeWorkspace implements Workspace {
       // (6) Bilinen küme = bu turun kabul edilen create'ları (spec 59).
       this.workerCreatedPaths = new Set<string>(createdThisRound);
     } catch (err) {
-      // (spec 58) işletimsel hata: base'e dön + bilinen create'ları temizle.
+      // (spec 58) işletimsel hata: bu turun kalıntılarını temizle + base'e
+      // dön. Rollback SIRASI (audit F-6): ÖNCE bu turun worker-oluşturdukları
+      // (bitki `.gitattributes` dahil) saf fs ile kaldırılır, SONRA
+      // `reset --hard` — `git reset --hard`'ın racy içerik doğrulaması
+      // (ölçüldü, Apple Git 2.50) bitki attr yüzeyiyle CLEAN filter'ı
+      // host'ta yürütür; bitki git'in önünde kaldırılmalıdır. Kaldırma
+      // hata verirse reset YÜRÜTÜLMEZ (temizlik hatası = rollback hatası).
+      // Rollback adım hatası → güvenli işletimsel hata; BİLİNEN KALINTI
+      // unutulmaz: küme = önceki set ∪ bu turun create'ları (bir sonraki
+      // reset/apply yeniden temizlemeyi dener; workspace "temiz" olarak
+      // ASLA raporlanmaz).
+      let rollback: { error: unknown; message: string } | null = null;
       try {
-        await this.git(["reset", "--hard", this.baseCommit]);
         await this.removeWorkerCreatedPaths(new Set<string>(createdThisRound));
-      } catch {
-        // Geri alma bile başarısız → güvenli işletimsel hata (ana checkout'a dokunulmadı).
+      } catch (cleanupErr) {
+        rollback = { error: cleanupErr, message: "Cleaning the worker-created paths failed" };
       }
-      this.workerCreatedPaths = new Set<string>();
-      if (err instanceof WorkspaceError) {
-        throw err;
+      if (rollback === null) {
+        try {
+          await this.git(["reset", "--hard", this.baseCommit]);
+        } catch (resetErr) {
+          rollback = { error: resetErr, message: "Resetting the workspace to base failed" };
+        }
       }
-      throw new WorkspaceError("workspace_operation_failed", "Applying the patch failed", { cause: err });
+      if (rollback === null) {
+        // Rollback TAMAMEN başarılı: kalıntılar giderildi, workspace base'te
+        // → küme BOŞ + orijinal hata atılır.
+        this.workerCreatedPaths = new Set<string>();
+        if (err instanceof WorkspaceError) {
+          throw err;
+        }
+        throw new WorkspaceError("workspace_operation_failed", "Applying the patch failed", { cause: err });
+      }
+      // Rollback tamamlanamadı: bilinen kalıntı kaydedilir (union).
+      this.workerCreatedPaths = new Set<string>([...previousCreated, ...createdThisRound]);
+      throw new WorkspaceError("workspace_operation_failed", rollback.message, { cause: rollback.error });
     }
 
     // (7) Sonuçlar git'ten — worker beyanına değil (spec 62).
@@ -330,11 +478,41 @@ export class GitWorktreeWorkspace implements Workspace {
     return { validation: validation.result, filesChanged, diffStats };
   }
 
-  /** Tracked durumu base'e sıfırlar + önceki worker-oluşturulan yolları kapsamlı kaldırır. */
+  /**
+   * Önceki worker-oluşturulan yolları kapsamlı kaldırır (geniş `git clean`
+   * ASLA) + tracked durumu base'e sıfırlar. SIRASI (PR #24 audit F-6):
+   * temizlik ÖNCE, `reset --hard` SONRA — worktree'de worker-ekili bir
+   * attribute dosyası kalıntısı varsa `git reset --hard`'ın racy içerik
+   * doğrulaması (ölçüldü, Apple Git 2.50) o yüzeydeki CLEAN filter'ı
+   * host'ta yürütür; bilinen worker yazıları git komutundan önce, saf fs
+   * ile gider. Küme yalnız temizlik + sıfırlama BAŞARILI bitince
+   * temizlenir; temizlik/reset hatası → yöntem red edilir ve küme BİLİNEN
+   * KALINTI olarak kalır ("başarılı reset" asla raporlanmaz, PR #24 Fix 4).
+   */
   async resetToBase(): Promise<void> {
     this.assertUsable();
-    await this.git(["reset", "--hard", this.baseCommit]);
-    await this.removeWorkerCreatedPaths(this.workerCreatedPaths);
+    try {
+      await this.removeWorkerCreatedPaths(this.workerCreatedPaths);
+    } catch (err) {
+      // Hata küme üzerinde yutulmaz: küme eski setiyle kalır (kalıntı
+      // unutulmaz) + güvenli tip'li red. Temizlik başarısızsa reset
+      // YÜRÜTÜLMEZ — bitki attr yüzeyiyle filter çalışmaz.
+      if (err instanceof WorkspaceError) {
+        throw err;
+      }
+      throw new WorkspaceError("workspace_operation_failed", "Cleaning the worker-created paths failed", {
+        cause: err,
+      });
+    }
+    try {
+      await this.git(["reset", "--hard", this.baseCommit]);
+    } catch (err) {
+      // Hata küme üzerinde yutulmaz: küme eski setiyle kalır (kalıntı
+      // unutulmaz — sonraki çağrı yeniden temizler) + güvenli tip'li red.
+      throw new WorkspaceError("workspace_operation_failed", "Resetting the workspace to base failed", {
+        cause: err,
+      });
+    }
     this.workerCreatedPaths = new Set<string>();
   }
 
@@ -342,9 +520,17 @@ export class GitWorktreeWorkspace implements Workspace {
    * Base → güncel workspace unified diff (spec 63): tüm workspace, 3 context
    * satırı, deterministik flag'ler (`--no-ext-diff --no-textconv --no-renames`).
    * `files` filtresi path-güvenliğinden geçmek zorundadır.
+   *
+   * fail-closed filter re-check (PR #24 audit F-6): diff, içerik değiştirmiş
+   * tracked dosyaları worktree attribute yüzeyiyle OKUR (ölçüldü: planted
+   * `.gitattributes` + config'deki driver'ın clean komutu `git diff <base>`
+   * içinde yürür — `--no-textconv` yalnız textconv'u kapatır, clean
+   * filter'ı değil). Başarısız rollback'ten kalan bitki + worker-modifiye
+   * dosya penceresinde bu bir RCE kanalidir → diff'ten ÖNCE re-check.
    */
   async diff(options: WorkspaceDiffOptions = {}): Promise<string> {
     this.assertUsable();
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
     const args: string[] = [
       "diff",
       "--no-ext-diff",
@@ -370,9 +556,17 @@ export class GitWorktreeWorkspace implements Workspace {
     return result.stdout.toString("utf8");
   }
 
-  /** Base → güncel workspace yapısal istatistik (files/insertions/deletions, spec 65). */
+  /**
+   * Base → güncel workspace yapısal istatistik (files/insertions/deletions,
+   * spec 65). fail-closed filter re-check (PR #24 audit F-6): numstat,
+   * içerik değiştirmiş tracked dosyaları worktree attribute yüzeyiyle okur
+   * (`diff()` ile aynı gerekçe) → istatistikten ÖNCE re-check.
+   * (`applyPatchSet` içindeki `statInternal` çağrısı 4b re-check'iyle
+   * aynı turdur — ara yazar YOK; ikinci çağrı gerekmez.)
+   */
   async stat(): Promise<DiffStats> {
     this.assertUsable();
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
     return this.statInternal();
   }
 
@@ -389,6 +583,11 @@ export class GitWorktreeWorkspace implements Workspace {
    * - BAŞARISIZ export workspace'yi imha ETMEZ (spec 72): `export_failed`
    *   atılır; workspace/base/worker sonucu aynen kalır.
    * - Patch içeriği metadata'da ASLA taşınmaz; yalnız mutlak yol döner.
+   * - fail-closed filter re-check (PR #24 audit F-6): diff komutundan
+   *   ÖNCE, `applyPatchSet` ile aynı yüzey/parametle — round sonu ile
+   *   export arasında yazar YOK ama fail-closed simetrisi korunur
+   *   (ucuz: 2 check-attr + config get). Tehdit → `invalid_repository`
+   *   (mevcut `export_failed` yolu DEĞİL — hata tipi korunur).
    */
   async exportPatch(outputRoot: string): Promise<string> {
     this.assertUsable();
@@ -412,6 +611,16 @@ export class GitWorktreeWorkspace implements Workspace {
     if (outsideWorkspace === null) {
       throw new WorkspaceError("unsafe_path", "The patch output path is unsafe");
     }
+
+    // PR #24 audit F-6 — fail-closed filter re-check: export diff'inden
+    // ÖNCE. Round sonu ile export arasında worktree değişmez (yazar yok);
+    // check fail-closed simetrisi için korunur (ucuz — 2 check-attr +
+    // config get). Yüzey/parametre `applyPatchSet` re-check'iyle aynı:
+    // worktree `ls-files` ∪ bilinen kalıntı + `--source <baseCommit>`.
+    // `try` bloğunun DIŞINDA: tehdit `invalid_repository` olarak aynen
+    // yayılır (aşağıdaki catch yalnız yazım hatalarını `export_failed`'a
+    // çevirir — hata tipi korunur).
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
 
     const repoId = computeRepoId(this.repoRoot);
     const patchDir = path.join(canonicalRoot, "patches", repoId);
@@ -489,11 +698,16 @@ export class GitWorktreeWorkspace implements Workspace {
   // ── iç yardımcıları ───────────────────────────────────────────────────────
 
   /**
-   * Bilinen worker-oluşturulan yolları tek tek kaldırır (spec 37/38):
+   * Bilinen worker-oluşturulan yolları tek tek kaldırır (spec 37/38 +
+   * PR #24 Fix 4 — `activeFs` seam'i üzerinden):
    * - yalnız O TAM yol `unlink` edilir (sembolik bağlantı TAKİP edilmez)
-   * - dizin/özel nesne BIRAKILIR (biz dosya oluştururuz; geniş temizlik YOK)
-   * - boş kalana atal dizinler sorun DEĞİL (git diff'i etkilemez)
-   * - bilinmeyen/untracked hiçbir dosya dokunulmaz (spec 89 test'i)
+   * - `lstat` ENOENT → yol zaten temiz → devam (race affedilir)
+   * - `lstat` başka hata / `unlink` başka hata (örn. EACCES) → tip'li
+   *   `workspace_operation_failed` ATILIR — çağrıya yayılır; yol BİLİNEN
+   *   KALINTI olarak kümede kalır (çağrı tarafı kümeyi temizlemez)
+   * - yolun üstünde DİZİN/özel nesne → aynı tip'li hata: RECURSIVE silme
+   *   YOK, `rm -rf` YOK, `git clean` YOK (geniş temizlik yasağı, spec 37)
+   * - kümeyi kapsamayan hiçbir dosya dokunulmaz (spec 89 test'i)
    */
   private async removeWorkerCreatedPaths(paths: Iterable<string>): Promise<void> {
     for (const canonical of paths) {
@@ -501,14 +715,31 @@ export class GitWorktreeWorkspace implements Workspace {
       if (abs === null) {
         continue; // defensive: yol doğrulaması oluşumda yapılmıştı
       }
+      let stat: Stats;
       try {
-        const stat = await lstat(abs);
-        if (stat.isFile() || stat.isSymbolicLink()) {
-          await unlink(abs);
+        stat = await activeFs.lstat(abs);
+      } catch (err) {
+        if (isErrnoCode(err, "ENOENT")) {
+          continue; // zaten yok — temiz.
         }
-        // dizin/özel: dokunulmaz (geniş temizlik yasağı, spec 37)
-      } catch {
-        // zaten yok — sorun değil
+        throw new WorkspaceError("workspace_operation_failed", "Cleaning the worker-created paths failed", {
+          cause: err,
+        });
+      }
+      if (!stat.isFile() && !stat.isSymbolicLink()) {
+        // Bilinen dosya yolunun üstünde dizin/özel nesne belirseydi →
+        // genişletmeden güvenli hata (içerik aynen kalır; kalıntı kümede).
+        throw new WorkspaceError("workspace_operation_failed", "Cleaning the worker-created paths failed");
+      }
+      try {
+        await activeFs.unlink(abs);
+      } catch (err) {
+        if (isErrnoCode(err, "ENOENT")) {
+          continue; // race: lstat ile unlink arasında kaldırıldı — affedilir.
+        }
+        throw new WorkspaceError("workspace_operation_failed", "Cleaning the worker-created paths failed", {
+          cause: err,
+        });
       }
     }
   }
@@ -572,7 +803,17 @@ export class GitWorktreeWorkspace implements Workspace {
 
 // ── Oluşturma ───────────────────────────────────────────────────────────────
 
-/** Seçili untracked dosyayı worktree'ye kopyalar (spec 21/50). */
+/**
+ * Seçili untracked dosyayı worktree'ye kopyalar (spec 21/50 + PR #24 Fix 1):
+ * - HEDEF tarafı: workspace'teki atal bileşenler arasında sembolik bağlantı
+ *   varsa `mkdir`/`writeFile`/`symlink`/`rename`/`chmod` link'i TAKİP edip
+ *   izole workspace DIŞINA yazabilir → `unsafe_path` (mesaj SABİT).
+ * - KAYNAK tarafı: ana working-tree'deki atal bileşenler arasında sembolik
+ *   bağlantı varsa `readFile`/`readlink` repo DIŞINDAKİ içeriği okuyup
+ *   izole base'e kopyalayabilir → `unsafe_path`.
+ * Seçili yolun KENDİSİ link ise meşrudur (mevcut hedef-içeride kontrolü
+ * derin savunma olarak kalır).
+ */
 async function copySelectedUntrackedFile(
   repoRoot: string,
   workspaceDir: string,
@@ -590,6 +831,17 @@ async function copySelectedUntrackedFile(
   }
   if (!stat.isFile() && !stat.isSymbolicLink()) {
     throw new WorkspaceError("invalid_input", "A selected path is not a file");
+  }
+
+  // Fix 1-B (hedef): workspace'teki ATALLARDA link → yazım workspace dışına
+  // kaçar. Son bileşen (kopyalanacak link'in kendisi) denetlenmez.
+  if (await hasSymlinkInPath(wsAbs, workspaceDir, { includeTarget: false })) {
+    throw new WorkspaceError("unsafe_path", "A selected path is unsafe");
+  }
+  // Fix 1-A (kaynak): ana depodaki ATALLARDA link → okuma repo dışından
+  // içerik taşır. Son bileşen denetlenmez (link ise hedef kontrolü aşağıda).
+  if (await hasSymlinkInPath(mainAbs, repoRoot, { includeTarget: false })) {
+    throw new WorkspaceError("unsafe_path", "A selected path is unsafe");
   }
 
   await mkdir(path.dirname(wsAbs), { recursive: true });
@@ -628,6 +880,198 @@ async function symlinkTargetStaysInside(repoRoot: string, linkAbs: string, targe
     return isPathInsideOrEqual(repoRoot, resolved);
   } catch {
     return isPathInsideOrEqual(repoRoot, lexical);
+  }
+}
+
+/**
+ * v1 politikası (fail-closed, PR #24 Fix 3 + audit F-6): verilen git kökü
+ * (`gitRoot`) altındaki tracked yollar + ek yollar arasında herhangi biri
+ * bir DIŞ Git filter'ı (`filter.<driver>.clean/smudge/process`)
+ * gerektiriyorsa `invalid_repository` güven hatası ile red. Komut
+ * YÜRÜTÜLMEZ, config değiştirilmez/silinmez.
+ *
+ * İKİ çağrı noktası (aynı mekanizma, farklı yüzey):
+ * - **oluşturma** (`gitRoot` = ana repo kökü, `sourceSha` = HEAD):
+ *   1. **working-tree** (`--source` YOK): tracked (`ls-files`) ∪ seçili
+ *      yollar — delta yakalayan komut (`git diff HEAD`) CLEAN filter'ı
+ *      bu yüzeyle çalıştırır;
+ *   2. **HEAD ağacı** (`--source <sourceSha>`): TAM HEAD ağacı
+ *      (`ls-tree -r -z --name-only`) ∪ tracked ∪ seçili — çünkü
+ *      `git worktree add --detach <headSha>` TÜM committed tree'yi
+ *      checkout eder ve COMMITTED `.gitattributes` yüzeyini (SMUDGE
+ *      filter) uygulatır: working-tree kopyası kirlenmiş (örn. attr
+ *      satırı silinmiş) bir tehdit, committed kopyada HÂLÂ geçerlidir
+ *      (ölçüldü, Apple Git 2.50: `--source` ağaç attribute'larını, ağaçta
+ *      olmayan yol adları için bile pattern eşleşmesiyle raporlar).
+ * - **her tur** (`gitRoot` = worktree, `sourceSha` = immutable base
+ *   commit, PR #24 audit F-6): worker yazıları worktree'de
+ *   UYGULANDIKTAN, turun ilk filter-capable komutundan (add -N / diff)
+ *   ÖNCE — worker, worktree'nin attribute yüzeyini YAZABİLİR (ör.
+ *   `d/.gitattributes` = `** filter=evil`); config'de ÖNCEDEN tanımlı
+ *   driver'ın (LFS dahi) komutu, tur içi diff/stat/export'ta bu
+ *   yüzeyle host'ta yürütülürdü. Yüzey: worktree'nin `ls-files`'i ∪
+ *   turun plan yolları ∪ bilinen kalıntı (`workerCreatedPaths`);
+ *   2. pass = base commit ağacı (`--source <baseCommit>` — fail-closed
+ *   simetrisi). export diff'inden önce aynı check yeniden koşar.
+ *
+ * Adımlar (tamamı salt-okunur; `runGit`'in hook+fsmonitor kilidi devrede):
+ *   a. `git ls-files -z` (tracked yollar)
+ *   b. `git ls-tree -r -z --name-only <sourceSha>` (committed ağaç =
+ *      `git worktree add`'in yazacağı / turun diff tabanı kümesi)
+ *   c. her yüzey için TEK çağrıda `git check-attr filter ... -z --stdin`
+ *      (`collectFilterDrivers` — tek merkezi parse)
+ *   d. her driver için `git config --get filter.<d>.clean/.smudge/.process`
+ *      — herhangi bir scope'ta tanımlı VE BOŞ DEĞİL → tehdit.
+ *
+ * Herhangi bir yüzeyde tehdit → AYNI red: `invalid_repository` + SABİT
+ * mesaj (yeni mesaj YOK; driver adı/komut/path taşınmaz). Herhangi bir
+ * pass'te git-seviyesi hata (örn. `--source` desteklemeyen eski git) →
+ * `git_operation_failed` fail-closed: doğrulanamayan attribute yüzeyi =
+ * repo çalıştırılmaz (bilinçli — DESIGN.md §7.2 notu).
+ *
+ * LFS (`filter.lfs`) da dış filter olduğundan v1'de desteklenmez — aynı red
+ * (PR/issue notu). Builtin `text`/`eol` normalizasyonu filter DEĞİLDİR —
+ * bu denetimin konusu değildir (çalışmaya devam eder).
+ */
+async function assertNoExternalFilters(
+  gitRoot: string,
+  paths: readonly string[],
+  sourceSha: string,
+): Promise<void> {
+  let tracked: string[];
+  try {
+    const ls = await runGit(["ls-files", "-z"], { cwd: gitRoot, config: [HOOKS_DISABLED_CONFIG] });
+    tracked = splitNul(ls.stdout).filter((entry) => entry !== "");
+  } catch (err) {
+    throw new WorkspaceError("git_operation_failed", "Reading the repository state failed", { cause: err });
+  }
+
+  let sourceTree: string[];
+  try {
+    const ls = await runGit(["ls-tree", "-r", "-z", "--name-only", sourceSha], {
+      cwd: gitRoot,
+      config: [HOOKS_DISABLED_CONFIG],
+    });
+    sourceTree = splitNul(ls.stdout).filter((entry) => entry !== "");
+  } catch (err) {
+    // Committed ağaç sayılamıyor → checkout/diff yüzeyi doğrulanamıyor → fail-closed.
+    throw new WorkspaceError("git_operation_failed", "Reading the repository state failed", { cause: err });
+  }
+
+  // İki yüzey, tek parse mantığı: working-tree (delta/clean) +
+  // committed ağaç (checkout/smudge).
+  const worktreeSurface = [...new Set([...tracked, ...paths])];
+  const sourceSurface = [...new Set([...sourceTree, ...tracked, ...paths])];
+  const drivers = new Set<string>();
+  for (const driver of await collectFilterDrivers(gitRoot, worktreeSurface, [])) {
+    drivers.add(driver);
+  }
+  for (const driver of await collectFilterDrivers(gitRoot, sourceSurface, ["--source", sourceSha])) {
+    drivers.add(driver);
+  }
+
+  for (const driver of [...drivers].sort()) {
+    for (const kind of ["clean", "smudge", "process"]) {
+      const value = await readConfigValue(gitRoot, `filter.${driver}.${kind}`);
+      if (value !== null && value.trim().length > 0) {
+        // Tehdit: config (herhangi bir scope'ta) bir dış program
+        // tanımlamış. SABİT mesaj — driver adı/komut/path taşınmaz.
+        throw new WorkspaceError("invalid_repository", "An external Git filter is not supported");
+      }
+    }
+  }
+}
+
+/**
+ * Verilen yollar için TEK `git check-attr filter` çağrısı (salt-okunur —
+ * check-attr yalnız attr DEĞERİNİ raporlar, filter'ı asla YÜRÜTMEZ) +
+ * paylaşılan çıktı parse'ı; bulunan driver adlarını döndürür (boş olabilir).
+ *
+ * `extraArgs`: committed-ağaç yüzeyi için `["--source", sourceSha]` —
+ * attribute'lar ÇALIŞMA ağacı yerine COMMITTED ağaçtan okunur.
+ *
+ * Parse = TEK MERKEZİ mantık (ölçüldü, Apple Git 2.50): kayıt formatı
+ * `path\0filter\0value\0` (yol içinde NUL olamaz); çıktı NUL ile BİTİR
+ * (`a.txt\0filter\0unspecified\0...`) → `splitNul`'in koruduğu tek sondaki
+ * "" düşülür. `unset`/`unspecified`/boş değer yalancı driver DEĞİLdir;
+ * geriye kalan her değer bir driver ADI'dır (komut araması yukarıda).
+ * Format/kayıt beklentimizi sağlamıyorsa (sürüm farklılığı) VEYA git
+ * seviyesinde hata olursa (örn. `--source` desteklemeyen eski git) →
+ * fail-closed `git_operation_failed`: filter durumu doğrulanamayan
+ * yüzey/repo çalıştırılmaz (güvenli taraf).
+ */
+async function collectFilterDrivers(
+  repoRoot: string,
+  paths: readonly string[],
+  extraArgs: readonly string[],
+): Promise<string[]> {
+  if (paths.length === 0) {
+    return []; // bu yüzeyde denetlenecek yol yok → filter yürütemez.
+  }
+
+  let output: Buffer;
+  try {
+    const result = await runGit(
+      ["check-attr", "filter", ...extraArgs, "-z", "--stdin"],
+      {
+        cwd: repoRoot,
+        config: [HOOKS_DISABLED_CONFIG],
+        stdin: Buffer.from(`${paths.join("\0")}\0`, "utf8"),
+      },
+    );
+    output = result.stdout;
+  } catch (err) {
+    throw new WorkspaceError("git_operation_failed", "Reading the repository state failed", { cause: err });
+  }
+
+  const records = splitNul(output);
+  if (records.length > 0 && records[records.length - 1] === "") {
+    records.pop();
+  }
+  if (records.length % 3 !== 0) {
+    throw new WorkspaceError("git_operation_failed", "Reading the repository state failed", {
+      cause: "malformed check-attr output",
+    });
+  }
+  const drivers = new Set<string>();
+  for (let i = 0; i < records.length; i += 3) {
+    const attr = records[i + 1];
+    const value = records[i + 2];
+    if (attr !== "filter" || value === undefined) {
+      throw new WorkspaceError("git_operation_failed", "Reading the repository state failed", {
+        cause: "malformed check-attr record",
+      });
+    }
+    // "unset"/"unspecified" = filter attribute'i tanımlı değil (yalancı
+    // driver değil); boş değer = komut yok. Geriye kalan her değer bir
+    // driver ADI'dır → config'de komut araması `assertNoExternalFilters`'ta.
+    if (value !== "unset" && value !== "unspecified" && value.length > 0) {
+      drivers.add(value);
+    }
+  }
+  return [...drivers];
+}
+
+/**
+ * `git config --get <key>` salt okuma:
+ * - tanımlı → değer (boş olabilir — boş DEĞER tehdit sayılmaz);
+ * - tanımsız (exit 1, çıktı YOK — git'in belgeli davranışı) → `null`;
+ * - başka git hatası → mevcut `git_operation_failed` kalıbı.
+ */
+async function readConfigValue(repoRoot: string, key: string): Promise<string | null> {
+  try {
+    const result = await runGit(["config", "--get", key], {
+      cwd: repoRoot,
+      config: [HOOKS_DISABLED_CONFIG],
+    });
+    return result.stdout.toString("utf8").trim();
+  } catch (err) {
+    const cause =
+      err instanceof WorkspaceError ? (err.cause as { exitCode?: number | null; stderr?: string } | undefined) : undefined;
+    if (cause !== undefined && cause.exitCode === 1 && (cause.stderr ?? "") === "") {
+      return null; // key tanımsız — tehdit yok.
+    }
+    throw new WorkspaceError("git_operation_failed", "A Git operation failed", { cause: err });
   }
 }
 
@@ -683,18 +1127,39 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
   }
   // Spec 16: seçili bağlam girdileri DOSYA benzeri olmalı (dizin/FIFO/socket/
   // cihaz red) — ana working-tree'de var olanlar için denetlenir.
+  // Fix 1-C: seçili yola SEMBOLİK BAĞLANTI gelirse (tracked VEYA untracked —
+  // base commit'ten gelen tracked dış link dahil) hedefi repo SINIRI içinde
+  // olmalı; mutlak dış hedef / dışa kaçan link zinciri → oluşum red.
+  // (copySelectedUntrackedFile'deki aynı kontrol derin savunma olarak kalır.)
   for (const selected of [...editable, ...readonly]) {
     const abs = resolveContained(repoRoot, selected);
     if (abs === null) {
       throw new WorkspaceError("unsafe_path", "A selected path is unsafe");
     }
     const stat = await lstat(abs).catch(() => null);
-    if (stat !== null && !stat.isFile() && !stat.isSymbolicLink()) {
+    if (stat === null) {
+      continue; // ana working-tree'de yok (örn. tracked silme) — denetlenecek hâl yok
+    }
+    if (stat.isSymbolicLink()) {
+      let target: string | null;
+      try {
+        target = await readlink(abs);
+      } catch {
+        target = null; // race: link anında değişti — doğrulanamaz → fail-closed
+      }
+      if (target === null || !(await symlinkTargetStaysInside(repoRoot, abs, target))) {
+        throw new WorkspaceError("unsafe_path", "A selected path is an unsafe symlink");
+      }
+      continue;
+    }
+    if (!stat.isFile()) {
       throw new WorkspaceError("invalid_input", "A selected path is not a file");
     }
   }
 
   // ── ana depo: HEAD commit'i zorunlu (v1 worktree tabanı, spec 7) ──────────
+  // Çözümleme F3 denetiminden ÖNCE: HEAD-ağacı attribute pass'i bu SHA'yı
+  // `check-attr --source` değeri olarak kullanır.
   let headSha: string;
   try {
     const head = await runGit(["rev-parse", "HEAD"], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] });
@@ -705,6 +1170,25 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
   if (headSha === "") {
     throw new WorkspaceError("invalid_repository", "The repository does not have a HEAD commit");
   }
+
+  // ── (F3) repo-tanımlı DIŞ Git filter'ları v1'de YÜRÜTÜLMEZ (fail-closed) ────
+  // `filter.<driver>.clean/smudge/process` = repo tanımlı dış programlar
+  // (LFS vb.). İlgili yollar böyle bir filter gerektiriyorsa oluşum GÜVENLİ
+  // HATA ile reddedilir: komut YÜRÜTÜLMEZ, config DEĞİŞTİRİLMEZ/silinmez.
+  // İKİ attribute yüzeyi denetlenir (audit F-1):
+  //   1. working-tree (`--source` yok): delta yakalayan `git diff HEAD`
+  //      CLEAN filter'ı tracked ∪ seçili yollarla çalıştırır;
+  //   2. HEAD ağacı (`--source <headSha>`): `git worktree add` TÜM
+  //      committed tree'yi checkout eder ve COMMITTED `.gitattributes`
+  //      yüzeyini (SMUDGE) uygulatır — working-tree kopyası silinmiş/kirli
+  //      bir attr, committed kopyada hâlâ geçerlidir → aynı red.
+  // Konum: delta yakalama ADIMINDAN ÖNCE — ilk filter yürütebilecek
+  // komutlar `git diff HEAD` (clean) ve `git worktree add` (smudge)'tir.
+  // `check-attr` yalnız attr DEĞERİNİ raporlar (filter yürütmez);
+  // `config --get` salt okumadır. `text`/`eol` BUILTIN normalizasyonu
+  // filter DEĞİLDİR (çalışır, yasak değil). Worktree henüz oluşturulmadı
+  // → temiz çıkış, geriye hiçbir şey kalmaz.
+  await assertNoExternalFilters(repoRoot, [...editable, ...readonly], headSha);
 
   // ── (1) tracked delta: staged + unstaged, binary, tam index (spec 19) ────
   // `git diff` (düz) KULLANILMAZ — yalnızca staged değişiklikleri kaçırır.
@@ -919,14 +1403,44 @@ async function canonicalRepoRoot(raw: string): Promise<string> {
 }
 
 /**
- * Base parmak izi + içerik yakalama (spec 29/30/31) — base COMMIT'TEN:
- * - seçili yollar: `git ls-tree -r -z <base> -- <yollar>` → mod/oid
- * - base ağacı:    `git ls-tree -r -z <base>`           → tam yol→mod haritası
- * - içerik:        `git cat-file --batch`               → blob baytları
+ * `git ls-tree` yolunu workspace kökü altında mutlak yola çözer; içerme
+ * ihlali → `null`. Git tree yolları yapısal olarak göreceli + `..`/mutlak
+ * içeremez; bu denetim saf invariant korumasıdır (hasarlı/bozuk çıktı
+ * workspace dışına kanal olamaz).
+ */
+function workspaceEntryPath(workspaceDir: string, gitPath: string): string | null {
+  const abs = path.resolve(workspaceDir, gitPath);
+  const rel = path.relative(workspaceDir, abs);
+  if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return null;
+  }
+  return abs;
+}
+
+/**
+ * Base parmak izi + içerik yakalama (spec 29/30/31 + PR #24 Fix 2):
+ * - seçili yollar: `git ls-tree -r -z <base> -- <yollar>` → varlık + git modu
+ * - base ağacı:    `git ls-tree -r -z <base>` → tam yol→mod haritası
+ *   (`basePaths` — create/delete denetimlerinin yapısal kaynağı; aynen)
+ * - tip/mod:       worktree ÇALIŞMA DOSYASININ `lstat`'ı — `captureLiveFingerprint`
+ *   ile BİREBİR aynı alan (`0o100` bit → `100755`/`100644`; link → `120000`)
+ * - içerik:        çalışma dosyasının BİREBİR baytları (düzenli dosya) /
+ *   link hedef metni (sembolik bağlantı) → SHA-256 — git blob baytları DEĞİL
  *
- * Düzenlenebilir düz dosyaların BİREBİR base baytları saklanır — arama/
- * değiştirme doğrulaması her zaman bu immutable içeriğe karşıdır
- * (spec 29: workspace'in mutable hali DEĞİL).
+ * İKİ ALAN KARIŞTIRILMAZ: parmak izi/tam-eşleşme içeriği = working-tree
+ * baytları (worker'a gösterilen); geçici base commit = diff/reset/export
+ * tabanı. `text`/`eol` normalizasyonu blob ile working tree'yi farklı
+ * baytlara sokabilir (ör. CRLF vs LF) — bu beklenen; base parmak izi
+ * working-tree tarafında kaldığı için tam eşleşme ve Step 9'un
+ * canlı↔base karşılaştırması aynı ölçekte çalışır.
+ *
+ * Çalışan dosya okunamıyorsa (commit ile yakalama arasındaki race/izin —
+ * yapısal olarak neredeyse imkânsız) → güvenli işletimsel hata (capture
+ * adımı işletimseldir: `git_operation_failed`).
+ *
+ * Düzenlenebilir dosya/link içeriği BİREBİR saklanır — arama/değiştirme
+ * doğrulaması her zaman bu immutable içeriğe karşıdır (spec 29: workspace'in
+ * mutable hali DEĞİL).
  */
 async function captureBase(
   workspaceDir: string,
@@ -967,79 +1481,94 @@ async function captureBase(
     basePaths.set(entry.filePath, normalizeGitFileMode(entry.mode));
   }
 
-  // İçerik baytları: seçili düz dosya + sembolik bağlantı blob'ları.
-  const oids = new Set<string>();
-  for (const entry of selectedEntries) {
-    const type = gitModeType(entry.mode);
-    if (type === "file" || type === "symlink") {
-      oids.add(entry.oid);
-    }
-  }
-  let blobBytes: Map<string, Buffer> = new Map();
-  if (oids.size > 0) {
-    try {
-      const payload = Buffer.from(`${[...oids].join("\n")}\n`, "utf8");
-      const batch = await runGit(["cat-file", "--batch"], {
-        cwd: workspaceDir,
-        stdin: payload,
-        config: [HOOKS_DISABLED_CONFIG],
-      });
-      blobBytes = parseCatFileBatch(batch.stdout);
-    } catch (err) {
-      throw new WorkspaceError("git_operation_failed", "Reading the base content failed", { cause: err });
-    }
-  }
-
   const fingerprints = new Map<string, PathFingerprint>();
   const editableFingerprints = new Map<string, PathFingerprint>();
   const editableContent = new Map<string, Buffer>();
 
-  const fingerprintFor = (canonical: string): PathFingerprint => {
+  const unsafeBase = (): WorkspaceError =>
+    new WorkspaceError("git_operation_failed", "The captured editable base could not be represented safely");
+
+  for (const canonical of selected) {
     const entry = entryByPath.get(canonical);
     if (entry === undefined) {
-      return { exists: false };
+      // Base ağacında yok (ana working-tree'de de olmayan seçili yol).
+      fingerprints.set(canonical, { exists: false });
+      continue;
     }
-    const type = gitModeType(entry.mode);
-    if (type === "symlink") {
-      const bytes = blobBytes.get(entry.oid);
-      return {
-        exists: true,
-        type: "symlink",
-        mode: "120000",
-        contentSha256: bytes === undefined ? undefined : sha256Hex(bytes),
-      };
+
+    const gitType = gitModeType(entry.mode);
+    if (gitType === "other") {
+      // gitlink (160000) vb.: git-tabanlı tip+mod korunur (içerik YOK).
+      fingerprints.set(canonical, { exists: true, type: "other", mode: normalizeGitFileMode(entry.mode) });
+      continue;
     }
-    if (type === "file") {
-      const bytes = blobBytes.get(entry.oid);
-      return {
+
+    // file/symlink: worktree'deki çalışma dosyası — canlı parmak iziyle aynı alan.
+    const abs = workspaceEntryPath(workspaceDir, entry.filePath);
+    if (abs === null) {
+      // İnvariant bozuldu (bozuk ls-tree çıktısı) — güvenli taraf: red.
+      throw new WorkspaceError("unsafe_path", "A base path is unsafe");
+    }
+    let stat: Stats;
+    try {
+      stat = await lstat(abs);
+    } catch (err) {
+      // Base commit ile yakalama arasındaki race/izin: base güvenli
+      // biçimde temsil edilemez → işletimsel hata (oluşum red).
+      throw new WorkspaceError("git_operation_failed", "The captured editable base could not be represented safely", {
+        cause: err,
+      });
+    }
+
+    let fingerprint: PathFingerprint;
+    if (gitType === "symlink") {
+      if (!stat.isSymbolicLink()) {
+        // Base ağacı link diyor, worktree dosya diyor — tutarsızlık.
+        throw unsafeBase();
+      }
+      let target: string;
+      try {
+        target = await readlink(abs);
+      } catch (err) {
+        // lstat "link" dedi, readlink okuyamadı (race/izin) → base güvenli
+        // biçimde temsil edilemez → işletimsel hata (oluşum red).
+        throw new WorkspaceError("git_operation_failed", "The captured editable base could not be represented safely", {
+          cause: err,
+        });
+      }
+      const bytes = Buffer.from(target, "utf8");
+      fingerprint = { exists: true, type: "symlink", mode: "120000", contentSha256: sha256Hex(bytes) };
+      if (editable.has(canonical)) {
+        editableContent.set(canonical, bytes);
+      }
+    } else {
+      // Düzenli dosya: git tree 100644/100755; worktree'de düz dosya olmalı.
+      if (!stat.isFile()) {
+        throw unsafeBase();
+      }
+      let bytes: Buffer;
+      try {
+        bytes = await readFile(abs);
+      } catch (err) {
+        throw new WorkspaceError("git_operation_failed", "The captured editable base could not be represented safely", {
+          cause: err,
+        });
+      }
+      const executable = (stat.mode & 0o100) !== 0;
+      fingerprint = {
         exists: true,
         type: "file",
-        mode: normalizeGitFileMode(entry.mode),
-        contentSha256: bytes === undefined ? undefined : sha256Hex(bytes),
+        mode: executable ? "100755" : "100644",
+        contentSha256: sha256Hex(bytes),
       };
-    }
-    // gitlink (160000) vb.: yalnız tip+mod (özet taşınmaz).
-    return { exists: true, type: "other", mode: normalizeGitFileMode(entry.mode) };
-  };
-
-  for (const canonical of editable) {
-    const fingerprint = fingerprintFor(canonical);
-    editableFingerprints.set(canonical, fingerprint);
-    fingerprints.set(canonical, fingerprint);
-    // Birebir base içeriği: yalnız düz dosyalar (search/replace hedefi).
-    if (fingerprint.exists && fingerprint.type === "file") {
-      const entry = entryByPath.get(canonical);
-      if (entry !== undefined) {
-        const bytes = blobBytes.get(entry.oid);
-        if (bytes !== undefined) {
-          editableContent.set(canonical, bytes);
-        }
+      if (editable.has(canonical)) {
+        editableContent.set(canonical, bytes);
       }
     }
-  }
-  for (const canonical of readonly) {
-    if (!fingerprints.has(canonical)) {
-      fingerprints.set(canonical, fingerprintFor(canonical));
+
+    fingerprints.set(canonical, fingerprint);
+    if (editable.has(canonical)) {
+      editableFingerprints.set(canonical, fingerprint);
     }
   }
 

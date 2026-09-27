@@ -25,6 +25,14 @@
  *   base'e GİRMEZ, meşru tracked seçimler etkilenmez
  * - `core.fsmonitor` kilidi (audit HIGH-1), export kökü workspace DIŞI (audit
  *   MEDIUM-1), exec mod koruması
+ * - PR #24 (Step 5 güvenlik/güvenilirlik): sembolik-bağlantı containment
+ *   (seçili kaynak/hedef atal + dışa kaçan hedef) (testler 23-25), içerideki
+ *   link parmak izi (26), CRLF working-tree bayt round-trip (27-28), dış
+ *   Git filter fail-closed — working-tree + COMMITTED attribute yüzeyleri
+ *   (29, 29a-29b: audit F-1), reset/temizlik kalıntı kümesi (30-33),
+ *   TUR filter re-check + reset-öncesi temizlik sırası: worker-ekili
+ *   `.gitattributes` + config'de önceden tanımlı driver (repo + global/LFS)
+ *   (34-37: audit F-6 — pozitif kontrol/mutasyon kanıtlı, S-2 kapandı)
  *
  * Hermetic git: global/system config kesilir (kullanıcı makine ayarları
  * determinizmi bozmasın). Testler BUILT çıktıyı (dist/) import eder.
@@ -52,7 +60,12 @@ import {
   type Workspace,
   type WorkspaceCreateInput,
 } from "../dist/workspace/Workspace.js";
-import { GitWorktreeWorkspace, createGitWorktreeWorkspace } from "../dist/workspace/GitWorktreeWorkspace.js";
+import {
+  GitWorktreeWorkspace,
+  createGitWorktreeWorkspace,
+  setWorkspaceFs,
+  type WorkspaceFs,
+} from "../dist/workspace/GitWorktreeWorkspace.js";
 import { runGit } from "../dist/workspace/git.js";
 import type { WorkerEdit, WorkerResult } from "../dist/worker/result.js";
 
@@ -267,6 +280,33 @@ const BINARY_BYTES = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x42, 0x49
 
 function workerResult(edits: WorkerEdit[]): WorkerResult {
   return { schemaVersion: 1, summary: "test round", edits };
+}
+
+function errnoEacces(): NodeJS.ErrnoException {
+  return Object.assign(new Error("operation not permitted (EACCES)"), { code: "EACCES" });
+}
+
+/**
+ * Arıza enjeksiyonu fs seam'leri (PR #24 Fix 4). Test biterken
+ * `setWorkspaceFs(null)` ile gerçek fs'e dönülür.
+ * - `failingFs`: gerçek `lstat` + DAİMA EACCES `unlink` — yol VAR ve
+ *   unlink'in gerçekten denendiğini (dosyanın kalmasıyla) ispatlar.
+ * - `denyingFs`: `lstat` + `unlink` ikisi de EACCES — dosyanın varlığından
+ *   BAĞIMSIZ deterministik temizlik hatası (reset'in git tarafında sildiği
+ *   intent-to-add yollarında `lstat` ENOENT'a düşerdi).
+ */
+function failingFs(): WorkspaceFs {
+  return {
+    lstat: (target: string) => lstat(target),
+    unlink: () => Promise.reject(errnoEacces()),
+  };
+}
+
+function denyingFs(): WorkspaceFs {
+  return {
+    lstat: () => Promise.reject(errnoEacces()),
+    unlink: () => Promise.reject(errnoEacces()),
+  };
 }
 
 /**
@@ -1045,6 +1085,901 @@ test("create with a magic-name (glob) selection never drags untracked files into
     assert.equal(await gitText(fixture.repo, ["ls-files", "--", "src/u.txt"]), "", "main index must not gain src/u.txt");
     assert.equal(await gitText(fixture.repo, ["ls-files", "--", ":(literal)src/*.txt"]), "", "main index must not gain the literal src/*.txt");
   } finally {
+    await ws.destroy();
+  }
+});
+
+// ── 23) PR #24 Fix 1-A: seçili untracked, ana depoda SEMBOLİK BAĞLANTI ATALI altında ──
+// Kopya KAYNAĞI (ana working-tree) tarafında atal bir sembolik bağlantı
+// varsa `readFile` repo DIŞINDAKİ içeriği izole base'e taşırdı → oluşum red.
+
+test("selected path under a symlink ancestor in the main repo is rejected (source side, PR #24 Fix 1)", async () => {
+  const fixture = await buildFixture("f1src");
+  const leakDir = path.join(fixture.out, "leak");
+  await mkdir(leakDir, { recursive: true });
+  await writeFile(path.join(leakDir, "secret.txt"), "secret\n");
+  // ana depoda untracked link dizin → repo DIŞI (göreli hedef link'in OLDUĞU
+  // dizine göre çözülür: repo/linkdir + "../leak" → out/leak)
+  await symlink("../leak", path.join(fixture.repo, "linkdir"));
+
+  const input = createInput(fixture, "s-f1a");
+  const worktreesBefore = (await gitText(fixture.repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const statusBefore = (await gitText(fixture.repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort();
+
+  const err = await expectWorkspaceError("unsafe_path", () =>
+    createGitWorktreeWorkspace({ ...input, editablePaths: [...input.editablePaths, "linkdir/secret.txt"] }),
+  );
+  assert.equal(err.message, "A selected path is unsafe");
+
+  // Yarım worktree KALMAZ; ana repo DEĞİŞMEZ; repo DIŞINA hiçbir şey yazılmaz
+  assert.deepEqual(
+    worktreePaths((await gitText(fixture.repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+  assert.deepEqual(
+    (await gitText(fixture.repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort(),
+    statusBefore,
+    "main repo must be untouched",
+  );
+  assert.deepEqual(await readdir(leakDir), ["secret.txt"], "nothing may be written outside the repository");
+  await assert.rejects(lstat(path.join(fixture.out, "ws", "s-f1a")), "partial workspace must be removed");
+});
+
+// ── 24) PR #24 Fix 1-B: seçili untracked, workspace'te SEMBOLİK BAĞLANTI ATALI altında ──
+// tracked link dizin worktree'ye checkout olur → kopya HEDEFİ tarafında atal
+// link `mkdir`/`writeFile`'i workspace DIŞINA yazdırırdı → oluşum red.
+
+test("selected path under a symlink ancestor in the workspace is rejected (target side, PR #24 Fix 1)", async () => {
+  const fixture = await buildFixture("f1tgt");
+  const outside = path.join(fixture.out, "tgt-outside");
+  await mkdir(outside, { recursive: true });
+  await writeFile(path.join(outside, "config.json"), "outside-config\n");
+  // tracked link dizin (COMMIT ediliyor → worktree'ye checkout olur); hedef repo DIŞI
+  await symlink("../tgt-outside", path.join(fixture.repo, "dir-link"));
+  await gitOk(fixture.repo, ["add", "dir-link"]);
+  await gitOk(fixture.repo, ["commit", "-m", "add dir-link"]);
+
+  const input = createInput(fixture, "s-f2");
+  const worktreesBefore = (await gitText(fixture.repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const statusBefore = (await gitText(fixture.repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort();
+
+  const err = await expectWorkspaceError("unsafe_path", () =>
+    createGitWorktreeWorkspace({ ...input, editablePaths: [...input.editablePaths, "dir-link/config.json"] }),
+  );
+  assert.equal(err.message, "A selected path is unsafe");
+
+  assert.deepEqual(
+    worktreePaths((await gitText(fixture.repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+  assert.deepEqual(
+    (await gitText(fixture.repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort(),
+    statusBefore,
+    "main repo must be untouched",
+  );
+  assert.equal((await readFile(path.join(outside, "config.json"))).toString(), "outside-config\n", "outside target untouched");
+  assert.deepEqual(await readdir(outside), ["config.json"], "nothing may be created outside the workspace");
+  await assert.rejects(lstat(path.join(fixture.out, "ws", "s-f2")), "partial workspace must be removed");
+});
+
+// ── 25) PR #24 Fix 1-C: seçili yoldun KENDİSİ dışa kaçan sembolik bağlantı ──
+// tracked/untracked fark etmez; hedef repo SINIRI dışında → oluşum red.
+
+test("selected symlink with an outside target is rejected (dangling + existing, editable + read-only, PR #24 Fix 1)", async () => {
+  const fixture = await buildFixture("f1sel");
+  // fixture'da committed `escape -> ../escape-outside` (hedef var değil → dangling)
+  const worktreesBefore = (await gitText(fixture.repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const inputA = createInput(fixture, "s-f3a");
+  const errA = await expectWorkspaceError("unsafe_path", () =>
+    createGitWorktreeWorkspace({ ...inputA, editablePaths: [...inputA.editablePaths, "escape"] }),
+  );
+  assert.equal(errA.message, "A selected path is an unsafe symlink");
+
+  // hedef VAR OLAN dış dizin (dangling değil) — realpath çözülse de sınır dışı
+  await mkdir(path.join(fixture.out, "escape-outside"), { recursive: true });
+  const inputB = createInput(fixture, "s-f3b");
+  const errB = await expectWorkspaceError("unsafe_path", () =>
+    createGitWorktreeWorkspace({ ...inputB, readonlyPaths: [...(inputB.readonlyPaths ?? []), "escape"] }),
+  );
+  assert.equal(errB.message, "A selected path is an unsafe symlink");
+
+  // red, worktree add ÖNCESİ (seçim denetimi) → hiçbir worktree oluşmaz
+  assert.deepEqual(
+    worktreePaths((await gitText(fixture.repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+  );
+});
+
+// ── 26) PR #24 Fix 1: repo İÇİNDE hedefli seçili link meşru — link KENDİSİ temsil edilir ──
+
+test("selected symlink with an inside target is captured as itself: type 120000 + target-text fingerprint (PR #24 Fix 1)", async () => {
+  const fixture = await buildFixture("f1ok");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture, "s-f4"));
+  try {
+    // untracked içerideki link: link'in kendisi (hedef değil) worktree'ye kopyalanır
+    const link2 = path.join(ws.workspaceDir, "link2");
+    assert.ok((await lstat(link2)).isSymbolicLink(), "the link itself is present in the workspace");
+    assert.equal(await readlink(link2), "tracked-clean.txt");
+    const fp1 = ws.base.fingerprints.get("link2");
+    assert.ok(fp1 !== undefined && fp1.exists === true);
+    if (fp1 !== undefined && fp1.exists) {
+      assert.equal(fp1.type, "symlink");
+      assert.equal(fp1.mode, "120000");
+      assert.equal(fp1.contentSha256, sha256("tracked-clean.txt"), "fingerprint = link target TEXT, never followed");
+    }
+    // tracked içerideki link: aynı temsil (checkout'tan gelir)
+    const fp2 = ws.base.fingerprints.get("inside-link");
+    assert.ok(fp2 !== undefined && fp2.exists === true);
+    if (fp2 !== undefined && fp2.exists) {
+      assert.equal(fp2.type, "symlink");
+      assert.equal(fp2.mode, "120000");
+      assert.equal(fp2.contentSha256, sha256("src/a.ts"));
+    }
+    // içerideki link modify YAPILAMAZ (düz metin dosyası değil) — meşru red
+    const result = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "inside-link", operations: [{ search: "alpha-USER", replace: "x" }] }]),
+    );
+    assert.equal(result.validation.editsApplied, 0);
+    assert.equal(result.validation.rejected[0]?.reason, "target is not a regular text file");
+  } finally {
+    await ws.destroy();
+  }
+});
+
+// ── 27) PR #24 Fix 2: CRLF base (text/eol attribute) — working-tree bayt round-trip ──
+
+test("CRLF base via text/eol attribute: fingerprint uses working-tree bytes; CRLF edit ok, LF search rejected (PR #24 Fix 2)", async () => {
+  const out = path.join(tmp, "crlf-attr");
+  const repo = path.join(out, "repo");
+  await mkdir(repo, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "T"]);
+  await gitOk(repo, ["config", "user.email", "t@local.invalid"]);
+  await writeFile(path.join(repo, ".gitattributes"), "*.txt text eol=crlf\n");
+  await writeFile(path.join(repo, "notes.txt"), "line1\r\nline2\r\n");
+  await gitOk(repo, ["add", ".gitattributes", "notes.txt"]);
+  await gitOk(repo, ["commit", "-m", "init"]);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-crlf",
+    editablePaths: ["notes.txt"],
+  });
+  try {
+    // İKİ ALAN: blob = LF (normalize edildi); working dosya = CRLF
+    const blob = (await git(ws.workspaceDir, ["show", `${ws.baseCommit}:notes.txt`])).toString("utf8");
+    assert.equal(blob, "line1\nline2\n", "the base-commit blob is LF-normalized");
+    const fp = ws.base.fingerprints.get("notes.txt");
+    assert.ok(fp !== undefined && fp.exists === true);
+    if (fp !== undefined && fp.exists) {
+      assert.equal(fp.type, "file");
+      assert.equal(fp.contentSha256, sha256("line1\r\nline2\r\n"), "fingerprint = working-tree bytes (CRLF), not the blob");
+    }
+    // worker, GÖRDÜĞÜNÜ (CRLF) düzenlerse → birebir round-trip, kabul
+    const r1 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "notes.txt", operations: [{ search: "line1\r\n", replace: "line1-x\r\n" }] }]),
+    );
+    assert.equal(r1.validation.editsApplied, 1);
+    assert.equal((await readFile(path.join(ws.workspaceDir, "notes.txt"))).toString("utf8"), "line1-x\r\nline2\r\n");
+    // worker LF'e normalize ettiyse → deterministik red (bozulma DEĞİL)
+    const r2 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "notes.txt", operations: [{ search: "line1\n", replace: "zzz" }] }]),
+    );
+    assert.equal(r2.validation.editsApplied, 0);
+    assert.equal(r2.validation.rejected[0]?.reason, "search text not found at operation 1");
+    // red edilen turdan sonra workspace base'te (CRLF) — korundu
+    assert.equal((await readFile(path.join(ws.workspaceDir, "notes.txt"))).toString("utf8"), "line1\r\nline2\r\n");
+  } finally {
+    await ws.destroy();
+  }
+});
+
+// ── 28) PR #24 Fix 2: CRLF base (core.autocrlf) — aynı round-trip, config mekanizması ──
+
+test("CRLF base via core.autocrlf: fingerprint uses working-tree bytes; CRLF edit ok, LF search rejected (PR #24 Fix 2)", async () => {
+  const out = path.join(tmp, "crlf-autocrlf");
+  const repo = path.join(out, "repo");
+  await mkdir(repo, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "T"]);
+  await gitOk(repo, ["config", "user.email", "t@local.invalid"]);
+  await gitOk(repo, ["config", "core.autocrlf", "true"]);
+  await writeFile(path.join(repo, "notes.txt"), "line1\r\nline2\r\n");
+  await gitOk(repo, ["add", "notes.txt"]);
+  await gitOk(repo, ["commit", "-m", "init"]);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-autocrlf",
+    editablePaths: ["notes.txt"],
+  });
+  try {
+    const blob = (await git(ws.workspaceDir, ["show", `${ws.baseCommit}:notes.txt`])).toString("utf8");
+    assert.equal(blob, "line1\nline2\n", "the base-commit blob is LF-normalized");
+    const fp = ws.base.fingerprints.get("notes.txt");
+    assert.ok(fp !== undefined && fp.exists === true);
+    if (fp !== undefined && fp.exists) {
+      assert.equal(fp.contentSha256, sha256("line1\r\nline2\r\n"), "fingerprint = working-tree bytes (CRLF), not the blob");
+    }
+    const r1 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "notes.txt", operations: [{ search: "line1\r\n", replace: "line1-x\r\n" }] }]),
+    );
+    assert.equal(r1.validation.editsApplied, 1);
+    assert.equal((await readFile(path.join(ws.workspaceDir, "notes.txt"))).toString("utf8"), "line1-x\r\nline2\r\n");
+    const r2 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "notes.txt", operations: [{ search: "line1\n", replace: "zzz" }] }]),
+    );
+    assert.equal(r2.validation.editsApplied, 0);
+    assert.equal(r2.validation.rejected[0]?.reason, "search text not found at operation 1");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "notes.txt"))).toString("utf8"), "line1\r\nline2\r\n");
+  } finally {
+    await ws.destroy();
+  }
+});
+
+// ── 29) PR #24 Fix 3: repo-tanımlı DIŞ Git filter → fail-closed red ──
+
+test("external Git filter on a selected path rejects creation before any filter-capable command runs (PR #24 Fix 3)", async () => {
+  const out = path.join(tmp, "filter-repo");
+  const repo = path.join(out, "repo");
+  await mkdir(repo, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "T"]);
+  await gitOk(repo, ["config", "user.email", "t@local.invalid"]);
+  // ÖNCE içeriği commit et (filter tanımsızken — kurulum hiçbir filter yürütmez)
+  await writeFile(path.join(repo, "evil.txt"), "data\n");
+  await gitOk(repo, ["add", "evil.txt"]);
+  await gitOk(repo, ["commit", "-m", "init"]);
+  // SONRA saldırgan filter: config + attribute (her ikisi de repo kontrollü)
+  const marker = path.join(out, "filter-marker");
+  const script = path.join(out, "filter-evil.sh");
+  await writeFile(script, `#!/bin/sh\ntouch "${marker}"\ncat`); // kimlik + gözlenebilir yan etki
+  await chmod(script, 0o755);
+  await gitOk(repo, ["config", "filter.evil.clean", script]);
+  await gitOk(repo, ["config", "filter.evil.smudge", script]);
+  await writeFile(path.join(repo, ".gitattributes"), "*.txt filter=evil\n");
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const err = await expectWorkspaceError("invalid_repository", () =>
+    createGitWorktreeWorkspace({
+      repoRoot: repo,
+      workspaceDir: path.join(out, "ws"),
+      sessionId: "s-filter",
+      editablePaths: ["evil.txt"],
+    }),
+  );
+  assert.equal(err.message, "An external Git filter is not supported");
+  await assert.rejects(lstat(marker), "the external filter program must never execute during creation");
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+  await assert.rejects(lstat(path.join(out, "ws")), "partial workspace must be removed");
+
+  // Zararsız varyant: attribute komut TANIMLAMAMIŞ bir driver adlandırıyorsa
+  // (yürütülecek hiçbir program yok) → red YOK, oluşum devam eder.
+  const repo2 = path.join(out, "repo2");
+  await mkdir(repo2, { recursive: true });
+  await gitOk(repo2, ["init", "-b", "main"]);
+  await gitOk(repo2, ["config", "user.name", "T"]);
+  await gitOk(repo2, ["config", "user.email", "t@local.invalid"]);
+  await writeFile(path.join(repo2, ".gitattributes"), "*.txt filter=benign\n");
+  await writeFile(path.join(repo2, "benign.txt"), "data\n");
+  await gitOk(repo2, ["add", ".gitattributes", "benign.txt"]);
+  await gitOk(repo2, ["commit", "-m", "init"]);
+  const ws2 = await createGitWorktreeWorkspace({
+    repoRoot: repo2,
+    workspaceDir: path.join(out, "ws2"),
+    sessionId: "s-benign",
+    editablePaths: ["benign.txt"],
+  });
+  try {
+    assert.equal(ws2.baseCommit.length, 40, "command-less driver is not a threat — creation proceeds");
+  } finally {
+    await ws2.destroy();
+  }
+});
+
+// ── 29a) PR #24 Fix 3 (audit F-1): COMMITTED attribute yüzeyi (kirli working kopya) ──
+// `git worktree add` TÜM committed tree'yi checkout eder → committed
+// `.gitattributes` yüzeyini (SMUDGE) uygulatır. Working-tree kopyası kirlenmiş
+// (attr satırı silinmiş) bir tehdit, committed kopyada hâlâ geçerlidir —
+// yalnız working-tree yüzeyini denetleyen eski check, checkout'ta script
+// çalıştırıyordu (audit: marker YANDI). İkinci pass bunu kapatır.
+
+test("external Git filter in the committed .gitattributes (dirty working copy) rejects creation before checkout; smudge never runs (PR #24 Fix 3, audit F-1)", async () => {
+  const out = path.join(tmp, "filter-committed-attr");
+  const repo = path.join(out, "repo");
+  await mkdir(repo, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "T"]);
+  await gitOk(repo, ["config", "user.email", "t@local.invalid"]);
+  // COMMIT: içerik + saldırgan .gitattributes (committed yüzey — `git worktree
+  // add` checkout'ta tam ağacı bu attribute yüzeyiyle yazar)
+  await writeFile(path.join(repo, "x.txt"), "data\n");
+  await writeFile(path.join(repo, ".gitattributes"), "*.txt filter=evil\n");
+  await gitOk(repo, ["add", "x.txt", ".gitattributes"]);
+  await gitOk(repo, ["commit", "-m", "init"]);
+  // SALDIRI: working-tree attr kopyası KİRLİ (satır silindi) → working pass
+  // "unspecified" görür; COMMITTED kopya hâlâ geçerli.
+  await writeFile(path.join(repo, ".gitattributes"), "");
+  // local config: smudge + clean → dış program (kimlik + gözlenebilir marker)
+  const marker = path.join(out, "committed-attr-marker");
+  const script = path.join(out, "committed-attr-evil.sh");
+  await writeFile(script, `#!/bin/sh\ntouch "${marker}"\ncat`);
+  await chmod(script, 0o755);
+  await gitOk(repo, ["config", "filter.evil.clean", script]);
+  await gitOk(repo, ["config", "filter.evil.smudge", script]);
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const statusBefore = (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort();
+
+  const err = await expectWorkspaceError("invalid_repository", () =>
+    createGitWorktreeWorkspace({
+      repoRoot: repo,
+      workspaceDir: path.join(out, "ws"),
+      sessionId: "s-cattr",
+      editablePaths: ["x.txt"],
+    }),
+  );
+  assert.equal(err.message, "An external Git filter is not supported");
+  // ANA assert: filter programı ASLA yürütülmedi (checkout olmadı → smudge YOK)
+  await assert.rejects(lstat(marker), "the committed-attribute filter program must never execute");
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+  assert.deepEqual(
+    (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort(),
+    statusBefore,
+    "the main repository state must be untouched",
+  );
+  await assert.rejects(lstat(path.join(out, "ws")), "partial workspace must be removed");
+});
+
+// ── 29b) PR #24 Fix 3 (audit F-1): COMMITTED attribute yüzeyi (staged deletion) ──
+// Staged deletion: dosya working-tree'de VAR, index'te YOK → tracked kümesinde
+// görünmez; ama COMMITTED ağaçta hâlâ var → HEAD-tree pass'i denetlemeli.
+
+test("external Git filter in the committed .gitattributes with a staged deletion rejects creation before checkout; smudge never runs (PR #24 Fix 3, audit F-1)", async () => {
+  const out = path.join(tmp, "filter-committed-del");
+  const repo = path.join(out, "repo");
+  await mkdir(repo, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "T"]);
+  await gitOk(repo, ["config", "user.email", "t@local.invalid"]);
+  await writeFile(path.join(repo, "x.txt"), "data\n");
+  await writeFile(path.join(repo, ".gitattributes"), "*.txt filter=evil\n");
+  await gitOk(repo, ["add", "x.txt", ".gitattributes"]);
+  await gitOk(repo, ["commit", "-m", "init"]);
+  // SALDIRI: staged deletion (working-tree dosyası var, index'te yok) +
+  // working-tree attr kopyası kirli (satır silindi)
+  await gitOk(repo, ["rm", "--cached", "x.txt"]);
+  await writeFile(path.join(repo, ".gitattributes"), "");
+  const marker = path.join(out, "committed-del-marker");
+  const script = path.join(out, "committed-del-evil.sh");
+  await writeFile(script, `#!/bin/sh\ntouch "${marker}"\ncat`);
+  await chmod(script, 0o755);
+  await gitOk(repo, ["config", "filter.evil.clean", script]);
+  await gitOk(repo, ["config", "filter.evil.smudge", script]);
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const statusBefore = (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort();
+
+  const err = await expectWorkspaceError("invalid_repository", () =>
+    createGitWorktreeWorkspace({
+      repoRoot: repo,
+      workspaceDir: path.join(out, "ws"),
+      sessionId: "s-cdel",
+      editablePaths: ["x.txt"],
+    }),
+  );
+  assert.equal(err.message, "An external Git filter is not supported");
+  // ANA assert: filter programı ASLA yürütülmedi (checkout olmadı → smudge YOK)
+  await assert.rejects(lstat(marker), "the committed-attribute filter program must never execute");
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+  assert.deepEqual(
+    (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort(),
+    statusBefore,
+    "the main repository state must be untouched",
+  );
+  await assert.rejects(lstat(path.join(out, "ws")), "partial workspace must be removed");
+});
+
+// ── 30) PR #24 Fix 4: bilinen yol elle silinmiş → resetToBase ENOENT'ı affeder ──
+
+test("resetToBase tolerates a manually removed worker-created path (ENOENT, PR #24 Fix 4)", async () => {
+  const fixture = await buildFixture("resid8");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture, "s-r8"));
+  try {
+    const r0 = await ws.applyPatchSet(workerResult([{ kind: "create", path: "res.txt", content: "res\n" }]));
+    assert.equal(r0.validation.editsApplied, 1);
+    // dışsal temizlik: worker-oluşturulan yol elle gitti
+    await rm(path.join(ws.workspaceDir, "res.txt"));
+    await ws.resetToBase(); // ENOENT affedilir — red YOK
+    // workspace tam işlevsel: sonraki tur kalıntıyı yeniden oluşturup modify alır
+    const r1 = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "res.txt", content: "res2\n" },
+        { kind: "modify", path: "src/a.ts", operations: [{ search: "alpha-USER", replace: "r8" }] },
+      ]),
+    );
+    assert.equal(r1.validation.editsApplied, 2);
+    assert.equal((await readFile(path.join(ws.workspaceDir, "res.txt"))).toString(), "res2\n");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "src", "a.ts"))).toString(), "r8\nbeta\n");
+  } finally {
+    await ws.destroy();
+  }
+});
+
+// ── 31) PR #24 Fix 4: temizlik EACCES → apply red, kalıntı KÜMEDE KALIR, sonraki tur temizler ──
+
+test("cleanup failure (EACCES) rejects the round, keeps the residue in the known set, and the next round cleans it (PR #24 Fix 4)", async () => {
+  const fixture = await buildFixture("resid9");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture, "s-r9"));
+  try {
+    const r0 = await ws.applyPatchSet(workerResult([{ kind: "create", path: "res.txt", content: "res\n" }]));
+    assert.equal(r0.validation.editsApplied, 1);
+
+    // arıza enjeksiyonu: lstat + unlink ikisi de EACCES → temizlik
+    // deterministik olarak başarısız (dosyanın varlığından bağımsız:
+    // reset --hard, intent-to-add yolunu git tarafında silebilir)
+    setWorkspaceFs(denyingFs());
+    try {
+      const err = await expectWorkspaceError("workspace_operation_failed", () =>
+        ws.applyPatchSet(
+          workerResult([{ kind: "modify", path: "src/a.ts", operations: [{ search: "alpha-USER", replace: "r9" }] }]),
+        ),
+      );
+      assert.equal(err.message, "Cleaning the worker-created paths failed");
+      // red edilen tur: tracked durum base'te; modify ASLA uygulanmadı
+      assert.equal((await readFile(path.join(ws.workspaceDir, "src", "a.ts"))).toString(), "alpha-USER\nbeta\n", "no partial apply after the failed round");
+    } finally {
+      setWorkspaceFs(null); // gerçek fs geri
+    }
+
+    // küme KALDIĞINI ispat: fail'den sonra res.txt yeniden belirirse
+    // (reset'in silemediği/yeniden yazılan senaryosu) sonraki reset temizler.
+    // Küme yanlışlıkla BOŞALTILMIS olsaydı resetToBase sessizce başarılı olur
+    // ve dosya geriye kalırdı.
+    await writeFile(path.join(ws.workspaceDir, "res.txt"), "res\n");
+    await ws.resetToBase();
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "res.txt")), "the retained known set is cleaned on the next reset");
+
+    // workspace tam işlevsel: modify uygulanır
+    const r1 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "src/a.ts", operations: [{ search: "alpha-USER", replace: "r9" }] }]),
+    );
+    assert.equal(r1.validation.editsApplied, 1);
+    assert.equal((await readFile(path.join(ws.workspaceDir, "src", "a.ts"))).toString(), "r9\nbeta\n");
+  } finally {
+    setWorkspaceFs(null);
+    await ws.destroy();
+  }
+});
+
+// ── 32) PR #24 Fix 4: bilinen dosya yolunun üstünde DİZİN → red, RECURSIVE silme YOK ──
+
+test("a directory replacing a known worker path rejects reset without recursive deletion (PR #24 Fix 4)", async () => {
+  const fixture = await buildFixture("resid10");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture, "s-r10"));
+  try {
+    await ws.applyPatchSet(workerResult([{ kind: "create", path: "resfile.txt", content: "f\n" }]));
+    // tip sürüklenmesi: bilinen dosya yolu artık bir DİZİN
+    await rm(path.join(ws.workspaceDir, "resfile.txt"));
+    await mkdir(path.join(ws.workspaceDir, "resfile.txt"));
+    await writeFile(path.join(ws.workspaceDir, "resfile.txt", "inner.txt"), "inner\n");
+
+    const err = await expectWorkspaceError("workspace_operation_failed", () => ws.resetToBase());
+    assert.equal(err.message, "Cleaning the worker-created paths failed");
+    // genişletme YOK: dizin + içeriği aynen durur (rm -rf / git clean / recursive unlink YASAK)
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "resfile.txt", "inner.txt"))).toString(),
+      "inner\n",
+      "the directory content must survive — no recursive deletion",
+    );
+    // manuel temizlenince sıradaki reset başarıyla biter
+    await rm(path.join(ws.workspaceDir, "resfile.txt", "inner.txt"));
+    await rm(path.join(ws.workspaceDir, "resfile.txt"), { recursive: true });
+    await ws.resetToBase();
+  } finally {
+    await ws.destroy();
+  }
+});
+
+// ── 33) PR #24 Fix 4: apply'da drift → rollback temizliği arıza ile başarısız → ──
+// bilinen kalıntı kümede KALIR; ana checkout DOKUNULMAZ; gerçek fs'le reset geri alır.
+
+test("failed apply rollback keeps its residue: main checkout untouched, foreign files untouched, real-fs reset recovers (PR #24 Fix 4)", async () => {
+  const fixture = await buildFixture("resid11");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture, "s-r11"));
+  try {
+    const mainHeadBefore = await gitText(fixture.repo, ["rev-parse", "HEAD"]);
+    const mainStatusBefore = (await gitText(fixture.repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort();
+
+    // genB create hedefi ÖNCEDEN var → drift → apply başarısız; foreign dosya setin dışında
+    await writeFile(path.join(ws.workspaceDir, "genB.txt"), "foreign-sentinel\n");
+    await writeFile(path.join(ws.workspaceDir, "foreign.txt"), "foreign\n");
+
+    setWorkspaceFs(failingFs());
+    const err = await expectWorkspaceError("workspace_operation_failed", () =>
+      ws.applyPatchSet(
+        workerResult([
+          { kind: "create", path: "genA.txt", content: "A\n" },
+          { kind: "create", path: "genB.txt", content: "B\n" },
+        ]),
+      ),
+    );
+    assert.equal(err.message, "Cleaning the worker-created paths failed", "rollback cleanup failed — safe operational error");
+    setWorkspaceFs(null);
+
+    // genA (bu turun create'ı) = BİLİNEN KALINTI (kümede, workspace'te); genB/foreign setin dışında
+    assert.equal((await readFile(path.join(ws.workspaceDir, "genA.txt"))).toString(), "A\n", "this round's create remains as known residue");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "genB.txt"))).toString(), "foreign-sentinel\n", "the sentinel was never a worker path — untouched");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "foreign.txt"))).toString(), "foreign\n", "foreign files are never removed");
+
+    // ana checkout DOKUNULMADI
+    assert.equal(await gitText(fixture.repo, ["rev-parse", "HEAD"]), mainHeadBefore);
+    assert.deepEqual(
+      (await gitText(fixture.repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort(),
+      mainStatusBefore,
+      "main checkout must be untouched",
+    );
+
+    // gerçek fs'le temiz reset: kalıntı gider, foreign dosyalar KALIR
+    await ws.resetToBase();
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "genA.txt")), "the residue is removed by the clean reset");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "genB.txt"))).toString(), "foreign-sentinel\n", "foreign files survive the reset");
+  } finally {
+    setWorkspaceFs(null);
+    await ws.destroy();
+  }
+});
+
+// ── PR #24 audit F-6 yardımcıları (testler 34-37) ───────────────────────────
+//
+// Tehdit modeli: worker (güvensiz girdi) turun içi worktree'ye `.gitattributes`
+// (örn. `** filter=evil`) ekebilir — `create` allow-list'ten BAĞIMSIZ (spec 81)
+// — + pattern'e uyan bir dosyaya dokunur. Config'de (repo `.git/config` VEYA
+// global — pratik örnek: LFS) ÖNCEDEN tanımlı `filter.<d>.clean`, tur içi
+// diff/stat/export komutlarında host'ta YÜRÜR (RCE). Oluşturmdaki check o ANKI
+// (temiz) yüzeyi doğruluyordu; tur sırasında yüzey worker-yazılabilir.
+//
+// ÖLÇÜLDÜ (Apple Git 2.50.1, bu makine): bitki attr + config'deki driver varken
+// `git diff <base>` (name-only/numstat/binary) + `add -N` + `git status` (racy
+// dosya) + `git reset --hard` (racy içerik doğrulama — checkout→doğrulama yolu)
+// filter'ı YÜRÜTÜR. Düzeltme: (a) her turda worker yazılarından sonra +
+// ilk filter-capable komuttan önce fail-closed re-check; (b) export diff'inden
+// önce aynı check; (c) her `reset --hard`'dan ÖNCE bilinen worker yazılarının
+// (bitki dahil) saf-fs temizliği — temizlik hata verirse reset YÜRÜTÜLMEZ.
+
+/**
+ * F-6 minimal fixture repo: `d/` altında tracked dosyalar (pattern altı).
+ * Repo'da `.gitattributes` YOK → config'deki driver yalnız worker bitkisiyle
+ * tehdit oluşturur; oluşum check'i temiz geçer (süper küme: hiçbir yol
+ * attr gerektirmiyor → config araması bile yapılmaz).
+ */
+async function buildF6Repo(name: string, files: Record<string, string>): Promise<{ out: string; repo: string }> {
+  const out = path.join(tmp, name);
+  const repo = path.join(out, "repo");
+  await mkdir(repo, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "T"]);
+  await gitOk(repo, ["config", "user.email", "t@local.invalid"]);
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(repo, rel);
+    await mkdir(path.dirname(abs), { recursive: true });
+    await writeFile(abs, content);
+  }
+  await gitOk(repo, ["add", "-A"]);
+  await gitOk(repo, ["commit", "-m", "init"]);
+  return { out, repo };
+}
+
+/**
+ * Önceden tanımlı filter driver'ı (LFS benzeri): marker yazan + kimlik
+ * (`cat`) betik, repo yerel config'inde. `marker` = gözlenebilir RCE kanıtı.
+ */
+async function plantDriver(out: string, repo: string, driver: string): Promise<{ marker: string; script: string }> {
+  const marker = path.join(out, `${driver}-marker`);
+  const script = path.join(out, `${driver}-evil.sh`);
+  await writeFile(script, `#!/bin/sh\ntouch "${marker}"\ncat`);
+  await chmod(script, 0o755);
+  await gitOk(repo, ["config", `filter.${driver}.clean`, script]);
+  await gitOk(repo, ["config", `filter.${driver}.smudge`, script]);
+  return { marker, script };
+}
+
+/**
+ * POZİTİF KONTROL (mutasyon kanıtı — audit S-2): sınıfın `statInternal()`
+ * ile BİREBİR aynı komutu, sınıfın check'inden BYPASS ederek ham git ile
+ * koşar. Worker yazılarının worktree'deki son halinin (bitki attr +
+ * modifiye tracked dosya) filter-capable komutta filter'ı GERÇEKTEN
+ * yürüttüğünü kanıtlar — fix'in savunacak bir şeyi olduğunu ölçer.
+ */
+async function rawRoundDiff(ws: GitWorktreeWorkspace): Promise<void> {
+  await git(ws.workspaceDir, [
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--numstat",
+    "-z",
+    ws.baseCommit,
+  ]);
+}
+
+/** Worker bitki durumunu worktree'ye ELLE kurar (attr dosyası + tracked modify). */
+async function plantThreatState(ws: GitWorktreeWorkspace, attrContent: string, trackedPath: string, modifiedContent: string): Promise<void> {
+  const wsDir = ws.workspaceDir;
+  await writeFile(path.join(wsDir, path.dirname(trackedPath), ".gitattributes"), attrContent);
+  await writeFile(path.join(wsDir, trackedPath), modifiedContent);
+}
+
+/** Bitki durumunu temizler (attr dosyası gider → reset filter yürütemez). */
+async function cleanThreatState(ws: GitWorktreeWorkspace, trackedPath: string): Promise<void> {
+  const wsDir = ws.workspaceDir;
+  await rm(path.join(wsDir, path.dirname(trackedPath), ".gitattributes"), { force: true });
+  await git(wsDir, ["reset", "--hard", ws.baseCommit]);
+}
+
+// ── 34) F-6 ana tehdit: repo-config driver + worker bitkisi → tur RED, marker ASLA ──
+
+test("worker-planted .gitattributes with a preconfigured repo-config driver: round rejected before any filter-capable command; the filter never executes (PR #24 F-6)", async () => {
+  const { out, repo } = await buildF6Repo("f6-main", { "d/p.txt": "data\n" });
+  const { marker } = await plantDriver(out, repo, "evil");
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const statusBefore = (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort();
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-f6",
+    editablePaths: ["d/p.txt"],
+  });
+  // Oluşum BAŞARILI (repo temiz) → canlı workspace worktree'si listede meşru.
+  const worktreesAfterCreate = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  try {
+    // ── POZİTİF KONTROL (mutasyon kanıtı, audit S-2): sınıf BYPASS ──
+    // Sınıfın check'i OLMASAYDI tur tam da bunu yürütürdü: bitki attr +
+    // modifiye tracked dosya → ham `git diff --numstat -z <base>` filter'ı
+    // host'ta çalıştırır (marker). Fix'in varlığını bu ölçüm kanıtlar.
+    await plantThreatState(ws, "*.txt filter=evil\n", "d/p.txt", "data-EVIL\n");
+    await rawRoundDiff(ws);
+    await assert.doesNotReject(lstat(marker), "POSITIVE CONTROL: without the re-check, the round's diff WOULD execute the external filter");
+    await rm(marker);
+    await cleanThreatState(ws, "d/p.txt");
+    await assert.rejects(lstat(marker), "cleaning the manually planted state (attribute removed) must not run the filter");
+
+    // ── sınıf yolu: aynı patch set → RED (tur re-check), marker ASLA YOK ──
+    const err = await expectWorkspaceError("invalid_repository", () =>
+      ws.applyPatchSet(
+        workerResult([
+          { kind: "create", path: "d/.gitattributes", content: "*.txt filter=evil\n" },
+          { kind: "create", path: "d/q.txt", content: "q\n" },
+          { kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-EVIL" }] },
+        ]),
+      ),
+    );
+    assert.equal(err.message, "An external Git filter is not supported", "the fixed fail-closed message");
+    await assert.rejects(lstat(marker), "the filter program must never execute in the class round (not even in the rollback)");
+
+    // Yarım state YOK: başarısız tur worktree ekleme/çıkarma YAPAMAZ —
+    // canlı workspace zaten listede; liste create sonundaki haliyle AYNI.
+    assert.deepEqual(
+      worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+      worktreePaths(worktreesAfterCreate),
+      "the failed round must not add or remove any worktree",
+    );
+    assert.deepEqual(
+      (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort(),
+      statusBefore,
+      "the main repository state must be untouched",
+    );
+    // Rollback worker yazılarını worktree'den gider (bitki dahil) → base'te.
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "d", ".gitattributes")), "the planted attribute is removed by the rollback");
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "d", "q.txt")), "the planted matching file is removed by the rollback");
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(),
+      "data\n",
+      "the modified file is back to base",
+    );
+
+    // Workspace YARIM KALMADI — sonraki zararsız tur tam işlevsel + filter YOK.
+    const ok = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-OK" }] }]),
+    );
+    assert.equal(ok.validation.editsApplied, 1);
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(), "data-OK\n");
+    await assert.rejects(lstat(marker), "the benign round must not run the filter either");
+  } finally {
+    await ws.destroy();
+  }
+  // destroy sonrası: ana repoda hiçbir worktree geride kalmadı.
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+});
+
+// ── 35) F-6 LFS-global varyantı: driver GLOBAL config'de (LFS kurulu makine) ──
+
+test("external filter in the GLOBAL config (LFS-style): worker-planted lfs attribute rejects the round; the filter never executes (PR #24 F-6)", async () => {
+  const { out, repo } = await buildF6Repo("f6-lfs", { "d/x.png": "pngdata\n" });
+  // LFS kurulu makine simülasyonu: `filter.lfs.*` GLOBAL config'de. Test
+  // ortamı global config'i boş dosyaya pinler (before()) — bu test geçici
+  // olarak LFS tanımlı dosyaya çevirir; runGit her spawn'da process.env'i
+  // miras aldığı için sonraki git çağrılarında etkilidir.
+  const lfsScript = path.join(out, "lfs-evil.sh");
+  const marker = path.join(out, "lfs-marker");
+  await writeFile(lfsScript, `#!/bin/sh\ntouch "${marker}"\ncat`);
+  await chmod(lfsScript, 0o755);
+  const globalConfigFile = path.join(out, "global-gitconfig");
+  await writeFile(globalConfigFile, `[filter "lfs"]\n\tclean = ${lfsScript}\n\tsmudge = ${lfsScript}\n`);
+  const previousGlobal = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = globalConfigFile;
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-lfs",
+    editablePaths: ["d/x.png"],
+  });
+  try {
+    // POZİTİF KONTROL: global-scope driver da tur diff'inde yürür —
+    // config okumasının (repo yerel VEYA global) ikisi de re-check yüzeyinde.
+    await plantThreatState(ws, "*.png filter=lfs\n", "d/x.png", "pngdata-EVIL\n");
+    await rawRoundDiff(ws);
+    await assert.doesNotReject(lstat(marker), "POSITIVE CONTROL: without the re-check, the global-scope filter WOULD execute");
+    await rm(marker);
+    await cleanThreatState(ws, "d/x.png");
+    await assert.rejects(lstat(marker), "cleaning the planted state must not run the filter");
+
+    const err = await expectWorkspaceError("invalid_repository", () =>
+      ws.applyPatchSet(
+        workerResult([
+          { kind: "create", path: "d/.gitattributes", content: "*.png filter=lfs\n" },
+          { kind: "modify", path: "d/x.png", operations: [{ search: "pngdata", replace: "pngdata-EVIL" }] },
+        ]),
+      ),
+    );
+    assert.equal(err.message, "An external Git filter is not supported");
+    await assert.rejects(lstat(marker), "the global-scope filter must never execute in the class round");
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "d", ".gitattributes")), "the planted attribute is removed by the rollback");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "x.png"))).toString(), "pngdata\n", "the modified file is back to base");
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = previousGlobal;
+    await ws.destroy();
+  }
+});
+
+// ── 36) F-6 zararsız varyant: komutSUZ driver'a pattern → red YOK, tur devam ──
+
+test("worker-planted attribute for a command-less driver (no filter.* config): round proceeds, results correct, no wedge (PR #24 F-6)", async () => {
+  const { out, repo } = await buildF6Repo("f6-benign", { "d/p.txt": "data\n" });
+  // `filter.benign.*` config'de TANIMLI DEĞİL — attr bir driver ADI
+  // bildiriyor ama yürütülecek hiçbir program yok → tehdit YOK.
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-benign6",
+    editablePaths: ["d/p.txt"],
+  });
+  try {
+    // Round 1: bitki (komutsuz driver) + pattern altı create + tracked modify.
+    const r1 = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "d/.gitattributes", content: "*.txt filter=benign\n" },
+        { kind: "create", path: "d/q.txt", content: "q\n" },
+        { kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-1" }] },
+      ]),
+    );
+    assert.equal(r1.validation.editsApplied, 3, "a command-less driver is not a threat — the round completes");
+    assert.deepEqual(r1.filesChanged.sort(), ["d/.gitattributes", "d/p.txt", "d/q.txt"]);
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "q.txt"))).toString(), "q\n");
+    const diff = await ws.diff();
+    assert.ok(diff.includes("d/q.txt"), "the worker create appears in the diff");
+    assert.ok(diff.includes("data-1"), "the worker modification appears in the diff");
+
+    // Round 2: aynı zararsız bitki YENİDEN — round 1'in create kümesi
+    // (bitki dahil) önceki turun kalıntısı olarak temizlenir + round devam
+    // eder (komutSUZ driver → wedge YOK, workspace işlevsel kalır).
+    // Dikkat: her tur immutable base'e karşı TAM ikame'dir (spec 35/88) —
+    // round başındaki `reset --hard` p.txt'yi base'e ("data\n") döndürür;
+    // modify, BASE içeriğinde aramalı (round 1 çıktısında DEĞİL).
+    const r2 = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "d/.gitattributes", content: "*.txt filter=benign\n" },
+        { kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-2" }] },
+      ]),
+    );
+    assert.equal(r2.validation.editsApplied, 2, "the second round with the benign attribute must proceed");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(), "data-2\n");
+  } finally {
+    await ws.destroy();
+  }
+});
+
+// ── 37) F-6 kalıntı varyantı: başarısız rollback (EACCES seam) bitkiyi
+//      worktree'de bırakır → sonraki tur, filter-capable komuttan ÖNCE red;
+//      fs toparlanınca (gerçek fs) tur kendiliğinden iyileşir ──
+
+test("failed-rollback residue (EACCES seam): the planted attribute is never executed — the next round reds before the filter-capable commands, and a recovered filesystem heals the workspace (PR #24 F-6)", async () => {
+  const { out, repo } = await buildF6Repo("f6-residue", { "d/p.txt": "data\n" });
+  const { marker } = await plantDriver(out, repo, "evil");
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-f6r",
+    editablePaths: ["d/p.txt"],
+  });
+  try {
+    // Round 1 (EACCES seam FAAL): bitki + tracked modify → tur re-check
+    // threat bulur (invalid_repository) → rollback'ın temizliği seam'le
+    // EACCES → rollback BAŞARISIZ: bitki worktree'de KALIR (bilinen kalıntı),
+    // reset YÜRÜTÜLMEZ (bitki attr yüzeyiyle filter çalışmaz) → güvenli
+    // işletimsel red. Marker ASLA yazılmaz.
+    // (Seam round 2'ye kadar KASITLI olarak faal kalır — dış `finally`
+    //  sıfırlar; buraya iç try/finally konmaz.)
+    setWorkspaceFs(denyingFs());
+    const err1 = await expectWorkspaceError("workspace_operation_failed", () =>
+      ws.applyPatchSet(
+        workerResult([
+          { kind: "create", path: "d/.gitattributes", content: "*.txt filter=evil\n" },
+          { kind: "create", path: "d/q.txt", content: "q\n" },
+          { kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-EVIL" }] },
+        ]),
+      ),
+    );
+    assert.equal(err1.message, "Cleaning the worker-created paths failed");
+    await assert.rejects(lstat(marker), "no filter execution in the failed round (the rollback reset is skipped while the attribute is present)");
+    // Yarım state: bitki + worker içeriği worktree'de; kalıntı BİLİNEN.
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(), "data-EVIL\n", "the mid-round state remains (no reset ran)");
+    await assert.doesNotReject(lstat(path.join(ws.workspaceDir, "d", ".gitattributes")), "the residue attribute stays as known residue");
+
+    // Round 2 (seam hâlâ FAAL): worker pattern'e uyan dosyaya dokunmak
+    // istiyor → bilinen kalıntı temizlenemiyor (EACCES) → tur, herhangi bir
+    // filter-capable komut YÜRÜTÜLMEÖNCE red (temizlik red'i — sıralama
+    // F-6'nın kalıntı ayağı). Marker ASLA yazılmaz.
+    const err2 = await expectWorkspaceError("workspace_operation_failed", () =>
+      ws.applyPatchSet(workerResult([{ kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-R2" }] }])),
+    );
+    assert.equal(err2.message, "Cleaning the worker-created paths failed");
+    await assert.rejects(lstat(marker), "the residue window must never execute the filter (reset skipped while the residue is known)");
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(),
+      "data-EVIL\n",
+      "the failed round writes nothing",
+    );
+
+    // ── fs TOPARLANIR (gerçek fs): kalıntı temizlenir, workspace İYİLEŞİR ──
+    setWorkspaceFs(null);
+    const r3 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-OK" }] }]),
+    );
+    assert.equal(r3.validation.editsApplied, 1, "the recovered round cleans the residue and proceeds");
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "d", ".gitattributes")), "the residue attribute is removed by the next round's cleanup");
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "d", "q.txt")), "the residue file is removed by the next round's cleanup");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(), "data-OK\n");
+    await assert.rejects(lstat(marker), "the healed round must not run the filter");
+  } finally {
+    setWorkspaceFs(null);
     await ws.destroy();
   }
 });
