@@ -643,11 +643,28 @@ already *has* its rules; returning them would burn tokens for nothing).
    filter-capable command (`add -N`, `diff`), and again before the
    `diff()`/`stat()`/`export` diff — because the worktree attribute surface
    is worker-writable (a worker may create or modify `.gitattributes`), and a
-   driver preconfigured in the user's git config (Git LFS included) would
-   otherwise execute its program on the host mid-round; every `git reset
-   --hard` is likewise preceded by the removal of known worker-written files,
-   since a measured racy content verification inside `reset --hard` also runs
-   the clean filter.
+    driver preconfigured in the user's git config (Git LFS included) would
+    otherwise execute its program on the host mid-round; every `git reset
+    --hard` is likewise preceded by the removal of known worker-written files,
+    since a measured racy content verification inside `reset --hard` also runs
+    the clean filter.
+
+   The racy window is closed **for every attribute surface the worker owns**
+   (PR #24, audit SB-1). Before *every* `git reset --hard` — the three points:
+   round-start housekeeping, round-failure rollback, and `resetToBase` — the
+   worker's attribute surface is sanitized with **plain filesystem operations
+   only**: worker-*created* `.gitattributes` files are removed, and
+   worker-*modified/deleted* **tracked** `.gitattributes` files (at any
+   repository depth) are rewritten with the exact base working-tree bytes and
+   the base mode. If either sanitation step fails, the `git reset --hard` is
+   **not run** (a fixed `workspace_operation_failed` red) — a reset must never
+   read a worker-owned attribute surface, because its racy content
+   verification (measured: a tracked same-size modification whose mtime lands
+   in the index's second) re-reads the working tree *through* that surface.
+   Even a fully successful round's attribute content is neutralized before the
+   next round's reset. The sanitation is a *sanitizer*, not a *detector*: the
+   per-round fail-closed re-checks above remain in force — the two mechanisms
+   are complementary, and neither replaces the other.
 
  Reasoning, mapped to the four criteria:
 1. **Token efficiency** — `git diff` and `git diff --stat` are free and exact,

@@ -52,6 +52,18 @@
  *   önce — worktree'nin attribute yüzeyi worker-YAZILABİLİR (worker
  *   `.gitattributes` eker; config'de önceden tanımlı driver — LFS dahi —
  *   tur içi diff/stat/export komutlarında host'ta yürütülürdü).
+ * - Her `git reset --hard` (ÜÇ nokta: round-start housekeeping, apply
+ *   catch-rollback, `resetToBase`) ÖNCESİ worker-çıkışlı attribute yüzeyi
+ *   saf-fs ile BİREBİR immutable base'e döndürülür (PR #24 SB-1): worker'ın
+ *   modify/delete ettiği TRACKED `.gitattributes`'lar (repo'nun her
+ *   derinliği) base'in working-tree baytları + moduyla yazılır; worker-
+ *   OLUŞTURDUĞU attr'lar ise bilinen kümeden saf-fs silinir. `git reset
+ *   --hard`'ın racy içerik doğrulaması (ölçüldü, Apple Git 2.50.1:
+ *   tracked-modified + aynı-saniye stat + aynı boyut) CLEAN filter'ı
+ *   attribute yüzeyiyle host'ta yürütür — yüzey worker'ınkİ değil,
+ *   immutable base'in olmalı. Sanitasyon (sılma VEYA restore) başarısız
+ *   olursa reset YÜRÜTÜLMEZ; re-check'ler bu restore'u İKAME ETMEZ
+ *   (restore ≠ dedektör) — her ikisi de devrede kalır.
  *
  * Her diff/stat/export `baseCommit`'e görecelidir (spec 64) — main'in
  * mevcut değişiklikleri base'e dahil edildiği için worker diff'inde
@@ -116,17 +128,32 @@ const SPLASH_GIT_IDENTITY: NodeJS.ProcessEnv = {
 // ── fs seam (PR #24 Fix 4 — küçük test enjeksiyonu noktası; DI framework YOK) ──
 
 /**
- * Worker-oluşturulan yol temizliğinin fs arayüzü: yalnız `lstat` + `unlink`.
- * `removeWorkerCreatedPaths` bu aktif fs üzerinden çalışır — testler
- * `setWorkspaceFs` ile arıza senaryoları (ENOENT/EACCES/...) enjekte eder;
- * `null` gerçek fs'e döner. Modülün geri kalanı node:fs'i doğrudan kullanır.
+ * Worker-oluşturulan yol temizliğinin (PR #24 Fix 4) + worker-takmış
+ * `.gitattributes` restore'unun (PR #24 SB-1) fs arayüzü: `lstat` +
+ * `unlink` (temizlik) ve `mkdir` + `writeFile` + `chmod` (restore).
+ * `removeWorkerCreatedPaths` ve `restoreBaseAttributeFiles` bu aktif fs
+ * üzerinden çalışır — testler `setWorkspaceFs` ile arıza senaryoları
+ * (ENOENT/EACCES/...) enjekte eder; `null` gerçek fs'e döner. Modülün geri
+ * kalanı node:fs'i doğrudan kullanır.
  */
 export interface WorkspaceFs {
   lstat(path: string): Promise<Stats>;
   unlink(path: string): Promise<void>;
+  mkdir(path: string, options: { recursive: boolean }): Promise<void>;
+  writeFile(path: string, data: Buffer): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
 }
 
-const realFs: WorkspaceFs = { lstat, unlink };
+// `mkdir`'in `recursive: true` overload'i `Promise<string | undefined>`
+// döndürür (ilk oluşturulan dizin) — seam sözleşmesi `Promise<void>`'tir;
+// içerik atılır. Geri kalan üyelerin imzaları birebir uyuşur.
+const realFs: WorkspaceFs = {
+  lstat,
+  unlink,
+  mkdir: (target, options) => mkdir(target, options).then(() => undefined),
+  writeFile,
+  chmod,
+};
 let activeFs: WorkspaceFs = realFs;
 
 /** Test enjeksiyonu seam'i: `null` → gerçek node:fs. */
@@ -194,6 +221,24 @@ export class GitWorktreeWorkspace implements Workspace {
    * küme yalnız temizlik BAŞARILI bitince temizlenir, PR #24 Fix 4).
    */
   private workerCreatedPaths = new Set<string>();
+  /**
+   * Bu turda worker tarafından modify/delete edilen ve base'te TRACKED olan
+   * `.gitattributes` yolları (PR #24 SB-1): her `git reset --hard` (3 nokta)
+   * ÖNCESİ, base'in yakalanma anındaki working-tree baytları + moduyla
+   * saf-fs ile geri yazılır — `git reset --hard`'ın racy içerik
+   * doğrulaması (ölçüldü, Apple Git 2.50.1: tracked-modified +
+   * aynı-saniye stat + aynı boyut) CLEAN filter'ı yalnız immutable base'in
+   * attribute yüzeyiyle yürütebilsin.
+   *
+   * Yaşam döngüsü: `applyPatchSet`'te doğrulama SONRASI (yazımdan ÖNCE)
+   * doldurulur → hem yeşil tur hem apply-ortası hata (rollback), her ikisi
+   * de sıradaki `git reset --hard`'tan önce bu yüzeyi döndürür. Yalnız
+   * restore BAŞARILI VE `reset --hard` BAŞARILI ise temizlenir;
+   * restore/temizlik hatasında KALIR (bir sonraki reset/apply yeniden
+   * dener — "temiz" asla raporlanmaz). Worker'ın OLUŞTURDUĞU attr'lar
+   * buraya girmez (onlar `workerCreatedPaths`'te `unlink` ile gider).
+   */
+  private workerTouchedAttributePaths = new Set<string>();
   /** Doğrulamanın immutable base girdisi (kamuya açık `base`'in genişlemesi). */
   private validationBase: WorkspaceBase;
 
@@ -258,9 +303,14 @@ export class GitWorktreeWorkspace implements Workspace {
    *      worker bitkisi `reset --hard`'ın racy doğrulamasında filter
    *      yürütebilir) — temizlik hatası → yöntem RED; küme eski (bilinen
    *      kalıntı) setiyle KALIR, başarı raporlanmaz
+   *   1b) önceki turda worker'ın modify/delete ettiği TRACKED
+   *      `.gitattributes`'ları saf-fs ile immutable base'e döndür (PR #24
+   *      SB-1) — hata → yöntem RED, sıfırlama YÜRÜTÜLMEZ
    *   2) tracked durumu immutable base'e sıfırla — işletimsel hata →
    *      `workspace_operation_failed` (ana checkout'a asla dokunulmaz)
    *   3) TÜM WorkerResult'ı immutable base'e karşı semantik doğrula
+   *   3b) bu turda worker'ın modify/delete ettiği tracked attr yollarını
+   *      SB-1 kümesine yaz (sıradaki sıfırlama onları restore etsin)
    *   4) yalnız kabul edilen düzenlemeleri uygula
    *   4b) fail-closed filter re-check (PR #24 audit F-6): worker yazıları
    *       worktree'de UYGULANDIKTAN, turun ilk filter-capable komutundan
@@ -278,13 +328,15 @@ export class GitWorktreeWorkspace implements Workspace {
    * Atımlar sırasında beklenmeyen işletimsel hata (spec 58): workspace base
    * durumuna geri Restore edilir + bu turun kalıntıları temizlenir, güvenli
    * tip'li `WorkspaceError` atılır — yarım patch "başarı" olarak raporlanmaz;
-   * ana checkout'a DOKUNULMAZ. Rollback SIRASI (audit F-6): önce bu turun
-   * worker-oluşturdukları (bitki dahil) saf fs ile kaldırılır, SONRA
-   * `reset --hard` — kaldırma hata verirse reset YÜRÜTÜLMEZ (bitki attr
-   * yüzeyiyle filter çalışmaz). Rollback'in kendisi başarısız olursa
-   * (temizlik veya reset): bilinen kalıntı `workerCreatedPaths`'a
-   * KAYDEDİLİR (union — unutulmaz, sonraki reset/apply yeniden dener) ve
-   * güvenli işletimsel hata atılır (PR #24 Fix 4).
+   * ana checkout'a DOKUNULMAZ. Rollback SIRASI (audit F-6 + SB-1): önce bu
+   * turun worker-oluşturdukları (bitki attr dahil) saf fs ile kaldırılır,
+   * SONRA bu turda worker'ın modify/delete ettiği tracked attr yüzeyi
+   * base'e saf-fs ile restore edilir (SB-1), SONRA `reset --hard` — bir
+   * adım hata verirse reset YÜRÜTÜLMEZ (attr yüzeyiyle filter çalışmaz).
+   * Rollback'in kendisi başarısız olursa (temizlik/restore/reset): bilinen
+   * kalıntı `workerCreatedPaths`'a KAYDEDİLİR (union — unutulmaz, sonraki
+   * reset/apply yeniden dener), attr kümesi aynen KALIR ve güvenli
+   * işletimsel hata atılır (PR #24 Fix 4 + SB-1).
    */
   async applyPatchSet(workerResult: WorkerResult): Promise<WorkspaceApplyResult> {
     this.assertUsable();
@@ -309,6 +361,23 @@ export class GitWorktreeWorkspace implements Workspace {
       });
     }
 
+    // (1b) PR #24 SB-1: önceki turda worker'ın modify/delete ettiği TRACKED
+    // `.gitattributes`'ları saf-fs ile immutable base'e döndür — `git reset
+    // --hard`'ın racy içerik doğrulaması (ölçüldü, Apple Git 2.50.1:
+    // tracked-modified + aynı-saniye stat + aynı boyut) o yüzeydeki CLEAN
+    // filter'ı host'ta yürütür; yüzey git komutundan ÖNCE base'in birebir
+    // attribute haliyle geri yazılır. Hata → yöntem RED, reset YÜRÜTÜLMEZ.
+    try {
+      await this.restoreBaseAttributeFiles(this.workerTouchedAttributePaths);
+    } catch (err) {
+      if (err instanceof WorkspaceError) {
+        throw err;
+      }
+      throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed", {
+        cause: err,
+      });
+    }
+
     // (2) Tracked durum → immutable base. (Asla main'e, asla main HEAD'e değil — spec 36.)
     // (1) yalnızca bilinen worker yollarını (untracked) kaldırdığı için tracked
     // durum hâlâ bu adımda sıfırlanır; worker bitkisi git'in önünde gitmiş
@@ -321,11 +390,31 @@ export class GitWorktreeWorkspace implements Workspace {
         cause: err,
       });
     }
-    // Küme yalnız temizlik + sıfırlama TAMAMEN başarılı bitince temizlenir.
+    // Kümeler yalnız temizlik + restore + sıfırlama TAMAMEN başarılı bitince
+    // temizlenir.
     this.workerCreatedPaths = new Set<string>();
+    this.workerTouchedAttributePaths = new Set<string>();
 
     // (3) TÜM seti immutable base'e karşı doğrula — yazmadan ÖNCE (spec 39).
     const validation = validateWorkerResult(this.validationBase, workerResult);
+
+    // (3b) PR #24 SB-1: bu turda worker'ın modify/delete ettiği ve base'te
+    // TRACKED olan `.gitattributes` yollarını SB-1 kümesine yaz — turun
+    // SONUNDA (yeşil) VEYA yarıda kalmasında (rollback), sıradaki
+    // `git reset --hard`'tan ÖNCE bu yüzey base'in birebir haliyle geri
+    // yazılmalıdır. `validate` modify/delete → `editable` zorlar ve attr
+    // base'te tracked → base baytları `editableContent`'te, mod parmak
+    // izinde zaten yakalanmıştır (F-2 alanı — `captureBase` değişmez).
+    this.workerTouchedAttributePaths = new Set<string>();
+    for (const plan of validation.plan) {
+      if (
+        (plan.action === "modify" || plan.action === "delete") &&
+        path.basename(plan.canonical) === ".gitattributes" &&
+        this.validationBase.basePaths.has(plan.canonical)
+      ) {
+        this.workerTouchedAttributePaths.add(plan.canonical);
+      }
+    }
 
     // (4) Yalnız kabul edilenleri uygula.
     const createdThisRound: string[] = [];
@@ -434,22 +523,35 @@ export class GitWorktreeWorkspace implements Workspace {
       // (6) Bilinen küme = bu turun kabul edilen create'ları (spec 59).
       this.workerCreatedPaths = new Set<string>(createdThisRound);
     } catch (err) {
-      // (spec 58) işletimsel hata: bu turun kalıntılarını temizle + base'e
-      // dön. Rollback SIRASI (audit F-6): ÖNCE bu turun worker-oluşturdukları
-      // (bitki `.gitattributes` dahil) saf fs ile kaldırılır, SONRA
+      // (spec 58) işletimsel hata: bu turun kalıntılarını temizle + attr
+      // yüzeyini base'e döndür + base'e dön. Rollback SIRASI (audit F-6 +
+      // SB-1): ÖNCE bu turun worker-oluşturdukları (bitki `.gitattributes`
+      // dahil) saf fs ile kaldırılır, SONRA bu turda modify/delete edilen
+      // tracked attr yüzeyi base'e saf-fs ile restore edilir, SONRA
       // `reset --hard` — `git reset --hard`'ın racy içerik doğrulaması
-      // (ölçüldü, Apple Git 2.50) bitki attr yüzeyiyle CLEAN filter'ı
-      // host'ta yürütür; bitki git'in önünde kaldırılmalıdır. Kaldırma
-      // hata verirse reset YÜRÜTÜLMEZ (temizlik hatası = rollback hatası).
+      // (ölçüldü, Apple Git 2.50) worker attr yüzeyiyle CLEAN filter'ı
+      // host'ta yürütür; her iki attr yüzeyi git'in önünde, base'in haliyle
+      // olmalıdır. Adımlardan biri hata verirse reset YÜRÜTÜLMEZ.
       // Rollback adım hatası → güvenli işletimsel hata; BİLİNEN KALINTI
-      // unutulmaz: küme = önceki set ∪ bu turun create'ları (bir sonraki
-      // reset/apply yeniden temizlemeyi dener; workspace "temiz" olarak
-      // ASLA raporlanmaz).
+      // unutulmaz: küme = önceki set ∪ bu turun create'ları, attr kümesi
+      // aynen kalır (bir sonraki reset/apply yeniden dener; workspace
+      // "temiz" olarak ASLA raporlanmaz).
       let rollback: { error: unknown; message: string } | null = null;
       try {
         await this.removeWorkerCreatedPaths(new Set<string>(createdThisRound));
       } catch (cleanupErr) {
         rollback = { error: cleanupErr, message: "Cleaning the worker-created paths failed" };
+      }
+      if (rollback === null) {
+        // PR #24 SB-1: bu turda worker'ın modify/delete ettiği TRACKED
+        // `.gitattributes`'ları base'e saf-fs ile döndür — `git reset
+        // --hard`'ın racy içerik doğrulaması bu yüzeyi CLEAN filter'la
+        // yürütür; yüzey worker'ınki değil, base'in olmalı.
+        try {
+          await this.restoreBaseAttributeFiles(this.workerTouchedAttributePaths);
+        } catch (restoreErr) {
+          rollback = { error: restoreErr, message: "Restoring the attribute files failed" };
+        }
       }
       if (rollback === null) {
         try {
@@ -459,15 +561,18 @@ export class GitWorktreeWorkspace implements Workspace {
         }
       }
       if (rollback === null) {
-        // Rollback TAMAMEN başarılı: kalıntılar giderildi, workspace base'te
-        // → küme BOŞ + orijinal hata atılır.
+        // Rollback TAMAMEN başarılı: kalıntılar giderildi + attr yüzeyi
+        // base'te + workspace base'te → kümeler BOŞ + orijinal hata atılır.
         this.workerCreatedPaths = new Set<string>();
+        this.workerTouchedAttributePaths = new Set<string>();
         if (err instanceof WorkspaceError) {
           throw err;
         }
         throw new WorkspaceError("workspace_operation_failed", "Applying the patch failed", { cause: err });
       }
-      // Rollback tamamlanamadı: bilinen kalıntı kaydedilir (union).
+      // Rollback tamamlanamadı: bilinen kalıntı kaydedilir (union); attr
+      // kümesi DEĞİŞTİRİLMEZ (kalıntı unutulmaz — sonraki reset yeniden
+      // restore'u dener).
       this.workerCreatedPaths = new Set<string>([...previousCreated, ...createdThisRound]);
       throw new WorkspaceError("workspace_operation_failed", rollback.message, { cause: rollback.error });
     }
@@ -480,14 +585,17 @@ export class GitWorktreeWorkspace implements Workspace {
 
   /**
    * Önceki worker-oluşturulan yolları kapsamlı kaldırır (geniş `git clean`
-   * ASLA) + tracked durumu base'e sıfırlar. SIRASI (PR #24 audit F-6):
-   * temizlik ÖNCE, `reset --hard` SONRA — worktree'de worker-ekili bir
-   * attribute dosyası kalıntısı varsa `git reset --hard`'ın racy içerik
-   * doğrulaması (ölçüldü, Apple Git 2.50) o yüzeydeki CLEAN filter'ı
-   * host'ta yürütür; bilinen worker yazıları git komutundan önce, saf fs
-   * ile gider. Küme yalnız temizlik + sıfırlama BAŞARILI bitince
-   * temizlenir; temizlik/reset hatası → yöntem red edilir ve küme BİLİNEN
-   * KALINTI olarak kalır ("başarılı reset" asla raporlanmaz, PR #24 Fix 4).
+   * ASLA) + worker-takmış tracked `.gitattributes` yüzeyini base'e döndürür
+   * (PR #24 SB-1) + tracked durumu base'e sıfırlar. SIRASI (audit F-6 +
+   * SB-1): temizlik ÖNCE, attr restore ORTA, `reset --hard` SONRA —
+   * worktree'de worker-ekili/modify'li bir attribute yüzeyi varsa `git
+   * reset --hard`'ın racy içerik doğrulaması (ölçüldü, Apple Git 2.50.1)
+   * o yüzeydeki CLEAN filter'ı host'ta yürütür; her iki attr yüzeyi git
+   * komutundan önce, saf fs ile, base'in birebir haliyle olmalıdır.
+   * Kümeler yalnız temizlik + restore + sıfırlama BAŞARILI bitince
+   * temizlenir; herhangi bir adım hata verirse yöntem red edilir, reset
+   * YÜRÜTÜLMEZ ve kümeler BİLİNEN KALINTI olarak kalır ("başarılı reset"
+   * asla raporlanmaz, PR #24 Fix 4 + SB-1).
    */
   async resetToBase(): Promise<void> {
     this.assertUsable();
@@ -504,16 +612,33 @@ export class GitWorktreeWorkspace implements Workspace {
         cause: err,
       });
     }
+    // PR #24 SB-1: worker'ın modify/delete ettiği TRACKED `.gitattributes`'ları
+    // saf-fs ile immutable base'e döndür — `reset --hard`'dan ÖNCE
+    // (yukarıdaki gerekçe). Hata → güvenli tip'li red, reset YÜRÜTÜLMEZ;
+    // attr kümesi aynen kalır (kalıntı unutulmaz — sonraki çağrı yeniden
+    // restore'u dener).
+    try {
+      await this.restoreBaseAttributeFiles(this.workerTouchedAttributePaths);
+    } catch (err) {
+      if (err instanceof WorkspaceError) {
+        throw err;
+      }
+      throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed", {
+        cause: err,
+      });
+    }
     try {
       await this.git(["reset", "--hard", this.baseCommit]);
     } catch (err) {
-      // Hata küme üzerinde yutulmaz: küme eski setiyle kalır (kalıntı
-      // unutulmaz — sonraki çağrı yeniden temizler) + güvenli tip'li red.
+      // Hata küme üzerinde yutulmaz: kümeler eski halleriyle kalırlar
+      // (kalıntı unutulmaz — sonraki çağrı yeniden temizler/restore eder)
+      // + güvenli tip'li red.
       throw new WorkspaceError("workspace_operation_failed", "Resetting the workspace to base failed", {
         cause: err,
       });
     }
     this.workerCreatedPaths = new Set<string>();
+    this.workerTouchedAttributePaths = new Set<string>();
   }
 
   /**
@@ -744,6 +869,88 @@ export class GitWorktreeWorkspace implements Workspace {
     }
   }
 
+  /**
+   * Worker'ın modify/delete ettiği tracked `.gitattributes` yollarını
+   * (PR #24 SB-1) saf-fs ile BİREBİR immutable base haliyle geri yazar:
+   * base'in yakalanma anındaki working-tree baytları + git modu.
+   *
+   * GEREKÇE (ölçüldü, Apple Git 2.50.1): `git reset --hard <base>` bir
+   * tracked dosyanın stat'ı (boyut + mtime saniyesi) index'le "aynı"
+   * göründüğünde (racy koşulum: tracked-modified + aynı saniye + aynı
+   * boyut) içerik doğrulamasını yeniden çalıştırır; bu yeniden doğrulama
+   * ÇALIŞMA dosyasındaki `.gitattributes` yüzeyindeki CLEAN filter'ı
+   * host'ta yürütür. Worker o yüzeyi yazabilir (tracked attr modify/
+   * delete — config'de önceden tanımlı driver, LFS dahi, yürütülürdü).
+   * Yüzey, git komutundan ÖNCE, base'in birebir haliyle geri yazılmalıdır.
+   *
+   * Restore ≠ dedektör: her turdaki fail-closed filter re-check'lerinin
+   * (audit F-6) ikamesi DEĞİLDİR — ikisi de devrededir (re-check = tur
+   * içi yürütme kanıtı; restore = racy pencerede güvenli yüzey).
+   *
+   * Her yol için kontrol sırası (ilk başarısızlık → yöntem BÜTÜNÜ red,
+   * `reset --hard` YÜRÜTÜLMEZ — fail-closed; mesaj SABİT, yol/içerik
+   * taşınmaz):
+   *   1. yol workspace içinde (containment — defansif; validate geçirmişti)
+   *   2. base'te var + tip DÜZENLİ DOSYA (symlink/gitlink → fail-closed:
+   *      link hedefi / submodule kimliği bayt-yazımı + mod aynasıyla
+   *      BİREBİR geri yazılamaz)
+   *   3. base baytları yakalanmış (`editableContent` — validate,
+   *      modify/delete → `editable` zorlar; yapısal olarak daima var)
+   *   4. atallarda/hedefte sembolik bağlantı yok (GERÇEK fs ile — yazım
+   *      workspace dışına kanaldır; seam yalnız yazım arızası enjekte
+   *      eder, atal güvenliği gerçeğe dayanır)
+   *   5. ebeveyn dizin yoksa oluşturulur (worker dizini silebilmiştir)
+   *   6. base baytları `writeFile` ile yazılır
+   *   7. mod base'in git moduyla birebir aynalanır (`chmod`)
+   *
+   * Adım 5–7 `activeFs` seam'i üzerinden (test: arıza/enjeksiyonu).
+   */
+  private async restoreBaseAttributeFiles(paths: Iterable<string>): Promise<void> {
+    for (const canonical of paths) {
+      const abs = resolveContained(this.workspaceDir, canonical);
+      if (abs === null) {
+        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+      }
+      const fingerprint = this.validationBase.editable.get(canonical);
+      if (fingerprint === undefined || !fingerprint.exists) {
+        // Restore edilecek base hali temsil edilemiyor → fail-closed.
+        // (validate modify/delete → `editable` zorlar; yapısal olarak
+        // beklenmez — bilinmeyen hal git'ten asla geçirilmez.)
+        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+      }
+      if (fingerprint.type !== "file") {
+        // symlink (120000) / gitlink (160000): base'in link hedef metni /
+        // submodule kimliği, düz bayt-yazımı + chmod ile BİREBİR geri
+        // yazılamaz (link'in kendisi `unlink` + `symlink` ister; mod
+        // aynası anlamsız). Fail-closed: reset YÜRÜTÜLMEZ (PR #24 SB-1
+        // kararı).
+        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+      }
+      const baseContent = this.validationBase.editableContent.get(canonical);
+      if (baseContent === undefined) {
+        // Parmak izi "file" diyor ama içerik yakalanmamış — tutarsızlık.
+        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+      }
+      if (await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: true })) {
+        // Atal/hedef link → bayt-yazımı workspace dışına kaçar (Fix 1-B
+        // ile aynı gerekçe). Denetim GERÇEK fs'tir (yukarıda).
+        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+      }
+      try {
+        await activeFs.mkdir(path.dirname(abs), { recursive: true });
+        await activeFs.writeFile(abs, baseContent);
+        await activeFs.chmod(abs, attributeBaseMode(fingerprint.mode));
+      } catch (err) {
+        if (err instanceof WorkspaceError) {
+          throw err;
+        }
+        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed", {
+          cause: err,
+        });
+      }
+    }
+  }
+
   /** `git diff --name-only -z <base>` → repository-göreceli değişen yollar (spec 62). */
   private async changedPaths(): Promise<string[]> {
     const result = await this.git([
@@ -799,6 +1006,22 @@ export class GitWorktreeWorkspace implements Workspace {
     }
     return { files, insertions, deletions };
   }
+}
+
+/**
+ * Base parmak izindeki git modunu (yalnız düzenli dosya modları) `chmod`
+ * moduna çevirir: `100755` → 0755, `100644` → 0644. Başka mod yapısal
+ * olarak beklenmez (`file` tipi yalnız bu ikisini taşır) → fail-closed:
+ * restore, bilinmeyen modda yürütülmez.
+ */
+function attributeBaseMode(mode: string): number {
+  if (mode === "100755") {
+    return 0o755;
+  }
+  if (mode === "100644") {
+    return 0o644;
+  }
+  throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
 }
 
 // ── Oluşturma ───────────────────────────────────────────────────────────────

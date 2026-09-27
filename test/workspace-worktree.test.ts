@@ -32,7 +32,10 @@
  *   (29, 29a-29b: audit F-1), reset/temizlik kalıntı kümesi (30-33),
  *   TUR filter re-check + reset-öncesi temizlik sırası: worker-ekili
  *   `.gitattributes` + config'de önceden tanımlı driver (repo + global/LFS)
- *   (34-37: audit F-6 — pozitif kontrol/mutasyon kanıtlı, S-2 kapandı)
+ *   (34-37: audit F-6 — pozitif kontrol/mutasyon kanıtlı, S-2 kapalı),
+ *   SB-1 tracked `.gitattributes` reset-filtre penceresi: her `reset
+ *   --hard`'dan önce saf-fs restore + sıralama + arıza/recovery + racy
+ *   pozitif kontrol (38-44: 5. audit LOW — pencere KAPALI)
  *
  * Hermetic git: global/system config kesilir (kullanıcı makine ayarları
  * determinizmi bozmasın). Testler BUILT çıktıyı (dist/) import eder.
@@ -49,7 +52,10 @@ import {
   readdir,
   readFile,
   rm,
+  stat,
   symlink,
+  unlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -287,18 +293,24 @@ function errnoEacces(): NodeJS.ErrnoException {
 }
 
 /**
- * Arıza enjeksiyonu fs seam'leri (PR #24 Fix 4). Test biterken
- * `setWorkspaceFs(null)` ile gerçek fs'e dönülür.
+ * Arıza enjeksiyonu fs seam'leri (PR #24 Fix 4 + SB-1). Test biterken
+ * `setWorkspaceFs(null)` ile gerçek fs'e dönülür. Seam'in beş üyesi:
+ * `lstat`/`unlink` (temizlik) + `mkdir`/`writeFile`/`chmod` (attr restore).
  * - `failingFs`: gerçek `lstat` + DAİMA EACCES `unlink` — yol VAR ve
- *   unlink'in gerçekten denendiğini (dosyanın kalmasıyla) ispatlar.
- * - `denyingFs`: `lstat` + `unlink` ikisi de EACCES — dosyanın varlığından
- *   BAĞIMSIZ deterministik temizlik hatası (reset'in git tarafında sildiği
+ *   unlink'in gerçekten denendiğini (dosyanın kalmasıyla) ispatlar;
+ *   restore üyeleri GERÇEK (eski testlerde SB-1 kümesi boş → restore
+ *   no-op → davranış değişmez).
+ * - `denyingFs`: beş üye de EACCES — dosyanın varlığından BAĞIMSIZ
+ *   deterministik temizlik hatası (reset'in git tarafında sildiği
  *   intent-to-add yollarında `lstat` ENOENT'a düşerdi).
  */
 function failingFs(): WorkspaceFs {
   return {
     lstat: (target: string) => lstat(target),
     unlink: () => Promise.reject(errnoEacces()),
+    mkdir: (target: string, options: { recursive: boolean }) => mkdir(target, options).then(() => undefined),
+    writeFile: (target: string, data: Buffer) => writeFile(target, data),
+    chmod: (target: string, mode: number) => chmod(target, mode),
   };
 }
 
@@ -306,6 +318,53 @@ function denyingFs(): WorkspaceFs {
   return {
     lstat: () => Promise.reject(errnoEacces()),
     unlink: () => Promise.reject(errnoEacces()),
+    mkdir: () => Promise.reject(errnoEacces()),
+    writeFile: () => Promise.reject(errnoEacces()),
+    chmod: () => Promise.reject(errnoEacces()),
+  };
+}
+
+/**
+ * Kayıt yapan fs seam'i (PR #24 SB-1 sıra kanıtı): beş operasyonun
+ * tamamı GERÇEK node:fs'e delege edilir — her çağrı `op:path` olarak
+ * log dizisine düşer. Güvenlik davranışı değişmez; test, saf-fs
+ * adımlarının (temizlik → attr restore) SIRASINI gözlemler.
+ */
+function recordingFs(log: string[]): WorkspaceFs {
+  return {
+    lstat: (target: string) => lstat(target),
+    unlink: async (target: string) => {
+      log.push(`unlink:${target}`);
+      await unlink(target);
+    },
+    mkdir: async (target: string, options: { recursive: boolean }) => {
+      log.push(`mkdir:${target}`);
+      await mkdir(target, options);
+    },
+    writeFile: async (target: string, data: Buffer) => {
+      log.push(`writeFile:${target}`);
+      await writeFile(target, data);
+    },
+    chmod: async (target: string, mode: number) => {
+      log.push(`chmod:${target}`);
+      await chmod(target, mode);
+    },
+  };
+}
+
+/**
+ * Attr restore'u için arıza enjeksiyonu (PR #24 SB-1): lstat/unlink/
+ * mkdir/chmod GERÇEK fs; YALNIZ `writeFile` her zaman EACCES — restore
+ * adımının gerçekten denendiği (ve başarısız olduğunda `reset --hard`'ın
+ * atlandığı) deterministik kanıt.
+ */
+function attrWriteFailingFs(): WorkspaceFs {
+  return {
+    lstat: (target: string) => lstat(target),
+    unlink: (target: string) => unlink(target),
+    mkdir: (target: string, options: { recursive: boolean }) => mkdir(target, options).then(() => undefined),
+    writeFile: () => Promise.reject(errnoEacces()),
+    chmod: (target: string, mode: number) => chmod(target, mode),
   };
 }
 
@@ -1982,4 +2041,599 @@ test("failed-rollback residue (EACCES seam): the planted attribute is never exec
     setWorkspaceFs(null);
     await ws.destroy();
   }
+});
+
+// ── SB-1 (PR #24, 5. audit LOW): tracked `.gitattributes` reset-filtre penceresi ──
+//
+// Tehdit modeli: worker, worktree'de OLMAYAN (create — F-6 created-clean
+// bunu kapsıyor) DEĞİL, tracked bir `.gitattributes`'ı MODIFY/DELETE eder
+// (config'de ÖNCEDEN tanımlı bir driver — LFS dahi — varsa). `git reset
+// --hard`'ın racy içerik doğrulaması (ölçüldü, Apple Git 2.50.1:
+// tracked-modified + aynı-saniye stat + aynı boyut) worktree içeriğini
+// yeniden okur ve bu okuma ÇALIŞMA `.gitattributes` yüzeyindeki CLEAN
+// filter'ı host'ta YÜRÜTÜR — yüzey worker'ınkidir. F-6 re-check'leri
+// tur-içi diff/stat/export'u kapatır ama rollback/round-start
+// `reset --hard`'ı kapatmaz (yürütülen komut DEĞİLDİR).
+//
+// Düzeltme (bu testler): her `git reset --hard` (3 nokta) ÖNCESİ,
+// worker-çıkışlı tracked attr yüzeyi saf-fs ile BİREBİR immutable base'e
+// restore edilir (`workerTouchedAttributePaths` + `restoreBaseAttributeFiles`);
+// restore başarısız → reset YÜRÜTÜLMEZ. F-6 re-check'leri bu restore'u
+// İKAME ETMEZ — ikisi de devrededir (restore ≠ dedektör).
+
+// ── 38) tracked ROOT attr modify + racy tracked dosya → red, restore, reset güvenli, sonraki tur yeşil ──
+
+test("worker-modified TRACKED root .gitattributes: the rollback restores the attribute to base before the reset, the racy window never runs the filter, the next round proceeds (PR #24 SB-1 m.15)", async () => {
+  const { out, repo } = await buildF6Repo("sb1-root", { ".gitattributes": "base-attr\n", "a.txt": "base\n" });
+  const { marker } = await plantDriver(out, repo, "evil");
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const statusBefore = (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort();
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-sb1root",
+    editablePaths: [".gitattributes", "a.txt"],
+  });
+  const worktreesAfterCreate = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const attrAbs = path.join(ws.workspaceDir, ".gitattributes");
+  const log: string[] = [];
+  setWorkspaceFs(recordingFs(log));
+  try {
+    // Round 1: tracked attr → config'de tanımlı driver (`filter=evil`) +
+    // a.txt AYNI BOYUT'ta modify (5B → 5B — racy ön koşulu; tur
+    // sub-second, index mtime'ı ile aynı saniyede). Tur re-check (F-6)
+    // → RED; rollback: created ∅ → attr restore (SB-1) → reset.
+    const err = await expectWorkspaceError("invalid_repository", () =>
+      ws.applyPatchSet(
+        workerResult([
+          {
+            kind: "modify",
+            path: ".gitattributes",
+            operations: [{ search: "base-attr", replace: "*.txt filter=evil" }],
+          },
+          { kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "bAsE" }] },
+        ]),
+      ),
+    );
+    assert.equal(err.message, "An external Git filter is not supported");
+    // Fix'in gözlemlenebilir izi: attr seam üzerinden restore edildi
+    // (yazım + mod aynası, doğru sırada) + reset YÜRÜTÜLDÜ (a.txt base'te).
+    assert.ok(
+      log.includes(`writeFile:${attrAbs}`),
+      "the tracked attribute was restored to base through the fs seam",
+    );
+    assert.ok(
+      log.indexOf(`writeFile:${attrAbs}`) < log.indexOf(`chmod:${attrAbs}`),
+      "the restore writes the base bytes before mirroring the base mode",
+    );
+    await assert.rejects(
+      lstat(marker),
+      "the filter must never execute — not even in the rollback reset (the attribute is restored to base first)",
+    );
+    assert.equal((await readFile(attrAbs)).toString(), "base-attr\n", "the attribute is back to base bytes");
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(),
+      "base\n",
+      "the tracked file is back to base (the reset ran)",
+    );
+
+    // Ana repo + worktree listesi değişmedi.
+    assert.deepEqual(
+      worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+      worktreePaths(worktreesAfterCreate),
+      "the failed round must not add or remove any worktree",
+    );
+    assert.deepEqual(
+      (await gitText(repo, ["status", "--porcelain"])).split("\n").filter(Boolean).sort(),
+      statusBefore,
+      "the main repository state must be untouched",
+    );
+
+    // Round 2 (yeşil): workspace TAMAMEN işlevsel — wedge YOK.
+    const r2 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-2" }] }]),
+    );
+    assert.equal(r2.validation.editsApplied, 1, "the next round proceeds");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(), "base-2\n");
+    assert.equal((await readFile(attrAbs)).toString(), "base-attr\n", "the attribute stays at base in the green round too");
+    await assert.rejects(lstat(marker), "the benign round must not run the filter either");
+  } finally {
+    setWorkspaceFs(null);
+    await ws.destroy();
+  }
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+});
+
+// ── 39) racy pozitif kontrol: HAM reset marker'ı YAZAR; sınıf yolu YAZMAZ ──
+
+test("racy reset positive control (same-size modify + same-second stat): a RAW reset WOULD execute the planted filter; the class round + resetToBase never do (PR #24 SB-1 m.16)", async () => {
+  const { out, repo } = await buildF6Repo("sb1-racy", { "d/.gitattributes": "d-base\n", "d/p.txt": "data\n" });
+  const { marker } = await plantDriver(out, repo, "evil");
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-sb1racy",
+    editablePaths: ["d/.gitattributes", "d/p.txt"],
+  });
+  try {
+    const gitVersion = await gitText(ws.workspaceDir, ["--version"]);
+    // Racy tehdit durumu: tracked attr → tanımlı driver + p.txt AYNI
+    // BOYUT'ta modify (5B → 5B) + mtime INDEX DOSYASININ mtime'ına çekilir
+    // (aynı saniye) → `git reset --hard`'ın racy içerik doğrulaması p.txt'yi
+    // worktree attr yüzeyiyle yeniden okur.
+    const plantRacy = async () => {
+      await writeFile(path.join(ws.workspaceDir, "d", ".gitattributes"), "*.txt filter=evil\n");
+      await writeFile(path.join(ws.workspaceDir, "d", "p.txt"), "dAta\n");
+      const indexRel = (await gitText(ws.workspaceDir, ["rev-parse", "--git-path", "index"])).trim();
+      const indexStat = await stat(path.resolve(ws.workspaceDir, indexRel));
+      await utimes(path.join(ws.workspaceDir, "d", "p.txt"), indexStat.mtime, indexStat.mtime);
+    };
+
+    // ── POZİTİF KONTROL (HAM — sınıf bypass, audit S-2 disiplini) ──
+    // Sınıftan BYPASS: aynı racy durumda ham `git reset --hard` filter'ı
+    // worktree attr yüzeyiyle GERÇEKTEN yürütür (marker). Bu ölçüm, düzelt-
+    // menin savunacak bir penceresi olduğunu kanıtlar (racy davranış
+    // sürüm-bağımlıdır: yalnız 2.50.x'te ölçüldü — başka sürümde marker
+    // assert'i atlanır, sınıf-yolu assert'leri koşulsuz devam eder).
+    await plantRacy();
+    await git(ws.workspaceDir, ["reset", "--hard", ws.baseCommit]);
+    if (/2\.50\./.test(gitVersion)) {
+      await assert.doesNotReject(
+        lstat(marker),
+        `POSITIVE CONTROL (git ${gitVersion.trim()}): a raw reset under the racy condition executes the external filter through the worktree attribute surface`,
+      );
+      await rm(marker);
+    }
+    // Her durumda: ham reset tracked attr'i base'e döndürdü (tehdit gitti).
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", ".gitattributes"))).toString(),
+      "d-base\n",
+      "the raw reset restored the tracked attribute to base",
+    );
+
+    // ── SınıF YOLU 1: aynı tehdit, worker'ın KENDİ sözleşmesi üzerinden ──
+    // Tehdit modeli worker yazısıdır (applyPatchSet): tur re-check (F-6)
+    // RED; rollback: created ∅ → attr restore (SB-1) → reset. Tur
+    // sub-second olduğu için worker yazıları index'in saniyesinde + aynı
+    // boyutta → racy koşulum doğal olarak kurulur; restore, reset'ten önce
+    // yüzeyi base'e döndürdüğü için filter YÜRÜMEMELİ. (Elle bitki =
+    // worker dışı yazı — SB-1 kümesi onu tanımaz; bu akış kapsam dışıdır.)
+    const err = await expectWorkspaceError("invalid_repository", () =>
+      ws.applyPatchSet(
+        workerResult([
+          { kind: "modify", path: "d/.gitattributes", operations: [{ search: "d-base", replace: "*.txt filter=evil" }] },
+          { kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "dAta" }] },
+        ]),
+      ),
+    );
+    assert.equal(err.message, "An external Git filter is not supported");
+    await assert.rejects(
+      lstat(marker),
+      "the class round must never execute the filter — the rollback restores the attribute to base before the reset",
+    );
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", ".gitattributes"))).toString(),
+      "d-base\n",
+      "the attribute is back to base bytes",
+    );
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(),
+      "data\n",
+      "the tracked file is back to base (the reset ran)",
+    );
+
+    // ── SınıF YOLU 2: `resetToBase` (3. reset noktası) — rollback sonrası
+    // temiz yüzeyde → güvenli.
+    await ws.resetToBase();
+    await assert.rejects(
+      lstat(marker),
+      "the class resetToBase must never execute the filter — the attribute surface is the immutable base's",
+    );
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", ".gitattributes"))).toString(),
+      "d-base\n",
+      "the attribute is back to base bytes",
+    );
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(),
+      "data\n",
+      "the tracked file is back to base",
+    );
+  } finally {
+    await ws.destroy();
+  }
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+});
+
+// ── 40) tracked attr DELETE varyantı: yeşil delete + başarısız tur (untracked
+//      çakışma) → rollback attr'i YENİDEN YARATIR; wedge iyileşir; marker yapısalcı olarak vacuous ──
+
+test("worker-deleted TRACKED .gitattributes: a later failed round's rollback recreates the base attribute before the reset; the workspace heals (PR #24 SB-1 m.17)", async () => {
+  const { out, repo } = await buildF6Repo("sb1-delete", { "d/.gitattributes": "d-base\n", "d/p.txt": "data\n" });
+  const { marker } = await plantDriver(out, repo, "evil");
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-sb1del",
+    editablePaths: ["d/.gitattributes", "d/p.txt"],
+  });
+  const worktreesAfterCreate = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const attrAbs = path.join(ws.workspaceDir, "d", ".gitattributes");
+  const log: string[] = [];
+  setWorkspaceFs(recordingFs(log));
+  try {
+    // Round 1 (YEŞİL): tracked attr DELETE + p.txt same-size modify.
+    const r1 = await ws.applyPatchSet(
+      workerResult([
+        { kind: "delete", path: "d/.gitattributes" },
+        { kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "dAta" }] },
+      ]),
+    );
+    assert.equal(r1.validation.editsApplied, 2, "the deletion round completes");
+    await assert.rejects(lstat(attrAbs), "the worker deleted the attribute");
+    await assert.rejects(lstat(marker), "no filter execution in the green round (the attribute is gone from the worktree)");
+
+    // Round 2 (BAŞARISIZ): untracked `d/seed.txt` pre-planted (reset onu
+    // dokunmaz — tracked değil) + worker aynı yola CREATE deniyor → apply
+    // drift red'i; ayrıca plan attr'i YENİDEN siliyor. Rollback: created ∅
+    // → attr restore (SB-1: delete edilen attr base baytlarıyla YENİDEN
+    // YARATILIR) → reset. Marker yapısal olarak vacuous (attr yokken filter
+    // yüzeyi boş) — ayırt edici, seam'in sıralaması + dosya durumlarıdır.
+    await writeFile(path.join(ws.workspaceDir, "d", "seed.txt"), "seed\n");
+    const err2 = await expectWorkspaceError("workspace_operation_failed", () =>
+      ws.applyPatchSet(
+        workerResult([
+          { kind: "delete", path: "d/.gitattributes" },
+          { kind: "create", path: "d/seed.txt", content: "x\n" },
+        ]),
+      ),
+    );
+    assert.equal(err2.message, "A workspace file has drifted from base");
+    // Sıra kanıtı (seam): rollback, attr'i base'e YAZDI (restore çalıştı).
+    assert.ok(
+      log.includes(`writeFile:${attrAbs}`),
+      "the failed round's rollback restored the deleted attribute through the fs seam",
+    );
+    await assert.rejects(lstat(marker), "no filter execution in the failed round (the attribute is recreated with base content before the reset)");
+    assert.equal(
+      (await readFile(attrAbs)).toString(),
+      "d-base\n",
+      "the deleted attribute is back to base bytes (recreated by the restore)",
+    );
+    await assert.doesNotReject(
+      lstat(path.join(ws.workspaceDir, "d", "seed.txt")),
+      "the unknown untracked residue is untouched (no broad cleanup — spec 37)",
+    );
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(),
+      "data\n",
+      "the tracked file is back to base (the reset ran)",
+    );
+
+    // Round 3 (iyileşme): workspace TAMAMEN işlevsel — wedge YOK.
+    const r3 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-2" }] }]),
+    );
+    assert.equal(r3.validation.editsApplied, 1, "the healed round proceeds");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(), "data-2\n");
+    assert.equal((await readFile(attrAbs)).toString(), "d-base\n", "the attribute stays at base");
+    await assert.rejects(lstat(marker), "the healed round must not run the filter");
+
+    assert.deepEqual(
+      worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+      worktreePaths(worktreesAfterCreate),
+      "no worktree may be added or removed across the rounds",
+    );
+  } finally {
+    setWorkspaceFs(null);
+    await ws.destroy();
+  }
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+});
+
+// ── 41) nested tracked attr (derinlik > kök): restore her derinliği kapsar ──
+
+test("worker-modified TRACKED nested .gitattributes (below root): the same restore path covers every repository depth (PR #24 SB-1 m.18)", async () => {
+  const { out, repo } = await buildF6Repo("sb1-nested", { "d/.gitattributes": "d-base\n", "d/p.txt": "data\n" });
+  const { marker } = await plantDriver(out, repo, "evil");
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-sb1nest",
+    editablePaths: ["d/.gitattributes", "d/p.txt"],
+  });
+  const worktreesAfterCreate = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const attrAbs = path.join(ws.workspaceDir, "d", ".gitattributes");
+  try {
+    // Round 1: nested tracked attr → config'de tanımlı driver + p.txt same-
+    // size modify (5B → 5B, racy ön koşul) → tur RED; rollback attr'i base'e
+    // döndürür (ebeveyn dizin var — mkdir no-op, yazım + mod).
+    const err = await expectWorkspaceError("invalid_repository", () =>
+      ws.applyPatchSet(
+        workerResult([
+          { kind: "modify", path: "d/.gitattributes", operations: [{ search: "d-base", replace: "*.txt filter=evil" }] },
+          { kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "dAta" }] },
+        ]),
+      ),
+    );
+    assert.equal(err.message, "An external Git filter is not supported");
+    await assert.rejects(lstat(marker), "the nested attribute is restored to base before the reset — the filter never executes");
+    assert.equal((await readFile(attrAbs)).toString(), "d-base\n", "the nested attribute is back to base bytes");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(), "data\n", "the tracked file is back to base");
+
+    assert.deepEqual(
+      worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+      worktreePaths(worktreesAfterCreate),
+      "the failed round must not add or remove any worktree",
+    );
+
+    // Round 2 (yeşil): workspace işlevsel + nested attr base'te kalır.
+    const r2 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "d/p.txt", operations: [{ search: "data", replace: "data-2" }] }]),
+    );
+    assert.equal(r2.validation.editsApplied, 1, "the next round proceeds");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "d", "p.txt"))).toString(), "data-2\n");
+    assert.equal((await readFile(attrAbs)).toString(), "d-base\n", "the nested attribute stays at base");
+    await assert.rejects(lstat(marker), "the benign round must not run the filter either");
+  } finally {
+    await ws.destroy();
+  }
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+});
+
+// ── 42) restore hatası (EACCES seam): reset YÜRÜTÜLMEZ — yöntem red, wedge, recovery ──
+
+test("restore failure (EACCES seam): the reset is skipped — the method reds with the fixed message, the workspace is NOT reset, and a recovered filesystem heals it (PR #24 SB-1 m.19)", async () => {
+  const { out, repo } = await buildF6Repo("sb1-fail", { ".gitattributes": "base-attr\n", "a.txt": "base\n" });
+  const { marker } = await plantDriver(out, repo, "evil");
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-sb1fail",
+    editablePaths: [".gitattributes", "a.txt"],
+  });
+  try {
+    // Round 1 (seam FAAL — writeFile EACCES): worker attr'i modify eder →
+    // tur re-check (F-6) red; rollback: created ∅ → restore EACCES →
+    // reset YÜRÜTÜLMEZ (worker attr yüzeyiyle filter çalışmaz) → güvenli
+    // işletimsel red + bilinen kalıntı (attr kümesi KORUNUR).
+    setWorkspaceFs(attrWriteFailingFs());
+    const err1 = await expectWorkspaceError("workspace_operation_failed", () =>
+      ws.applyPatchSet(
+        workerResult([
+          {
+            kind: "modify",
+            path: ".gitattributes",
+            operations: [{ search: "base-attr", replace: "*.txt filter=evil" }],
+          },
+          { kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "bAsE" }] },
+        ]),
+      ),
+    );
+    assert.equal(err1.message, "Restoring the attribute files failed");
+    await assert.rejects(lstat(marker), "no filter execution — the reset was skipped while the restore failed");
+    // Reset YÜRÜTÜLMEZ kanıtı: worker'ın yarım durumu aynen kalır.
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(),
+      "bAsE\n",
+      "the reset did NOT run (the worker modification persists)",
+    );
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, ".gitattributes"))).toString(),
+      "*.txt filter=evil\n",
+      "the restore failed — the worker attribute persists as known residue",
+    );
+
+    // Round 2 (seam hâlâ FAAL, attr kümesi KORUNURDU): zararsız bir tur bile,
+    // restore başaramadan red edilir (reset YOK) — bilinen wedge, güvenli
+    // raporlanır. (Seam test bitince dış `finally` sıfırlar.)
+    const err2 = await expectWorkspaceError("workspace_operation_failed", () =>
+      ws.applyPatchSet(workerResult([{ kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-2" }] }])),
+    );
+    assert.equal(err2.message, "Restoring the attribute files failed");
+    await assert.rejects(lstat(marker), "the wedge round never executes the filter (the reset stays skipped)");
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(),
+      "bAsE\n",
+      "the wedge round writes nothing (no reset)",
+    );
+
+    // ── fs TOPARLANIR (gerçek fs): restore başarır, reset koşar, iyileşir ──
+    setWorkspaceFs(null);
+    const r3 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-OK" }] }]),
+    );
+    assert.equal(r3.validation.editsApplied, 1, "the recovered round restores the attribute, resets, and proceeds");
+    assert.equal((await readFile(path.join(ws.workspaceDir, ".gitattributes"))).toString(), "base-attr\n", "the attribute is back to base");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(), "base-OK\n");
+    await assert.rejects(lstat(marker), "the healed round must not run the filter");
+  } finally {
+    setWorkspaceFs(null);
+    await ws.destroy();
+  }
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+});
+
+// ── 43) `resetToBase` public yol: restore hatası reset'i atlar; recovery tamamlar ──
+
+test("resetToBase: a failed attribute restore skips the reset (fixed red); a recovered filesystem completes it and the workspace stays functional (PR #24 SB-1 m.20)", async () => {
+  const { out, repo } = await buildF6Repo("sb1-rb", { ".gitattributes": "base-attr\n", "a.txt": "base\n" });
+  // Config'de driver YOK — worker attr içeriği zararsız (tur yeşil); SB-1
+  // restore yolu `resetToBase` üzerinden ölçülür.
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-sb1rb",
+    editablePaths: [".gitattributes", "a.txt"],
+  });
+  try {
+    // Round 1 (yeşil, gerçek fs): tracked attr zararsız içerik alır + a.txt.
+    const r1 = await ws.applyPatchSet(
+      workerResult([
+        { kind: "modify", path: ".gitattributes", operations: [{ search: "base-attr", replace: "*.txt text=auto" }] },
+        { kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-1" }] },
+      ]),
+    );
+    assert.equal(r1.validation.editsApplied, 2, "a harmless attribute modify completes the round");
+    assert.equal((await readFile(path.join(ws.workspaceDir, ".gitattributes"))).toString(), "*.txt text=auto\n");
+
+    // `resetToBase` + seam (writeFile EACCES): temizlik ∅ → restore EACCES
+    // → red; reset YÜRÜTÜLMEZ — yarım durum aynen kalır.
+    setWorkspaceFs(attrWriteFailingFs());
+    const err = await expectWorkspaceError("workspace_operation_failed", () => ws.resetToBase());
+    assert.equal(err.message, "Restoring the attribute files failed");
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, ".gitattributes"))).toString(),
+      "*.txt text=auto\n",
+      "the reset did NOT run — the worker attribute persists",
+    );
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(),
+      "base-1\n",
+      "the reset did NOT run — the worker modification persists",
+    );
+
+    // fs TOPARLANIR → sonraki `resetToBase` TAMAMLANIR.
+    setWorkspaceFs(null);
+    await ws.resetToBase();
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, ".gitattributes"))).toString(),
+      "base-attr\n",
+      "the attribute is restored to base",
+    );
+    assert.equal((await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(), "base\n", "the tracked file is back to base");
+
+    // Workspace TAMAMEN işlevsel kalır.
+    const r2 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-2" }] }]),
+    );
+    assert.equal(r2.validation.editsApplied, 1, "the workspace is fully functional after the recovered reset");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(), "base-2\n");
+    assert.equal(
+      (await readFile(path.join(ws.workspaceDir, ".gitattributes"))).toString(),
+      "base-attr\n",
+      "the attribute stays at base across the subsequent round",
+    );
+  } finally {
+    setWorkspaceFs(null);
+    await ws.destroy();
+  }
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+});
+
+// ── 44) yeşil tur + worker attr → SONRAKİ turun reset'i restore eder (m.27);
+//        küme sıfırlanır (m.28) — kayıt seam'ı sırayı kanıtlar ──
+
+test("a successful round with a worker-modified attribute: the NEXT round's reset restores it to base, and the touched set clears afterwards (PR #24 SB-1 m.27/m.28)", async () => {
+  const { out, repo } = await buildF6Repo("sb1-eol", { ".gitattributes": "base-attr\n", "a.txt": "base\n" });
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "s-sb1eol",
+    editablePaths: [".gitattributes", "a.txt"],
+  });
+  const attrAbs = path.join(ws.workspaceDir, ".gitattributes");
+  try {
+    // Round 1 (yeşil): worker zararsız attr + a.txt yazar. (İlk turda restore
+    // no-op — küme henüz boş → seam'de attr YAZIMI YOK.)
+    const log1: string[] = [];
+    setWorkspaceFs(recordingFs(log1));
+    const r1 = await ws.applyPatchSet(
+      workerResult([
+        { kind: "modify", path: ".gitattributes", operations: [{ search: "base-attr", replace: "*.txt eol=lf" }] },
+        { kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-1" }] },
+      ]),
+    );
+    assert.equal(r1.validation.editsApplied, 2, "the round with the harmless worker attribute completes");
+    assert.equal(
+      (await readFile(attrAbs)).toString(),
+      "*.txt eol=lf\n",
+      "the worker attribute is in the worktree after the green round",
+    );
+    assert.ok(!log1.includes(`writeFile:${attrAbs}`), "no restore in the first round (nothing was touched yet)");
+
+    // Round 2: round-start, worker attr'ı sıradaki reset ÖNCESİ base'e
+    // döndürmek ZORUNDA (m.27) — seam yazımı kaydeder.
+    const log2: string[] = [];
+    setWorkspaceFs(recordingFs(log2));
+    const r2 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-2" }] }]),
+    );
+    assert.equal(r2.validation.editsApplied, 1);
+    assert.ok(
+      log2.includes(`writeFile:${attrAbs}`),
+      "m.27: the previous round's worker attribute is restored to base before the next reset",
+    );
+    assert.equal(
+      (await readFile(attrAbs)).toString(),
+      "base-attr\n",
+      "the worker attribute is neutralized after the round",
+    );
+    assert.equal((await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(), "base-2\n");
+
+    // Round 3: küme, round 2'nin çift-başarılı (restore + reset) sonunda
+    // sıfırlandı → round-start restore no-op (m.28).
+    const log3: string[] = [];
+    setWorkspaceFs(recordingFs(log3));
+    const r3 = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "a.txt", operations: [{ search: "base", replace: "base-3" }] }]),
+    );
+    assert.equal(r3.validation.editsApplied, 1);
+    assert.ok(
+      !log3.includes(`writeFile:${attrAbs}`),
+      "m.28: the touched-attribute set was cleared — no restore in the third round",
+    );
+    assert.equal((await readFile(attrAbs)).toString(), "base-attr\n", "the attribute stays at base");
+    assert.equal((await readFile(path.join(ws.workspaceDir, "a.txt"))).toString(), "base-3\n");
+  } finally {
+    setWorkspaceFs(null);
+    await ws.destroy();
+  }
+  assert.deepEqual(
+    worktreePaths((await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean)),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
 });
