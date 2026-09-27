@@ -29,10 +29,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, rmdir } from "node:fs/promises";
 import path from "node:path";
 import type { SplashConfig } from "../config.js";
-import type {
-  CoordinatedInferenceRequest,
-  CoordinatedInferenceResult,
-  InferenceConflict,
+import {
+  CoordinatorError,
+  type CoordinatedInferenceRequest,
+  type CoordinatedInferenceResult,
+  type InferenceConflict,
 } from "../backend/InferenceCoordinator.js";
 import type {
   InferenceMessage,
@@ -43,12 +44,14 @@ import type {
 } from "../backend/InferenceBackend.js";
 import { WorkerContract } from "../worker/WorkerContract.js";
 import type { WorkerPromptInput } from "../worker/WorkerContract.js";
-import type {
-  CompactContextMetadata,
-  CompactResult,
-  ValidationResult,
-  WorkerResult,
+import {
+  WorkerContractError,
+  type CompactContextMetadata,
+  type CompactResult,
+  type ValidationResult,
+  type WorkerResult,
 } from "../worker/result.js";
+import { BackendError } from "../backend/errors.js";
 import { discoverRepoRoot } from "../workspace/git.js";
 import { canonicalizeOutside, isSafeSessionId } from "../workspace/pathSafety.js";
 import { WorkspaceError, type Workspace, type WorkspaceCreateInput } from "../workspace/Workspace.js";
@@ -402,12 +405,14 @@ export class SplashTaskService {
    * Kapatım yaşam döngüsü (spec 69):
    *   1. yeni görev kabul edilmez (`#disposed` — ilk await'ten ÖNCE),
    *   2. shutdown ÖNCESİ başlayan TÜM in-flight görevler güvenli terminal
-   *      yollarına ulaşıncaya KADAR BEKLENİR (fire-and-forget YOK):
-   *      korunanlar kayıt defterinde, self-cleanup yapanlar kendi
-   *      rejection'larında yüzeye çıkar — `Promise.allSettled` bir görevin
-   *      reddi diğerlerinin temizliğini kesmez, hatayı da YUTMAZ;
+   *      yollarına ulaşıncaya KADAR BEKLENİR (fire-and-forget YOK);
+   *      settlement'lar SINIFLANDIRILIR: bir in-flight görevin self-cleanup'ı
+   *      başarısız olduysa (`task_cleanup_failed`) veya kanıtlanamaz bir
+   *      lifecycle redi varsa, shutdown temizliği BAŞARISIZ sayılır —
+   *      `allSettled` redleri görmezden gelinmez;
    *   3. kayıt defterindeki (dispose ÖNCESİ korunan) TÜM worktree'ler
-   *      imha edilir (sıralı),
+   *      imha edilir (sıralı) — in-flight cleanup hatası olsa bile HER
+   *      korunan görev denenir (erken dönüş YOK; best-effort tam kapatım);
    *   4. boşalan Step 6 session dizinleri `rmdir` ile kaldırılır
    *      (geniş `rm -rf <outputRoot>/sessions` YASAK — spec 69/75),
    *   5. kayıt defteri temizlenir.
@@ -416,8 +421,9 @@ export class SplashTaskService {
    * görevin shutdown temizliği KENDİSİNEDİR; korunan görevin imhası
    * dispose'tadır — aynı workspace TEK tarafça imha edilir.
    *
-   * Bir imha/temizlik adımı başarısız olursa güvenli tip'li hata yayılır
-   * (kaynak/cause yüzeye taşınmaz); kalan görevler yine denenir.
+   * Adım 2 veya 3'te bir temizlik başarısızsa `dispose()` GÜVENLİ tip'li
+   * `task_cleanup_failed` ile REDDEDİLİR (kaynak/cause yüzeye taşınmaz);
+   * orhan workspace "başarılı temizlik" olarak ASLA raporlanmaz.
    * Crash kurtarması Step 9'a aittir (spec 72) — burada yok.
    */
   async dispose(): Promise<void> {
@@ -427,15 +433,23 @@ export class SplashTaskService {
     // 1) Herhangi bir await'ten ÖNCE: artık yeni görev başlatılamaz.
     this.#disposed = true;
     // 2) Shutdown'dan önce başlayan tüm in-flight görevler terminale
-    //    (koruma / self-cleanup) ulaşıncaya kadar bekle.
+    //    (koruma / self-cleanup) ulaşıncaya kadar bekle; red nedenlerini
+    //    incele — cleanup hatası dispose'a YAYILIR (yutma YOK).
+    let cleanupFailed = false;
     if (this.#inFlight.size > 0) {
-      await Promise.allSettled(this.#inFlight);
+      const settlements = await Promise.allSettled(this.#inFlight);
+      for (const settlement of settlements) {
+        if (settlement.status === "rejected" && inFlightRejectionFailsShutdown(settlement.reason)) {
+          cleanupFailed = true;
+        }
+      }
     }
     // 3) Dispose öncesi korunan görevler: imha sahibi dispose'tur.
+    //    In-flight cleanup hatası erken dönüş YAPMAZ — her korunan görev
+    //    için destroy + dizin temizliği denenir (sıralı, best-effort tam).
     const tasks = [...this.#active.values()];
     this.#active.clear();
 
-    let cleanupFailed = false;
     for (const task of tasks) {
       let destroyFailed = false;
       try {
@@ -612,6 +626,37 @@ export class SplashTaskService {
       usage: { in: usage.inputTokens, out: usage.outputTokens }, // totalTokens YOK (spec 48)
     };
   }
+}
+
+/**
+ * `dispose()` in-flight settlement sınıflandırması (fail-closed):
+ * - `shutting_down` → GÜVENLİ: self-cleanup BAŞARILI (başarısız olsaydı
+ *   neden `task_cleanup_failed` ile YERİNE DOLDURULURDU — bkz. catch bloğu).
+ * - `task_cleanup_failed` → TEMİZLİK BAŞARISIZ (shutdown'a yayılır).
+ * - diğer `SplashTaskError` (invalid_input/output_root_unsafe/session_conflict)
+ *   → GÜVENLİ: workspace oluşturulmadan önce atılır — yetkili temizlik YOK.
+ * - sıradan tip'li görev hataları (Workspace/Coordinator/Backend/WorkerContract)
+ *   → GÜVENLİ: workspace SONRASI hatanın temizliği başarısız olsaydı, red
+ *   nedeni orijinal hata değil `task_cleanup_failed` olurdu — orijinal nedenin
+ *   bu yola ulaşması temizliğin tamamlandığının KANITIDIR.
+ * - kanıtlanamayan (tanınmayan) red → fail-closed TEMİZLİK BAŞARISIZ.
+ *   Ham mesaj/detay hiçbir yere taşınmaz — kamu hatası sabit cümledir.
+ */
+function inFlightRejectionFailsShutdown(reason: unknown): boolean {
+  if (reason instanceof SplashTaskError) {
+    return reason.kind === "task_cleanup_failed";
+  }
+  if (
+    reason instanceof WorkspaceError ||
+    reason instanceof CoordinatorError ||
+    reason instanceof BackendError ||
+    reason instanceof WorkerContractError
+  ) {
+    return false;
+  }
+  // Tanınmayan lifecycle redi: güvenli temizlik kanıtlanamıyor → kapatımı
+  // başarısız say (orhan workspace "temiz" olarak raporlanmasın).
+  return true;
 }
 
 /**

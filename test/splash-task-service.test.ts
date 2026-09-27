@@ -874,12 +874,18 @@ test("69/120: dispose racing in-flight inference — awaited; task rejects shutt
   await waitFor(() => h.backend.runCalls.length === 1);
 
   let disposeSettled = false;
+  let disposeRejected = false;
   const disposePromise = h.service
     .dispose()
-    .catch(() => undefined)
-    .finally(() => {
-      disposeSettled = true;
-    });
+    .then(
+      () => {
+        disposeSettled = true;
+      },
+      () => {
+        disposeSettled = true;
+        disposeRejected = true; // yutulmaz — sonda `false` olarak doğrulanır
+      },
+    );
 
   // dispose, A hâlâ inference'ta bekliyorken ÇÖZÜLMEZ (in-flight bekleniyor):
   await new Promise((resolve) => setTimeout(resolve, 50));
@@ -895,6 +901,8 @@ test("69/120: dispose racing in-flight inference — awaited; task rejects shutt
   // dispose, A'nın BEKLENEN (await'lenen) temizliğinden SONRA çözüldü:
   await disposePromise;
   assert.equal(disposeSettled, true);
+  // Başarılı yarış → dispose BAŞARIyla çözüldü (cleanup hatası YOK):
+  assert.equal(disposeRejected, false);
   // Kayıt defteri boş (A koruma yerine self-cleanup yaptı):
   assert.equal(h.service.activeTasks().length, 0);
   // Workspace imha + session dizini temiz:
@@ -917,21 +925,105 @@ test("74/69: dispose racing in-flight task whose destroy fails — task_cleanup_
   const task = h.service.executeTask({ task: "Racy", files: ["src/a.ts"] });
   await waitFor(() => h.backend.runCalls.length === 1);
 
-  const disposePromise = h.service.dispose().catch(() => undefined);
+  // `dispose()`'un redi DERHAL yakalanır (handler gecikmesinde unhandled
+  // rejection tuzağı yok); neden sonda DOĞRULANIR — yutma YOK.
+  let disposeRejected = false;
+  let disposeReason: unknown;
+  const disposeOutcome = h.service
+    .dispose()
+    .then(
+      () => {
+        disposeReason = undefined;
+      },
+      (err) => {
+        disposeRejected = true;
+        disposeReason = err;
+      },
+    );
   await new Promise((resolve) => setTimeout(resolve, 50));
   releaseInference?.();
 
-  // İmha başarısız → `task_cleanup_failed` ÖNCELİKLİ (shutting_down değil);
-  // hata YUTULMAZ — görevin rejection'ında yüzeydedir:
+  // İmha başarısız → görev `task_cleanup_failed` ile reddedilir (yutulmaz):
   await assert.rejects(
     task,
     (err: unknown) => err instanceof SplashTaskError && err.kind === "task_cleanup_failed",
   );
-  // dispose in-flight'i BEKLEDİ ve registry boştu → temizlikle çözüldü:
-  await disposePromise;
+  // VE dispose AYNI temizlik hatasını yüzeye çıkarır — sahte "başarılı
+  // shutdown" raporlanamaz (orhan workspace ile `process.exit` riski kapalı):
+  await disposeOutcome;
+  assert.equal(disposeRejected, true, "dispose cleanup hatasını red olarak YÜZEYE ÇIKARMALI");
+  assert.ok(
+    disposeReason instanceof SplashTaskError && disposeReason.kind === "task_cleanup_failed",
+    `dispose red nedeni task_cleanup_failed olmalı: ${String(disposeReason)}`,
+  );
   assert.equal(h.service.activeTasks().length, 0);
   // İmha edilemeyen workspace DOKUNULMAZ — sahte "temiz" raporu YOK:
   assert.ok(await pathExists(path.join(h.sessionsDir, "race-2", "workspace")));
+});
+
+test("69: multi-task shutdown — A cleanup fails, B cleanup succeeds; BOTH attempted; dispose rejects", async (t) => {
+  let id = 0;
+  const h = await makeHarness(t, {
+    newSessionId: () => `mm-${(id += 1)}`,
+    // İlk oluşturulan (mm-1) worktree'nin destroy'u KIRIK; ikincisi normal.
+    createWorkspace: (input) =>
+      input.sessionId === "mm-1" ? brokenDestroyWorkspace(input) : createGitWorktreeWorkspace(input),
+  });
+  let releaseFirst: (() => void) | undefined;
+  h.backend.runBehavior = async (call) => {
+    if (call === h.backend.runCalls[0]) {
+      // İlk (A) run BLOKE — ikinci (B) coordinator kuyruğunda bekler.
+      await new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+    }
+    return { content: okWorkerJson(), usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+
+  const a = h.service.executeTask({ task: "A", files: ["src/a.ts"] });
+  // A: workspace + bağlam hazır, inference BLOKE (sıra garantili: B'den önce).
+  await waitFor(() => h.backend.runCalls.length === 1);
+  // B: başlatıldı — in-flight defterinde (kuyrukta).
+  const b = h.service.executeTask({ task: "B", files: ["src/a.ts"] });
+
+  // `dispose()`'un redi DERHAL yakalanır; neden sonda doğrulanır (yutma YOK).
+  let disposeRejected = false;
+  let disposeReason: unknown;
+  const disposeOutcome = h.service
+    .dispose()
+    .then(
+      () => {
+        disposeReason = undefined;
+      },
+      (err) => {
+        disposeRejected = true;
+        disposeReason = err;
+      },
+    );
+  releaseFirst?.();
+
+  // A: destroy başarısız → `task_cleanup_failed` (yutulmaz):
+  await assert.rejects(
+    a,
+    (err: unknown) => err instanceof SplashTaskError && err.kind === "task_cleanup_failed",
+  );
+  // B: destroy başarılı → `shutting_down` (shutdown kazandı, temizlik tamam):
+  await assert.rejects(
+    b,
+    (err: unknown) => err instanceof SplashTaskError && err.kind === "shutting_down",
+  );
+  // A'nın cleanup hatası B'nin temizliğini KESMEZ — B'nin dizini temizlendi:
+  assert.ok(!(await pathExists(path.join(h.sessionsDir, "mm-2"))), "B session dizini temizlenmeli");
+  // A'nın imha edilemeyen workspace'i DOKUNULMAZ (bilinen artık; sahte temizlik YOK):
+  assert.ok(await pathExists(path.join(h.sessionsDir, "mm-1", "workspace")));
+  // dispose: HER iki görevin terminal yolunu bekledi ve cleanup hatasını yüzeye çıkardı:
+  await disposeOutcome;
+  assert.equal(disposeRejected, true, "dispose cleanup hatasını red olarak YÜZEYE ÇIKARMALI");
+  assert.ok(
+    disposeReason instanceof SplashTaskError && disposeReason.kind === "task_cleanup_failed",
+    `dispose red nedeni task_cleanup_failed olmalı: ${String(disposeReason)}`,
+  );
+  assert.equal(h.service.activeTasks().length, 0);
 });
 
 test("21/22: lstat EACCES (fault-injected) on a selected path → workspace_operation_failed; no inference; no ABSENT; cleanup", async (t) => {
