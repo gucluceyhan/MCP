@@ -625,8 +625,48 @@ already *has* its rules; returning them would burn tokens for nothing).
 - **If Git repository discovery fails** (no `repo_root` override, or the
   override is not a valid Git repository), `splash_task` returns a **clear
   project/configuration error** — nothing is created (Section 2).
+- **External Git filters are not supported in v1 (fail-closed).** If any
+  tracked or selected path requires an *external* filter
+  (`filter.<driver>.clean` / `.smudge` / `.process` — e.g. Git LFS),
+  workspace creation is **rejected before the first command that could
+  execute a filter** (Section 7.3 step 1, `git diff HEAD`). The check is
+  read-only (`ls-files`, `check-attr`, `config --get`); it never modifies
+  or removes the repository's filter configuration. The *built-in*
+  `text` / `eol` normalization is not a filter and remains in effect. The
+  check inspects **two** attribute surfaces — the working tree (delta /
+  clean filters) and the committed HEAD tree (`check-attr --source`, since
+  the `git worktree add` checkout applies the *committed* `.gitattributes`
+  and would run smudge filters on the whole tree) — so a committed
+   attribute whose working-tree copy has been tampered with is also rejected
+   fail-closed. The same check is re-run **on every round** in the worktree —
+   after the worker's writes have been applied, before the round's first
+   filter-capable command (`add -N`, `diff`), and again before the
+   `diff()`/`stat()`/`export` diff — because the worktree attribute surface
+   is worker-writable (a worker may create or modify `.gitattributes`), and a
+    driver preconfigured in the user's git config (Git LFS included) would
+    otherwise execute its program on the host mid-round; every `git reset
+    --hard` is likewise preceded by the removal of known worker-written files,
+    since a measured racy content verification inside `reset --hard` also runs
+    the clean filter.
 
-Reasoning, mapped to the four criteria:
+   The racy window is closed **for every attribute surface the worker owns**
+   (PR #24, audit SB-1). Before *every* `git reset --hard` — the three points:
+   round-start housekeeping, round-failure rollback, and `resetToBase` — the
+   worker's attribute surface is sanitized with **plain filesystem operations
+   only**: worker-*created* `.gitattributes` files are removed, and
+   worker-*modified/deleted* **tracked** `.gitattributes` files (at any
+   repository depth) are rewritten with the exact base working-tree bytes and
+   the base mode. If either sanitation step fails, the `git reset --hard` is
+   **not run** (a fixed `workspace_operation_failed` red) — a reset must never
+   read a worker-owned attribute surface, because its racy content
+   verification (measured: a tracked same-size modification whose mtime lands
+   in the index's second) re-reads the working tree *through* that surface.
+   Even a fully successful round's attribute content is neutralized before the
+   next round's reset. The sanitation is a *sanitizer*, not a *detector*: the
+   per-round fail-closed re-checks above remain in force — the two mechanisms
+   are complementary, and neither replaces the other.
+
+ Reasoning, mapped to the four criteria:
 1. **Token efficiency** — `git diff` and `git diff --stat` are free and exact,
    which is what makes the *compact response* (stats) and the *on-demand
    `splash_diff`* possible without inventing a diff engine. The exported
@@ -729,6 +769,28 @@ deterministic Splash-local identity instead); remain on a detached HEAD; use
 exact Node/git invocation is an implementation detail; the behavior is
 required.
 
+**Selected-path symlink policy (required, fail-closed).** When copying
+selected untracked files (step 4), the source path in the main working
+tree and the target path in the workspace must contain **no symlink
+component** — an ancestor symlink would let the copy read or write
+outside the isolated boundary, so the selection is rejected. A selected
+path that *is* a symbolic link (tracked or untracked) must resolve
+**inside the repository**; an outside or escaping target (or a target
+that cannot be read) rejects creation. A symlink whose target stays
+inside the repository is a legitimate selection and is captured as
+itself (link target text, never followed).
+
+**Reset/cleanup failure semantics (required).** The round's two
+housekeeping steps — reset to the immutable base (step 1) and the scoped
+removal of the previous round's worker-created paths (step 2) — must each
+fail with a safe operational error rather than a crash or a partial
+success. If the scoped cleanup cannot complete, the **failed paths remain
+recorded as the known residue set** (union with the previous set) and are
+retried by the next reset/apply; the set is cleared only when a cleanup
+completes entirely. A failed round is never reported as a successful
+reset, no broad `git clean` and no recursive deletion is attempted, and
+the main checkout is never touched.
+
 ### 7.4 Patch validation (the safety boundary)
 
 The worker's output is **data, never code** — it is parsed into a typed patch
@@ -744,7 +806,11 @@ structure and checked before any effect:
    (create). Additional read-only context files are **not** writable — edits
    targeting them are rejected. Nothing else.
 3. **Path bounds**: workspace-relative, no `..` escape, no absolute paths, no
-   symlink targets outside the workspace.
+   symlink targets outside the workspace. Any path handed to Git as a pathspec
+   is pinned with `:(literal)`, so pathspec magic (glob, `:(exclude)`, …) can
+   never act on a path — a path is a path, not a directive (normalization
+   deliberately does not reject the magic characters: legitimate file names
+   may contain them; the pin is the control).
 4. **Match (pre-apply)**: every `search` string is validated against the
    **immutable base** content of that file; each required match must be
    **unique**; **overlapping edit ranges are detected and rejected** (an
@@ -784,6 +850,19 @@ the captured fingerprints (a read-only check; nothing is modified). The
 first round is fresh by construction (the base is captured from the live
 tree at that moment); the check is what matters from round 2 on, and at
 close.
+
+**Fingerprint scale (final).** The captured fingerprint — and the
+exact-match content used for search/replace validation — is taken from
+the worktree's **working files** (existence from the base tree; type/mode
+from `lstat`; content = the file's bytes, or the link's target text for a
+symbolic link). This is the *same scale* as the live fingerprint recorded
+by stale-base detection, so the two sides compare like for like. The
+transient base commit is a different field: it is the diff/reset/export
+base. Git's `text` / `eol` normalization can make the *blob* and the
+*working file* differ (e.g. CRLF vs. LF); that is expected and harmless —
+the worker is shown the working-file bytes, so an edit copied from what it
+saw round-trips exactly, while a normalized (LF) search against a CRLF
+base is rejected deterministically rather than applied with corruption.
 
 **Created-path collision (final).** Once the worker patch contains a
 `create` operation for a path, that path has an **expected base state of
