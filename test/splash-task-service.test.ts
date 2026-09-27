@@ -50,6 +50,7 @@ import {
   BINARY_CONTENT_MARKER,
   SYMLINK_MARKER_PREFIX,
 } from "../dist/task/simpleContext.js";
+import { getSimpleContextIo, setSimpleContextIo } from "../dist/task/simpleContextIo.js";
 import type { SplashConfig } from "../dist/config.js";
 import { randomUUID } from "node:crypto";
 
@@ -333,6 +334,17 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+/** Koşul sağlanana kadar kısa periyotlarla bekle (race testleri için). */
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 // ── Testler ─────────────────────────────────────────────────────────────────
 
 test("93: end-to-end success — applied result, worktree written, MAIN CHECKOUT UNTOUCHED, registry retains", async (t) => {
@@ -530,24 +542,32 @@ test("102: outputRoot INSIDE repo → output_root_unsafe (no sessions dir in rep
   assert.ok(!(await pathExists(path.join(inside, "sessions"))), "repo İÇİ outputRoot'ta sessions oluşmamalı");
 });
 
-test("102: repo INSIDE outputRoot (reverse containment) → output_root_unsafe", async (t) => {
+test("102: repo inside outputRoot (reverse) is ACCEPTED — sessions/workspace stay outside the repo", async (t) => {
   const h = await makeHarness(t);
-  // outputRoot = fixture kökü; repo onun İÇİNDE (sessions dizini proje ağacına düşerdi).
+  // outputRoot = fixture KÖKÜ; repo onun İÇİNDE (root/repo) — ortak atal.
+  // Ters yön tek başına güvensiz DEĞİLDİR: `root/sessions/<id>/workspace`
+  // repository ağacına otomatik girmez.
   const service = new SplashTaskService({
     config: { ...h.fixture.config, outputRoot: h.fixture.root },
-    coordinator: new InferenceCoordinator({
-      backend: h.backend,
-      runtimeDir: path.join(h.fixture.outputRoot, "runtime"),
-      scanner: cleanScanner(),
-      lock: h.lock,
-    }),
+    coordinator: h.coordinator,
+    capacity: h.backend,
     processCwd: () => h.fixture.repoRoot,
   });
-  await assert.rejects(
-    service.executeTask({ task: "Anything", files: [] }),
-    (err: unknown) => err instanceof SplashTaskError && err.kind === "output_root_unsafe",
-  );
-  assert.ok(!(await pathExists(path.join(h.fixture.root, "sessions"))), "repo-içi outputRoot'ta sessions oluşmamalı");
+  h.backend.runBehavior = async () => ({ content: okWorkerJson(), usage: { inputTokens: 1, outputTokens: 1 } });
+
+  const result = await service.executeTask({ task: "Change the value", files: ["src/a.ts"] });
+  assert.equal(result.status, "applied");
+
+  // Session + workspace dizinleri repo DIŞINDA (ortak atal altındaki kardeş ağaç):
+  const sessionDir = path.join(h.fixture.root, "sessions", result.sessionId);
+  const workspaceDir = path.join(sessionDir, "workspace");
+  const relSession = path.relative(h.fixture.repoRoot, sessionDir);
+  const relWorkspace = path.relative(h.fixture.repoRoot, workspaceDir);
+  assert.ok(relSession.startsWith(".."), `session dizini repo dışında kalmalı: ${relSession}`);
+  assert.ok(relWorkspace.startsWith(".."), `workspace repo dışında kalmalı: ${relWorkspace}`);
+  assert.ok(await pathExists(workspaceDir));
+  // Ana checkout yine dokunulmadı (spec 13):
+  assert.equal(await readFile(path.join(h.fixture.repoRoot, "src/a.ts"), "utf8"), "const value = 1;\n");
 });
 
 test("111/117: session id collision → session_conflict; no workspace, no dispatch", async (t) => {
@@ -836,4 +856,133 @@ test("64/57: active registry exposes latestResult per session (diagnostic surfac
   assert.equal(byId.get(b.sessionId)?.latestResult.summary, "Changed value to 2.");
   // `latestResult` = compact result (wire'a birebir gider):
   assert.equal(byId.get(a.sessionId)?.latestResult.status, "applied");
+});
+
+test("69/120: dispose racing in-flight inference — awaited; task rejects shutting_down; no orphan worktree", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "race-1" });
+  let releaseInference: (() => void) | undefined;
+  h.backend.runBehavior = async () => {
+    // inference BLOKE — tamamlanmayı test kontrol ediyor:
+    await new Promise<void>((resolve) => {
+      releaseInference = resolve;
+    });
+    return { content: okWorkerJson(), usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+
+  const task = h.service.executeTask({ task: "Racy", files: ["src/a.ts"] });
+  // Workspace + bağlam hazır, inference gerçekten bloke:
+  await waitFor(() => h.backend.runCalls.length === 1);
+
+  let disposeSettled = false;
+  const disposePromise = h.service
+    .dispose()
+    .catch(() => undefined)
+    .finally(() => {
+      disposeSettled = true;
+    });
+
+  // dispose, A hâlâ inference'ta bekliyorken ÇÖZÜLMEZ (in-flight bekleniyor):
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(h.service.disposed, true);
+  assert.equal(disposeSettled, false);
+
+  releaseInference?.();
+  // A, shutdown kazandığı için BAŞARI DÖNMEZ — güvenli tip'li red:
+  await assert.rejects(
+    task,
+    (err: unknown) => err instanceof SplashTaskError && err.kind === "shutting_down",
+  );
+  // dispose, A'nın BEKLENEN (await'lenen) temizliğinden SONRA çözüldü:
+  await disposePromise;
+  assert.equal(disposeSettled, true);
+  // Kayıt defteri boş (A koruma yerine self-cleanup yaptı):
+  assert.equal(h.service.activeTasks().length, 0);
+  // Workspace imha + session dizini temiz:
+  assert.ok(!(await pathExists(path.join(h.sessionsDir, "race-1"))));
+  // Orfan git worktree YOK — ana repo yalnız kendi worktree'sini listeler:
+  const listed = execFileSync("git", ["worktree", "list"], { cwd: h.fixture.repoRoot, encoding: "utf8" });
+  assert.equal(listed.split("\n").filter(Boolean).length, 1);
+});
+
+test("74/69: dispose racing in-flight task whose destroy fails — task_cleanup_failed (never swallowed)", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "race-2", createWorkspace: brokenDestroyWorkspace });
+  let releaseInference: (() => void) | undefined;
+  h.backend.runBehavior = async () => {
+    await new Promise<void>((resolve) => {
+      releaseInference = resolve;
+    });
+    return { content: okWorkerJson(), usage: { inputTokens: 1, outputTokens: 1 } };
+  };
+
+  const task = h.service.executeTask({ task: "Racy", files: ["src/a.ts"] });
+  await waitFor(() => h.backend.runCalls.length === 1);
+
+  const disposePromise = h.service.dispose().catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  releaseInference?.();
+
+  // İmha başarısız → `task_cleanup_failed` ÖNCELİKLİ (shutting_down değil);
+  // hata YUTULMAZ — görevin rejection'ında yüzeydedir:
+  await assert.rejects(
+    task,
+    (err: unknown) => err instanceof SplashTaskError && err.kind === "task_cleanup_failed",
+  );
+  // dispose in-flight'i BEKLEDİ ve registry boştu → temizlikle çözüldü:
+  await disposePromise;
+  assert.equal(h.service.activeTasks().length, 0);
+  // İmha edilemeyen workspace DOKUNULMAZ — sahte "temiz" raporu YOK:
+  assert.ok(await pathExists(path.join(h.sessionsDir, "race-2", "workspace")));
+});
+
+test("21/22: lstat EACCES (fault-injected) on a selected path → workspace_operation_failed; no inference; no ABSENT; cleanup", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "lstat-eacces" });
+  const real = getSimpleContextIo();
+  setSimpleContextIo({
+    lstat: async () => {
+      throw Object.assign(new Error("EACCES (fault-injected)"), { code: "EACCES" });
+    },
+    readlink: (p) => real.readlink(p),
+    readFile: (p) => real.readFile(p),
+  });
+  t.after(() => setSimpleContextIo(null));
+  h.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run when the context cannot be built");
+  };
+
+  await assert.rejects(
+    h.service.executeTask({ task: "Anything", files: ["src/a.ts"] }),
+    (err: unknown) => err instanceof WorkspaceError && err.kind === "workspace_operation_failed",
+  );
+  // Bağlam kurulamadı → mesaj/dispatch YOK (ABSENT marker model'e gitmedi):
+  assert.equal(h.backend.runCalls.length, 0);
+  // Temizlik: kayıt defteri boş + session dizini gitti:
+  assert.equal(h.service.activeTasks().length, 0);
+  assert.ok(!(await pathExists(path.join(h.sessionsDir, "lstat-eacces"))));
+});
+
+test("23: readlink EIO (fault-injected) on a selected symlink → workspace_operation_failed; no fabricated target", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "readlink-eio" });
+  await symlink("a.ts", path.join(h.fixture.repoRoot, "src/link.ts"));
+  git(h.fixture.repoRoot, "add", "-A");
+  git(h.fixture.repoRoot, "commit", "-m", "symlink");
+  const real = getSimpleContextIo();
+  setSimpleContextIo({
+    lstat: (p) => real.lstat(p),
+    readlink: async () => {
+      throw Object.assign(new Error("EIO (fault-injected)"), { code: "EIO" });
+    },
+    readFile: (p) => real.readFile(p),
+  });
+  t.after(() => setSimpleContextIo(null));
+  h.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run when the context cannot be built");
+  };
+
+  await assert.rejects(
+    h.service.executeTask({ task: "Inspect the link", files: ["src/link.ts"] }),
+    (err: unknown) => err instanceof WorkspaceError && err.kind === "workspace_operation_failed",
+  );
+  // Model hiçbir (icat edilmiş) hedef metni/placeholder göremedi — dispatch YOK:
+  assert.equal(h.backend.runCalls.length, 0);
+  assert.equal(h.service.activeTasks().length, 0);
 });

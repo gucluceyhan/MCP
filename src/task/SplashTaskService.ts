@@ -50,7 +50,7 @@ import type {
   WorkerResult,
 } from "../worker/result.js";
 import { discoverRepoRoot } from "../workspace/git.js";
-import { canonicalizeOutside, isPathInsideOrEqual, isSafeSessionId } from "../workspace/pathSafety.js";
+import { canonicalizeOutside, isSafeSessionId } from "../workspace/pathSafety.js";
 import { WorkspaceError, type Workspace, type WorkspaceCreateInput } from "../workspace/Workspace.js";
 import { createGitWorktreeWorkspace } from "../workspace/GitWorktreeWorkspace.js";
 import { buildSimpleEditableContext } from "./simpleContext.js";
@@ -61,9 +61,12 @@ export type SplashTaskErrorKind =
   /** Görev girdi sözleşmesine uymuyor (task/files) — MCP şemasının derin savunması. */
   | "invalid_input"
   /**
-   * Yapılandırılmış outputRoot ile repository BİRLİKTE çelişiyor: outputRoot
-   * repo içinde/eşit VEYA repo outputRoot içinde (session/workspace dizinleri
-   * kullanıcı projesinin içine düşer) — session mkdir'ından ÖNCE red.
+   * Yapılandırılmış outputRoot, repository ile çelişiyor: `outputRoot ==
+   * repoRoot` ya da outputRoot repo İÇİNDE — `sessions` dizini kullanıcı
+   * projesinin içine düşer — session mkdir'ından ÖNCE red. (Repo, outputRoot
+   * içinde OLMASI tek başına red DEĞİLDİR: `<outputRoot>/sessions/<id>`
+   * repository ağacının dışında kalır; workspace dizinini Step 5 fabrikası
+   * ayrıca doğrular.)
    */
   | "output_root_unsafe"
   /** Enjekte ID fabrikası güvenli/tekil bir kimlik üretemedi ya da kayıt çakışması. */
@@ -182,6 +185,13 @@ export class SplashTaskService {
   #active = new Map<string, ActiveTask>();
   /** `dispose()` sonrası yeni görev kabul edilmez (spec 69). */
   #disposed = false;
+  /**
+   * Şu an yürüyen (terminale ulaşmamış) `executeTask` çalışmaları —
+   * `dispose()` bu defteri BEKLER: shutdown başladıktan sonra hiçbir görev
+   * cleanup'suz kaçamaz (fire-and-forget YOK). Genel zamanlayıcı DEĞİLDİR;
+   * yalnız yaşam döngüsü izlemesidir.
+   */
+  #inFlight = new Set<Promise<CompactResult>>();
 
   constructor(deps: SplashTaskServiceDeps) {
     this.#config = deps.config;
@@ -206,6 +216,15 @@ export class SplashTaskService {
   /**
    * Bir `splash_task` çağrısını uçtan uca yürütür (spec 93 loop'u).
    *
+   * Shutdown yaşam döngüsü (spec 69 — dispose yarışına karşı deterministik):
+   * - dispose başlamışsa → derhal `shutting_down` (yeni çalışma YOK).
+   * - Çalışma BAŞLARKEN in-flight defterine SENKRON kaydedilir (denetimle
+   *   kayıt arasında yield YOK — dispose araya giremez).
+   * - `dispose()`, in-flight defteri boşalana kadar ÇÖZÜLMEZ: shutdown
+   *   öncesi başlayan HER görev ya koruma+dispose imhasından ya da
+   *   KENDİ beklenen (await'lenen) temizliğinden geçer — orfan workspace
+   *   YOK, fire-and-forget YOK.
+   *
    * Başarıda: `CompactResult` (durum applied/partial/failed/inference_busy —
    * hepsi NORMAL sonuç; `failed`/`inference_busy` hata DEĞİLdir).
    * Ara hatada (keşif/outputRoot/oluşum/parse/apply/koordinator): tip'li
@@ -221,7 +240,19 @@ export class SplashTaskService {
     if (this.#disposed) {
       throw new SplashTaskError("shutting_down", "Splash is shutting down");
     }
+    // in-flight kaydı, `#disposed` denetiminden sonra SENKRON yapılır —
+    // dispose, kayıttan önce araya giremez (tek iplik; yield yok).
+    const execution = this.#runTask(request);
+    this.#inFlight.add(execution);
+    try {
+      return await execution;
+    } finally {
+      this.#inFlight.delete(execution);
+    }
+  }
 
+  /** `executeTask` gövdesi — in-flight defterinde izlenir (spec 93 loop'u). */
+  async #runTask(request: SplashTaskRequest): Promise<CompactResult> {
     // ── girdi doğrulaması (spec 7/8) — trim YALNIZCA boşluk denetimi ─────
     if (typeof request.task !== "string" || request.task.trim() === "") {
       throw new SplashTaskError("invalid_input", "The task must be a non-empty string");
@@ -237,19 +268,14 @@ export class SplashTaskService {
       override: this.#config.repoRoot,
     });
 
-    // ── outputRoot containment (spec 13) — session mkdir'ından ÖNCE ──────
-    // `outputRoot == repoRoot` ya da repo İÇİ → güvenli red; kullanıcı
-    // repository'sinde `.splash` dizini ASLA oluşmaz.
+    // ── outputRoot containment (spec 13/102) — session mkdir'ından ÖNCE ───
+    // Red koşulları (ve yalnız bunlar): `outputRoot == repoRoot` ya da
+    // outputRoot repo İÇİNDE — `sessions` dizini kullanıcı repository'sinde
+    // ASLA oluşmaz. Repo'nun outputRoot içinde OLMASI tek başına red DEĞİL:
+    // `<outputRoot>/sessions/<id>/workspace` repository ağacına otomatik
+    // girmez (workspace dizinini Step 5 fabrikası ayrıca doğrular).
     const canonicalOutputRoot = await canonicalizeOutside(this.#config.outputRoot, repoRoot);
-    if (
-      // outputRoot repo İÇİNDE veya repo ile eşit (spec 102): `sessions` dizini
-      // kullanıcı repository'sinde ASLA oluşmaz.
-      canonicalOutputRoot === null ||
-      // outputRoot repo'yu İÇERİYOR (spec 102, ters yön): session/workspace
-      // dizinleri proje ağacının içine düşer — ikisi de kanonik olduğundan
-      // string karşılaştırması güvenlidir.
-      isPathInsideOrEqual(canonicalOutputRoot, repoRoot)
-    ) {
+    if (canonicalOutputRoot === null) {
       throw new SplashTaskError("output_root_unsafe", "The output root must be outside the repository");
     }
 
@@ -334,10 +360,11 @@ export class SplashTaskService {
       });
 
       // ── inference_busy (spec 36/66): GEÇERLİ compact sonuç; workspace
-      //    KORUNUR (imha YOK — Step 9'da refine/close onu kullanacak). ──────
+      //    KORUNUR (imha YOK — Step 9'da refine/close onu kullanacak).
+      //    (shutdown kazandıysa koruma DEĞİL beklenen self-cleanup + red.) ──
       if (dispatched.status === "inference_busy") {
         const result = this.#busyResult(sessionId, dispatched.conflict);
-        this.#retain(sessionId, workspace, sessionDir, result);
+        await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
         return result;
       }
 
@@ -351,9 +378,18 @@ export class SplashTaskService {
       const applyResult = await workspace.applyPatchSet(workerResult);
 
       const result = this.#completedResult(sessionId, workerResult, applyResult, dispatched.result.usage);
-      this.#retain(sessionId, workspace, sessionDir, result);
+      await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
       return result;
     } catch (err) {
+      // `#retainOrCleanup`'ın sonuçları (shutting_down / task_cleanup_failed)
+      // kendi temizliğini ZATEN await'ledi (tek-sahiplik) — workspace
+      // ÇİFT-imha edilemez: aynı hata aynen yayılır.
+      if (
+        err instanceof SplashTaskError &&
+        (err.kind === "shutting_down" || err.kind === "task_cleanup_failed")
+      ) {
+        throw err;
+      }
       // Sonuç korunamadan iş hata verdi (spec 73): workspace imha edilir,
       // boş dizinler rmdir ile gider. `inference_busy` bu yolun dışındadır
       // (geçerli sonuç; yukarıda korunur).
@@ -364,11 +400,21 @@ export class SplashTaskService {
 
   /**
    * Kapatım yaşam döngüsü (spec 69):
-   *   1. yeni görev kabul edilmez (`#disposed`),
-   *   2. TÜM aktif worktree'ler imha edilir (sıralı),
-   *   3. boşalan Step 6 session dizinleri `rmdir` ile kaldırılır
+   *   1. yeni görev kabul edilmez (`#disposed` — ilk await'ten ÖNCE),
+   *   2. shutdown ÖNCESİ başlayan TÜM in-flight görevler güvenli terminal
+   *      yollarına ulaşıncaya KADAR BEKLENİR (fire-and-forget YOK):
+   *      korunanlar kayıt defterinde, self-cleanup yapanlar kendi
+   *      rejection'larında yüzeye çıkar — `Promise.allSettled` bir görevin
+   *      reddi diğerlerinin temizliğini kesmez, hatayı da YUTMAZ;
+   *   3. kayıt defterindeki (dispose ÖNCESİ korunan) TÜM worktree'ler
+   *      imha edilir (sıralı),
+   *   4. boşalan Step 6 session dizinleri `rmdir` ile kaldırılır
    *      (geniş `rm -rf <outputRoot>/sessions` YASAK — spec 69/75),
-   *   4. kayıt defteri temizlenir.
+   *   5. kayıt defteri temizlenir.
+   *
+   * Sahiplik deterministik (çift-imha YOK): in-flight, henüz korunmamış
+   * görevin shutdown temizliği KENDİSİNEDİR; korunan görevin imhası
+   * dispose'tadır — aynı workspace TEK tarafça imha edilir.
    *
    * Bir imha/temizlik adımı başarısız olursa güvenli tip'li hata yayılır
    * (kaynak/cause yüzeye taşınmaz); kalan görevler yine denenir.
@@ -378,7 +424,14 @@ export class SplashTaskService {
     if (this.#disposed) {
       return;
     }
+    // 1) Herhangi bir await'ten ÖNCE: artık yeni görev başlatılamaz.
     this.#disposed = true;
+    // 2) Shutdown'dan önce başlayan tüm in-flight görevler terminale
+    //    (koruma / self-cleanup) ulaşıncaya kadar bekle.
+    if (this.#inFlight.size > 0) {
+      await Promise.allSettled(this.#inFlight);
+    }
+    // 3) Dispose öncesi korunan görevler: imha sahibi dispose'tur.
     const tasks = [...this.#active.values()];
     this.#active.clear();
 
@@ -410,13 +463,25 @@ export class SplashTaskService {
 
   // ── iç yardımcılar ────────────────────────────────────────────────────────
 
-  /** Sonuç korunur (applied/partial/failed/inference_busy — hepsi canlı). */
-  #retain(sessionId: string, workspace: Workspace, sessionDir: string, result: CompactResult): void {
+  /**
+   * Turun terminal yolu — sahiplik TETİĞİ (tek sahip; çift-imha YOK):
+   * - dispose ÖNCESİ biten → kayıt defterinde KORUNUR (canlı — Step 9'da
+   *   refine/close kullanır); imhayı `dispose()` yapar.
+   * - dispose SONRASI biten → kayıt defterine GİRMEZ; bu çalışma kendi
+   *   temizliğini **await'ler** (fire-and-forget YOK, hata YUTULMAZ):
+   *   temizlik başarılı → görev `shutting_down` ile REDDEDİLİR (shutdown
+   *   kazandıysa görev ASLA başarıyla çözülmez); temizlik hata →
+   *   `task_cleanup_failed` ÖNCELİKLİ yayılır.
+   */
+  async #retainOrCleanup(
+    sessionId: string,
+    workspace: Workspace,
+    sessionDir: string,
+    result: CompactResult,
+  ): Promise<void> {
     if (this.#disposed) {
-      // dispose() ile yarışan son çağrı: kayıt defteri zaten boş; workspace'i
-      // kendisi imha eder — dispose'un tek-geç turu onu görmez (orfan YOK).
-      void this.#cleanupAfterFailure(workspace, sessionDir, null).catch(() => undefined);
-      return;
+      await this.#cleanupAfterFailure(workspace, sessionDir, null);
+      throw new SplashTaskError("shutting_down", "Splash is shutting down");
     }
     this.#active.set(sessionId, { workspace, sessionDir, latestResult: result });
   }

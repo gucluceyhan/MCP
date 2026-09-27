@@ -269,7 +269,8 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
 
   const taskTool = tools.find((tool) => tool.name === "splash_task");
   assert.ok(taskTool !== undefined);
-  // zod şema → JSON schema: `task` zorunlu; `files`/`options` isteğe bağlı.
+  // zod şema → JSON schema: `task` + `files` ZORUNLU (final sözleşme:
+  // splash_task(task, files, options?)); `options` isteğe bağlı.
   const schema = taskTool?.inputSchema as {
     type: string;
     properties: Record<string, unknown>;
@@ -277,7 +278,7 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
   };
   assert.equal(schema.type, "object");
   assert.ok(Array.isArray(schema.required) && schema.required.includes("task"));
-  assert.ok(!("required" in schema) || !(schema.required ?? []).includes("files"));
+  assert.ok(Array.isArray(schema.required) && schema.required.includes("files"), "`files` zorunlu olmalı");
   assert.ok(!("required" in schema) || !(schema.required ?? []).includes("options"));
   // çağrı başına YASAK alanlar şemada YOK (spec 6/9):
   for (const forbidden of ["repo_root", "session_id", "output_root", "context_tier", "rules", "system_prompt"]) {
@@ -396,6 +397,44 @@ test("58/59/123: safe typed errors surface as MCP error results (no payload, no 
     assert.deepEqual(parseWire(res), { kind: "internal_error", message: "Internal Splash error" });
     assert.ok(!String(res.content?.[0]?.text).includes("TOTALLY_UNEXPECTED"));
   }
+});
+
+test("8: `files` missing → MCP schema rejection; task service NEVER called (no workspace/inference/session dir)", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const session = await makeMcpSession(t, fixture);
+  session.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run for a schema-invalid call");
+  };
+
+  const res = (await session.client.callTool({ name: "splash_task", arguments: { task: "Do something" } })) as WireContent;
+
+  // Şema protokol seviyesinde reddeder:
+  assert.ok(res.isError === true, `files eksik çağrı reddedilmeli: ${JSON.stringify(res)}`);
+  // Görev servisine ASLA inemedi — workspace/inference/oturum YOK:
+  assert.equal(session.backend.runCalls.length, 0);
+  assert.ok(!(await pathExists(fixture.sessionsDir)), "şema-geçersiz çağrıda sessions dizini OLUŞMAMALI");
+  // Çalışma zamanı hâlâ ayakta (şema reddi runtime'ı bozmaz):
+  const ping = (await session.client.callTool({ name: "splash_ping", arguments: {} })) as WireContent;
+  assert.ok(!ping.isError);
+});
+
+test("8: `files: []` (explicit empty array, create-only task) is still accepted", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const session = await makeMcpSession(t, fixture);
+  session.backend.runBehavior = async () => ({
+    content: JSON.stringify({ schema_version: 1, summary: "Nothing to do.", edits: [] }),
+    usage: { inputTokens: 4, outputTokens: 4 },
+  });
+
+  const res = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "Create a file", files: [] },
+  })) as WireContent;
+
+  assert.ok(!res.isError, `boş files dizi kabul edilmeli: ${res.content?.[0]?.text}`);
+  const wire = parseWire(res);
+  assert.equal(wire.status, "applied"); // 0/0 no-op = geçerli tur
+  assert.equal(session.backend.runCalls.length, 1);
 });
 
 test("125: runtime.dispose() → session cleaned; subsequent task → shutting_down error result", async (t) => {

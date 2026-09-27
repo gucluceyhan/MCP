@@ -16,20 +16,28 @@
  *   metadata marker (base64/hex yok) — worker modify edemez, delete edebilir.
  * - Sembolik bağlantı: ASLA takip edilmez (`lstat`/`readlink`); hedef
  *   içeriği okunmaz; link'in kendisinin metadata'sı verilir.
- * - Tabanda yok: açık ABSENT marker (yok ≠ boş; worker `create` kullanabilir).
+ * - Tabanda yok (GERÇEK `ENOENT`): açık ABSENT marker (yok ≠ boş; worker
+ *   `create` kullanabilir).
+ * - Dosya sistemi hatası SINIFLANDIRILIR (fail-closed): yalnız `ENOENT`
+ *   "yok"tur; EACCES/EPERM/EIO/ELOOP/ENOTDIR/... "yokmuş" DEĞERLENDİRİLMEZ
+ *   ve `readlink` hatası hedef icat etmez — ikisi de `workspace`
+ *   `workspace_operation_failed` ile fail-closed (bağlam, immutable tabanla
+ *   UYUŞMAZSA model o bağlamla inference'a ASLA girmez; yol/errno mesajda YOK).
  * - Redaksiyon (Step 7) ve kurallar (Step 8) YOK; salt-okunur referans YOK.
  */
 
-import { lstat, readFile, readlink } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import path from "node:path";
 import { WorkspaceError } from "../workspace/Workspace.js";
+import type { SimpleContextIo } from "./simpleContextIo.js";
+import { getSimpleContextIo } from "./simpleContextIo.js";
 
 /** Düzenli dosya içeriğinin marker'ı (blok başlık/sonu arasındaki içerik). */
 export const BINARY_CONTENT_MARKER =
   "[BINARY CONTENT OMITTED: modify is unsupported; delete remains possible.]";
 /** Sembolik bağlantı metadata'sının öneki (hedef metni takip edilmez). */
 export const SYMLINK_MARKER_PREFIX = "[SYMLINK -> ";
-/** Tabanda var olmayan seçili yol (worker `create` kullanabilir). */
+/** Tabanda var olmayan seçili yol — yalnız GERÇEK `ENOENT` (worker `create` kullanabilir). */
 export const ABSENT_MARKER = "[ABSENT IN IMMUTABLE BASE]";
 /**
  * Savunmacı marker: base'te temsil edilemeyen tip (dizin/özel nesne).
@@ -44,7 +52,7 @@ export const NOT_REPRESENTABLE_MARKER = "[NOT REPRESENTABLE IN IMMUTABLE BASE]";
  *
  * Blok formatı (birebir):
  *   `===== EDITABLE BASE: <yol> =====\n<içerik>
-===== END EDITABLE BASE: <yol> =====`
+ ===== END EDITABLE BASE: <yol> =====`
  * Bloklar tek boş satırla ayrılır; `editablePaths` BOŞSA sonuç BOŞ stringtir
  * (Worker Contract bu durumda REPOSITORY CONTEXT bölümünü koymaz).
  */
@@ -52,18 +60,19 @@ export async function buildSimpleEditableContext(
   workspaceDir: string,
   editablePaths: readonly string[],
 ): Promise<string> {
+  const io = getSimpleContextIo();
   // Deterministik sıra (spec 19): lexiconographic; dosya sistemi
   // dizin sayımı (readdir) BAŞVURULMAZ.
   const ordered = [...editablePaths].sort();
   const blocks: string[] = [];
   for (const canonical of ordered) {
-    blocks.push(await buildBlock(workspaceDir, canonical));
+    blocks.push(await buildBlock(io, workspaceDir, canonical));
   }
   return blocks.join("\n\n");
 }
 
 /** Tek bir seçili yolun bağlam bloğu. */
-async function buildBlock(workspaceDir: string, canonical: string): Promise<string> {
+async function buildBlock(io: SimpleContextIo, workspaceDir: string, canonical: string): Promise<string> {
   const abs = path.resolve(workspaceDir, canonical);
   // Containment (savunmacı): workspace manager yolun zaten normalize olduğunu
   // garanti eder; yine de kökten kaçış imkânsız olmalı.
@@ -73,10 +82,18 @@ async function buildBlock(workspaceDir: string, canonical: string): Promise<stri
   }
 
   let body: string;
-  let stat: Awaited<ReturnType<typeof lstat>> | null = null;
+  let stat: Stats | null = null;
   try {
-    stat = await lstat(abs);
-  } catch {
+    stat = await io.lstat(abs);
+  } catch (err) {
+    // Fail-closed sınıflandırma: YALNIZ `ENOENT` = tabanda YOK (ABSENT).
+    // Gerçek dosya sistemi hatası (EACCES/EPERM/EIO/ELOOP/ENOTDIR/...)
+    // "yokmuş" gibi DEĞERLENDİRİLMEZ — bağlam, immutable tabanla uyuşmazsa
+    // model o bağlamla inference'a giremez.
+    if (!hasErrno(err, "ENOENT")) {
+      // Sabit güvenli mesaj: yol/errno/OS çıktısı YOK.
+      throw new WorkspaceError("workspace_operation_failed", "Reading the editable base failed");
+    }
     stat = null; // var değil → ABSENT (spec 24)
   }
 
@@ -87,17 +104,18 @@ async function buildBlock(workspaceDir: string, canonical: string): Promise<stri
     // içeriği ASLA okunmaz.
     let target: string;
     try {
-      target = await readlink(abs);
+      target = await io.readlink(abs);
     } catch {
-      // lstat "link" dedi, readlink okuyamadı (race/izin) — içerik vermeden
-      // metadata (hedef bilinmiyor; worker yine de delete edebilir).
-      target = "<unreadable>";
+      // lstat "link" dedi, readlink okuyamadı (race/izin/IO): hedef
+      // BİLİNEMİYOR — icat edilen state (`<unreadable>` vb.) worker'a ASLA
+      // verilmez; fail-closed işletimsel hata (yukarıdaki sabit mesaj).
+      throw new WorkspaceError("workspace_operation_failed", "Reading the editable base failed");
     }
     body = `${SYMLINK_MARKER_PREFIX}${target}]`;
   } else if (stat.isFile()) {
     let bytes: Buffer;
     try {
-      bytes = await readFile(abs);
+      bytes = await io.readFile(abs);
     } catch {
       // Base'te var ama okunamıyor (race/izin): bağlam güvenli temsil
       // edilemez — tip'li işletimsel hata (içerik/çözüm YOK, mesaj SABİТ).
@@ -115,6 +133,16 @@ async function buildBlock(workspaceDir: string, canonical: string): Promise<stri
   }
 
   return `===== EDITABLE BASE: ${canonical} =====\n${body}\n===== END EDITABLE BASE: ${canonical} =====`;
+}
+
+/** `err` bir `NodeJS.ErrnoException` ve `code` verilene eşit mi? (saf.) */
+function hasErrno(err: unknown, code: string): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as NodeJS.ErrnoException).code === code
+  );
 }
 
 /** `bytes` strict UTF-8 olarak round-trip ediyor mu? (saf, bayt-tam.) */

@@ -62,8 +62,11 @@ export interface SplashRuntimeOptions {
  *
  * - `task`: boş-olmayan string (trim ile boşluk-tek denetimi; orijinal metin
  *   worker'a aynen gider — spec 7).
- * - `files`: string dizisi; BOŞ dizi GEÇERLİ (create-only görev) (spec 8).
- *   Her string açık repository-göreceli yoldur — glob/dizin/regex YOK.
+ * - `files`: string dizisi — **ZORUNLU** (final sözleşme:
+ *   `splash_task(task, files, options?)`): eksik `files` şema tarafında
+ *   REDDEDİLİR — boş dizi icat edilmez (`default` YOK). BOŞ dizi GEÇERLİ
+ *   (create-only görev) (spec 8). Her string açık repository-göreceli
+ *   yoldur — glob/dizin/regex YOK.
  * - `options.reasoning_effort`: `none|low|medium|xhigh` (spec 6).
  *   Adaptif bütçe override'ları YOK (Step 7).
  * - `repo_root`/`session_id`/`output_root`/`context_tier`/`rules`/
@@ -74,7 +77,7 @@ const splashTaskInputSchema = z.object({
   task: z
     .string()
     .refine((value) => value.trim().length > 0, "The task must be a non-empty string"),
-  files: z.array(z.string()).default([]),
+  files: z.array(z.string()),
   options: z
     .object({
       reasoning_effort: z.enum(["none", "low", "medium", "xhigh"]).optional(),
