@@ -84,6 +84,30 @@ export type PathFingerprint =
       contentSha256?: string;
     };
 
+/**
+ * Immutable base'in tek bir seçili yolunun BİREBİR girişi (Step 7 —
+ * Context Assembler'ın salt-okunur kaynağı).
+ *
+ * `PathFingerprint`'ın içerik taşıyan ikiziyle aynı ölçek (DESIGN.md 7.5):
+ * tip + git-ilişkili mod + içerik. İçerik ALANLARI bu tipin kendisindedir —
+ * parmak izi (hash) değil: worker'a gösterilecek / redakte edilecek
+ * bayt'lar veya link hedef metni. Dönen Buffer'lar savunmacı KOPIYAlardır
+ * (yalnızca okunur kullansan da çağrı tarafının mutasyonu immutable
+ * snapshot'ı bozamaz).
+ *
+ * `mode` git dosya modudur (`"100644"`, `"100755"`, `"120000"`, `"040000"`,
+ * `"160000"`...) — platform `stat.mode`'u ASLA taşınmaz (Step 5 spec 31).
+ */
+export type WorkspaceBaseEntry =
+  /** Base'te yok (GERÇEK yokluk — worker `create` kullanabilir). */
+  | { exists: false }
+  /** Düzenli dosya: birebir base baytları (defansif kopya). */
+  | { exists: true; type: "file"; mode: "100644" | "100755"; content: Buffer }
+  /** Sembolik bağlantı: hedef METNİ (takip edilmez; hedef dosya okunmaz). */
+  | { exists: true; type: "symlink"; mode: "120000"; target: string }
+  /** Dizin / gitlink / özel nesne: içerik temsil edilemez (tip+mod meta). */
+  | { exists: true; type: "directory" | "other"; mode: string };
+
 // ── Oluşturma girdisi ───────────────────────────────────────────────────────
 
 export interface WorkspaceCreateInput {
@@ -167,6 +191,21 @@ export interface Workspace {
   readonly editablePaths: readonly string[];
   /** Immutable base parmak izleri + base ağaç haritası (Step 9 API'si). */
   readonly base: WorkspaceBaseInfo;
+
+  /**
+   * Bir düzenlenebilir yolun IMMUTABLE BASE'indeki BİREBİR durumunu döndürür
+   * (Step 7 — Context Assembler'ın editable-side okuma API'si).
+   *
+   * - Senkron ve saf-okunur: base yakalama anında bellekte tutulan snapshot'tan
+   *   (working-tree baytları / link hedef metni) yanıt verir — worktree'nin
+   *   MUTABLE hali, ana checkout ve git ASLA okunmaz/tetiklenmez; apply
+   *   SONRASI çağrılsa bile aynı base baytları döner.
+   * - Girdi repository-göreceli yoldur; normalize edilir ve YALNIZCA
+   *   `editablePaths` üyesi (kanonik form) kabul edilir — başka her yol
+   *   `invalid_input` ile reddedilir.
+   * - İmha edilmiş workspace → `workspace_destroyed`.
+   */
+  readBaseEntry(repoRelativePath: string): WorkspaceBaseEntry;
 
   /** Worker sonuç tablosunu uygular (tam ikame; yukarıdaki yaşam döngüsü). */
   applyPatchSet(result: WorkerResult): Promise<WorkspaceApplyResult>;

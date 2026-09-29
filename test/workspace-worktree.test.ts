@@ -2637,3 +2637,106 @@ test("a successful round with a worker-modified attribute: the NEXT round's rese
     "no worktree may be left behind",
   );
 });
+
+// ── Step 7: readBaseEntry (immutable base'in birebir bellek görünümü) ──────
+
+test("readBaseEntry: exact immutable base view (file/binary/symlink/absent + allow-list + post-apply invariance)", async () => {
+  const base = path.join(tmp, "rbe");
+  const repo = path.join(base, "repo");
+  const out = path.join(base, "out");
+  await mkdir(path.join(repo, "src"), { recursive: true });
+  await mkdir(out, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "RBE Test"]);
+  await gitOk(repo, ["config", "user.email", "rbe@splash.test"]);
+  await writeFile(path.join(repo, "src", "a.ts"), "alpha\n");
+  // SEÇİLMEYEN sentinel — readBaseEntry allow-list'i dışında (crawl yok).
+  await writeFile(path.join(repo, "src", "out.ts"), "OUT_SENTINEL_NEVER_READ\n");
+  // Binary (geçersiz UTF-8) — snapshot bayt-bayt; marker kararı assembler'da.
+  await writeFile(path.join(repo, "src", "bin.dat"), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+  // Repo-içi hedefli sembolik bağlantı — hedef METNİ, takip edilmez.
+  await symlink("a.ts", path.join(repo, "src", "link.ts"));
+  // Seçilmemiş dizin sentinel (dizin seçimi creation'da reddedilir).
+  await mkdir(path.join(repo, "src", "dir"), { recursive: true });
+  await writeFile(path.join(repo, "src", "dir", "x.txt"), "x\n");
+  await gitOk(repo, ["add", "-A"]);
+  await gitOk(repo, ["commit", "-m", "base"]);
+
+  const worktreesBefore = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: repo,
+    workspaceDir: path.join(out, "ws"),
+    sessionId: "rbe-1",
+    editablePaths: ["src/a.ts", "src/bin.dat", "src/link.ts", "src/missing.ts"],
+    readonlyPaths: [],
+  });
+  try {
+    // Düzenli dosya: birebir base baytları.
+    const a = ws.readBaseEntry("src/a.ts");
+    assert.equal(a.exists, true);
+    if (a.exists && a.type === "file") {
+      assert.equal(a.mode, "100644");
+      assert.deepEqual(a.content, Buffer.from("alpha\n"));
+    } else {
+      assert.fail(`unexpected entry shape: ${JSON.stringify(a)}`);
+    }
+    // Binary: baytlar aynen (decode/normalizasyon YOK).
+    const bin = ws.readBaseEntry("src/bin.dat");
+    assert.equal(bin.exists, true);
+    if (bin.exists && bin.type === "file") {
+      assert.deepEqual(bin.content, Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+    }
+    // Savunmacı kopya: dönen buffer'ın mutasyonu snapshot'ı bozamaz.
+    const bin2 = ws.readBaseEntry("src/bin.dat");
+    if (bin2.exists && bin2.type === "file") {
+      bin2.content.fill(0x00);
+      const bin3 = ws.readBaseEntry("src/bin.dat");
+      if (bin3.exists && bin3.type === "file") {
+        assert.deepEqual(bin3.content, Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+      }
+    }
+    // Sembolik bağlantı: yalnız hedef metni (hedef dosya içeriği ASLA).
+    assert.deepEqual(ws.readBaseEntry("src/link.ts"), {
+      exists: true,
+      type: "symlink",
+      mode: "120000",
+      target: "a.ts",
+    });
+    // Tabanda yok.
+    assert.deepEqual(ws.readBaseEntry("src/missing.ts"), { exists: false });
+    // Normalizasyon: `./src/a.ts` → aynı kanonik yol → aynı giriş.
+    const norm = ws.readBaseEntry("./src/a.ts");
+    assert.equal(norm.exists, true);
+    // Allow-list dışı yol → `invalid_input` (salt-okunur bağlam dâhil — sessiz
+    // genişleme YOK).
+    assert.throws(
+      () => ws.readBaseEntry("src/out.ts"),
+      (err: unknown) => err instanceof WorkspaceError && err.kind === "invalid_input",
+    );
+    assert.throws(
+      () => ws.readBaseEntry("../escape.ts"),
+      (err: unknown) => err instanceof WorkspaceError && err.kind === "invalid_input",
+    );
+
+    // Apply SONRASI invarians: worker worktree'ye yazar; base snapshot BİREBİR
+    // base'i vermeye devam eder (mutable taraf snapshot'ın dışındadır).
+    const res = await ws.applyPatchSet(
+      workerResult([{ kind: "modify", path: "src/a.ts", operations: [{ search: "alpha", replace: "beta" }] }]),
+    );
+    assert.equal(res.validation.editsApplied, 1);
+    assert.equal((await readFile(path.join(ws.workspaceDir, "src", "a.ts"), "utf8")), "beta\n");
+    const after = ws.readBaseEntry("src/a.ts");
+    if (after.exists && after.type === "file") {
+      assert.deepEqual(after.content, Buffer.from("alpha\n"), "base snapshot worker yazısından etkilenemez");
+    }
+  } finally {
+    await ws.destroy();
+  }
+  const listed = (await gitText(repo, ["worktree", "list"])).split("\n").filter(Boolean);
+  assert.deepEqual(
+    worktreePaths(listed),
+    worktreePaths(worktreesBefore),
+    "no worktree may be left behind",
+  );
+  await rm(base, { recursive: true, force: true });
+});

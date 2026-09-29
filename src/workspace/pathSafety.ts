@@ -24,6 +24,7 @@
 
 import path from "node:path";
 import { lstat, realpath } from "node:fs/promises";
+import type { Stats } from "node:fs";
 
 /** Windows sürücülü mutlak: `C:\x`, `C:/x` (tek karakter sürücü). */
 const WINDOWS_DRIVE = /^[A-Za-z]:[\\/]/;
@@ -210,6 +211,31 @@ export function resolveContained(root: string, canonical: string): string | null
 }
 
 /**
+ * Seçilen sembolik bağlantının hedefi repository İÇİNDE kalıyor mu?
+ * (spec 50: mutlak dış hedefler host dosyalarını okuma/taşıma kanalı olamaz.)
+ * Hedef zincir çözülebildiyse `realpath`, çözülmezse (kırık link)
+ * sözdizimsel çözüm kullanılır; ikisi de kök dışına düşüyorsa red.
+ *
+ * `resolveFn` (varsayılan: `node:fs/promises.realpath`) Context Assembler'ın
+ * test enjeksiyonu (`ContextFs`) ile aynı dikişten geçebilir — daha zayıf
+ * bir ikinci çözümleyici ikame edilmez.
+ */
+export async function symlinkTargetStaysInside(
+  repoRoot: string,
+  linkAbs: string,
+  target: string,
+  resolveFn: (target: string) => Promise<string> = realpath,
+): Promise<boolean> {
+  const lexical = path.isAbsolute(target) ? path.resolve(target) : path.resolve(path.dirname(linkAbs), target);
+  try {
+    const resolved = await resolveFn(lexical);
+    return isPathInsideOrEqual(repoRoot, resolved);
+  } catch {
+    return isPathInsideOrEqual(repoRoot, lexical);
+  }
+}
+
+/**
  * `absolute` yolun `root` altındaki bileşenleri arasında sembolik bağlantı
  * var mı? (v1 yazma güvenliği, spec 48: worker yazıları ASLA sembolik
  * bağlantı bileşeni üzerinden ilerlemez — workspace İÇİNE bağlanan bir
@@ -218,11 +244,17 @@ export function resolveContained(root: string, canonical: string): string | null
  * `includeTarget: false` ise hedef kendisi denetlenmez (delete: hedefin
  * sembolik bağlantı olması meşrudur — link'in kendisi kaldırılır).
  * Eksik (var olmayan) atal bileşenlerde denetim orada durur.
+ *
+ * `lstatFn` (varsayılan: `node:fs/promises.lstat`) — Context Assembler'ın
+ * read-only yol denetimleri test arızaları enjekte edebilsin diye aynı
+ * dikişten geçer; production davranış birebir node:fs'tir.
  */
 export async function hasSymlinkInPath(
   absolute: string,
   root: string,
-  options: { includeTarget: boolean } = { includeTarget: true },
+  options: { includeTarget: boolean; lstatFn?: (target: string) => Promise<Stats> } = {
+    includeTarget: true,
+  },
 ): Promise<boolean> {
   const rel = path.relative(root, absolute);
   if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
@@ -230,6 +262,7 @@ export async function hasSymlinkInPath(
   }
   const segments = rel.split(path.sep).filter((segment) => segment !== "");
   const limit = options.includeTarget ? segments.length : Math.max(0, segments.length - 1);
+  const probe = options.lstatFn ?? lstat;
 
   let current = root;
   for (let i = 0; i < limit; i++) {
@@ -238,9 +271,9 @@ export async function hasSymlinkInPath(
       break;
     }
     current = path.join(current, segment);
-    let stat: Awaited<ReturnType<typeof lstat>>;
+    let stat: Stats;
     try {
-      stat = await lstat(current);
+      stat = await probe(current);
     } catch {
       break; // Atal var değil → gerisi de var olamaz.
     }

@@ -93,6 +93,7 @@ import type {
   PathFingerprint,
   Workspace,
   WorkspaceApplyResult,
+  WorkspaceBaseEntry,
   WorkspaceBaseInfo,
   WorkspaceCreateInput,
   WorkspaceDiffOptions,
@@ -109,10 +110,10 @@ import {
 import {
   canonicalizeOutside,
   hasSymlinkInPath,
-  isPathInsideOrEqual,
   isSafeSessionId,
   normalizeRepoPath,
   resolveContained,
+  symlinkTargetStaysInside,
 } from "./pathSafety.js";
 import { captureLiveFingerprint, gitModeType, normalizeGitFileMode, sha256Hex } from "./fingerprint.js";
 import { validateWorkerResult, type EditPlan, type WorkspaceBase } from "./validate.js";
@@ -292,6 +293,75 @@ export class GitWorktreeWorkspace implements Workspace {
     if (this.destroyed) {
       throw new WorkspaceError("workspace_destroyed", "The workspace has been destroyed");
     }
+  }
+
+  /**
+   * Immutable base'in tek yolunu BİREBİR döndürür (sözleşme: `Workspace.readBaseEntry`).
+   *
+   * Kaynak = base yakalama anında belleğe alınan snapshot:
+   * - varlık/tip/mod: `validationBase.editable` parmak izi (git modu ölçeği);
+   * - içerik: `validationBase.editableContent` (düzenli dosya baytları /
+   *   link hedef metni) — worktree'nin MUTABLE dosyaları ASLA okunmaz.
+   *   Bu, apply SONRASI bir çağrının bile base durumunu vermesinin
+   *   garantisidir (worker yazıları snapshot'ın dışındadır).
+   *
+   * Güvenlik: yol `normalizeRepoPath` ile kanonikleştirilir; YALNIZCA
+   * `editablePaths` üyesi kabul edilir (allow-list dışı yol — salt-okunur
+   * bağlam dâhil — `invalid_input`). Dönen Buffer/str yapıları savunmacı
+   * kopyalardır; içerik asla snapshot referansı olarak kaçmaz.
+   */
+  readBaseEntry(repoRelativePath: string): WorkspaceBaseEntry {
+    this.assertUsable();
+    if (typeof repoRelativePath !== "string") {
+      throw new WorkspaceError("invalid_input", "A selected path must be a string");
+    }
+    const canonical = normalizeRepoPath(repoRelativePath);
+    if (canonical === null || !this.editablePaths.includes(canonical)) {
+      // Allow-list dışı (salt-okunur bağlam / repository içeriği) — bu API
+      // editable base'e aittir; derin savunma, sessiz genişleme YOK.
+      throw new WorkspaceError("invalid_input", "Only editable base paths can be read");
+    }
+
+    const fingerprint = this.validationBase.editable.get(canonical);
+    if (fingerprint === undefined) {
+      // Yapısal invariant: her editable yol yakalamada kaydedilir
+      // (varsa parmak izi, yoksa `{exists:false}`). Ulaşılmaz; yine de
+      // fail-closed (snapshot eksik = güvenli temsil imkânsız).
+      throw new WorkspaceError(
+        "workspace_operation_failed",
+        "The captured editable base could not be represented safely",
+      );
+    }
+    if (!fingerprint.exists) {
+      return { exists: false };
+    }
+    if (fingerprint.type === "file") {
+      const bytes = this.validationBase.editableContent.get(canonical);
+      if (bytes === undefined) {
+        throw new WorkspaceError(
+          "workspace_operation_failed",
+          "The captured editable base could not be represented safely",
+        );
+      }
+      // Parmak izi modu git ölçeğindedir: `"100644"` / `"100755"`.
+      return {
+        exists: true,
+        type: "file",
+        mode: fingerprint.mode === "100755" ? "100755" : "100644",
+        content: Buffer.from(bytes), // savunmacı kopya
+      };
+    }
+    if (fingerprint.type === "symlink") {
+      const bytes = this.validationBase.editableContent.get(canonical);
+      if (bytes === undefined) {
+        throw new WorkspaceError(
+          "workspace_operation_failed",
+          "The captured editable base could not be represented safely",
+        );
+      }
+      return { exists: true, type: "symlink", mode: "120000", target: bytes.toString("utf8") };
+    }
+    return { exists: true, type: fingerprint.type, mode: fingerprint.mode };
   }
 
   // ── public API ────────────────────────────────────────────────────────────
@@ -1091,22 +1161,6 @@ async function copySelectedUntrackedFile(
 }
 
 /**
- * Seçilen sembolik bağlantının hedefi repository İÇİNDE kalıyor mu?
- * (spec 50: mutlak dış hedefler host dosyalarını okuma/taşıma kanalı olamaz.)
- * Hedef zincir çözülebildiyse `realpath`, çözülmezse (kırık link)
- * sözdizimsel çözüm kullanılır; ikisi de kök dışına düşüyorsa red.
- */
-async function symlinkTargetStaysInside(repoRoot: string, linkAbs: string, target: string): Promise<boolean> {
-  const lexical = path.isAbsolute(target) ? path.resolve(target) : path.resolve(path.dirname(linkAbs), target);
-  try {
-    const resolved = await realpath(lexical);
-    return isPathInsideOrEqual(repoRoot, resolved);
-  } catch {
-    return isPathInsideOrEqual(repoRoot, lexical);
-  }
-}
-
-/**
  * v1 politikası (fail-closed, PR #24 Fix 3 + audit F-6): verilen git kökü
  * (`gitRoot`) altındaki tracked yollar + ek yollar arasında herhangi biri
  * bir DIŞ Git filter'ı (`filter.<driver>.clean/smudge/process`)
@@ -1716,6 +1770,9 @@ async function captureBase(
     if (entry === undefined) {
       // Base ağacında yok (ana working-tree'de de olmayan seçili yol).
       fingerprints.set(canonical, { exists: false });
+      if (editable.has(canonical)) {
+        editableFingerprints.set(canonical, { exists: false });
+      }
       continue;
     }
 

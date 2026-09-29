@@ -1,9 +1,10 @@
 /**
- * Step 6: `SplashTaskService` entegrasyon testleri (spec 93-124).
+ * Step 6+7: `SplashTaskService` entegrasyon testleri (spec 93-124 + Step 7).
  *
  * Gerçeklik karışımı (spec 5/121): GERÇEK `InferenceCoordinator` + GERÇEK
- * `GitWorktreeWorkspace` (gerçek git, hermetic) + GERÇEK `WorkerContract` —
- * SADECE backend sahtedir (model çağrısı YOK; `run` scriptlenir).
+ * `ContextAssembler` + GERÇEK `GitWorktreeWorkspace` (gerçek git, hermetic)
+ * + GERÇEK `WorkerContract` — SADECE backend sahtedir (model çağrısı YOK;
+ * `run` + ölçüm yüzeyi scriptlenir).
  *
  * Her test kendi git repo + output fixture'ını kurar; teardown hepsini
  * kaldırır. Test sürecinin CWD'si test repo'suna bağlanır — asla testin
@@ -28,6 +29,7 @@ import {
   type InferenceRunOptions,
   type ReasoningEffort,
   type RuntimeInfo,
+  type TokenizeResult,
 } from "../dist/backend/InferenceBackend.js";
 import { BackendError } from "../dist/backend/errors.js";
 import { createGitWorktreeWorkspace } from "../dist/workspace/GitWorktreeWorkspace.js";
@@ -41,16 +43,15 @@ import { WorkerContractError, type WorkerResult } from "../dist/worker/result.js
 import {
   SplashTaskError,
   SplashTaskService,
-  SIMPLE_CONTEXT_WARNING,
-  type SplashTaskRequest,
   type SplashTaskServiceDeps,
 } from "../dist/task/SplashTaskService.js";
 import {
+  ContextAssembler,
   ABSENT_MARKER,
   BINARY_CONTENT_MARKER,
   SYMLINK_MARKER_PREFIX,
-} from "../dist/task/simpleContext.js";
-import { getSimpleContextIo, setSimpleContextIo } from "../dist/task/simpleContextIo.js";
+} from "../dist/context/ContextAssembler.js";
+import { ContextAssemblyError } from "../dist/context/types.js";
 import type { SplashConfig } from "../dist/config.js";
 import { randomUUID } from "node:crypto";
 
@@ -158,6 +159,11 @@ class FakeBackend implements InferenceBackend {
   maxActive = 0;
   runCalls: RunCall[] = [];
   refreshCount = 0;
+  /** `countPromptTokens` davranışı (varsayılan: 64K'a sığan küçük sayı). */
+  countBehavior: (messages: InferenceMessage[]) => number = () => 1_000;
+  countCalls: InferenceMessage[][] = [];
+  /** `tokenize` davranışı (pressure-files ipucu için; varsayılan 0). */
+  tokenizeBehavior: (content: string) => number = () => 0;
 
   get runtimeInfo(): RuntimeInfo | null {
     return this.#current;
@@ -186,14 +192,15 @@ class FakeBackend implements InferenceBackend {
     }
   }
 
-  async tokenize(): Promise<never> {
-    throw new Error("FakeBackend.tokenize must not be called in Step 6");
+  async tokenize(content: string): Promise<TokenizeResult> {
+    return { tokens: [], count: this.tokenizeBehavior(content) };
   }
   async renderPrompt(): Promise<never> {
-    throw new Error("FakeBackend.renderPrompt must not be called in Step 6");
+    throw new Error("FakeBackend.renderPrompt must not be called in Step 7");
   }
-  async countPromptTokens(): Promise<never> {
-    throw new Error("FakeBackend.countPromptTokens must not be called in Step 6");
+  async countPromptTokens(messages: InferenceMessage[]): Promise<number> {
+    this.countCalls.push([...messages]);
+    return this.countBehavior(messages);
   }
 }
 
@@ -252,7 +259,7 @@ async function makeHarness(
   const service = new SplashTaskService({
     config: fixture.config,
     coordinator,
-    capacity: backend,
+    contextAssembler: new ContextAssembler({ runtime: backend }),
     workerContract: new WorkerContract(),
     createWorkspace: (input) => createGitWorktreeWorkspace(input),
     newSessionId: overrides.newSessionId ?? randomUUID,
@@ -287,6 +294,7 @@ async function brokenDestroyWorkspace(input: WorkspaceCreateInput): Promise<Work
     sessionId: real.sessionId,
     editablePaths: real.editablePaths,
     base: real.base,
+    readBaseEntry: (p: string) => real.readBaseEntry(p),
     applyPatchSet: (result: WorkerResult) => real.applyPatchSet(result),
     resetToBase: () => real.resetToBase(),
     diff: (options) => real.diff(options),
@@ -353,6 +361,9 @@ test("93: end-to-end success — applied result, worktree written, MAIN CHECKOUT
     await new Promise((r) => setTimeout(r, 10));
     return { content: okWorkerJson(), usage: { inputTokens: 1_234, outputTokens: 567 } };
   };
+  // Tam preflight ölçüsü: `usage.in` (1_234) ile AYRI — telemetri dispatch
+  // öncesi kesin olmalı; runtime hakedişi ayrı gerçektir (spec 31/32).
+  h.backend.countBehavior = () => 777;
 
   const result = await h.service.executeTask({ task: "Change the value constant from 1 to 2", files: ["src/a.ts"] });
 
@@ -366,12 +377,12 @@ test("93: end-to-end success — applied result, worktree written, MAIN CHECKOUT
   assert.deepEqual(result.filesChanged, ["src/a.ts"]);
   assert.deepEqual(result.diffStats, { files: 1, insertions: 1, deletions: 1 });
   assert.deepEqual(result.validation, { editsRequested: 1, editsApplied: 1, rejected: [] });
-  assert.deepEqual(result.warnings, [SIMPLE_CONTEXT_WARNING]);
+  assert.deepEqual(result.warnings, []);
   assert.deepEqual(result.usage, { in: 1_234, out: 567 });
   assert.equal(result.context.runtimeMaxTokens, 128_000); // backend'in yetkili tavanı
-  assert.equal(result.context.inputTokens, 1_234);
+  assert.equal(result.context.inputTokens, 777); // TAM preflight ölçüsü — usage.in (1_234) ASLA değil
   assert.equal(result.context.outputReserveTokens, 32_768); // config.minOutputReserve
-  assert.equal(result.context.selectedContextTier, "runtime_max");
+  assert.equal(result.context.selectedContextTier, "64k"); // 65536'ya sığdı; 128K'a KALKMADI (inflation YOK)
   assert.equal(result.context.truncatedReadonlyContext, false);
   assert.ok(!("inference" in result) && !("splitHint" in result) && !("staleFiles" in result));
 
@@ -392,6 +403,7 @@ test("93: end-to-end success — applied result, worktree written, MAIN CHECKOUT
   // Tek dispatch; seçenekler (spec 34):
   assert.equal(h.backend.runCalls.length, 1);
   assert.equal(h.backend.runCalls[0]?.options?.maxOutputTokens, 32_768);
+  assert.equal(h.backend.runCalls[0]?.options?.contextTier, 65_536); // seçilen kade metadata'sı
   assert.equal(h.backend.runCalls[0]?.options?.reasoningEffort, undefined); // verilmedi → YOK
 
   // Bağlam: exact taban içeriği + seçili DEĞİL dosya GİRMEDİ (spec 18/21):
@@ -488,6 +500,7 @@ test("10: non-git project root → invalid_repository; no session, no dispatch",
   const service = new SplashTaskService({
     config: { ...h.fixture.config, repoRoot: notGit },
     coordinator: h.coordinator,
+    contextAssembler: new ContextAssembler({ runtime: h.backend }),
     processCwd: () => notGit,
   });
   await assert.rejects(
@@ -510,6 +523,7 @@ test("102: outputRoot == repoRoot → output_root_unsafe BEFORE any mkdir", asyn
           scanner: cleanScanner(),
           lock: h.lock,
         }),
+        contextAssembler: new ContextAssembler({ runtime: h.backend }),
         processCwd: () => h.fixture.repoRoot,
       });
       return service.executeTask({ task: "Anything", files: [] });
@@ -533,6 +547,7 @@ test("102: outputRoot INSIDE repo → output_root_unsafe (no sessions dir in rep
       scanner: cleanScanner(),
       lock: h.lock,
     }),
+    contextAssembler: new ContextAssembler({ runtime: h.backend }),
     processCwd: () => h.fixture.repoRoot,
   });
   await assert.rejects(
@@ -550,7 +565,7 @@ test("102: repo inside outputRoot (reverse) is ACCEPTED — sessions/workspace s
   const service = new SplashTaskService({
     config: { ...h.fixture.config, outputRoot: h.fixture.root },
     coordinator: h.coordinator,
-    capacity: h.backend,
+    contextAssembler: new ContextAssembler({ runtime: h.backend }),
     processCwd: () => h.fixture.repoRoot,
   });
   h.backend.runBehavior = async () => ({ content: okWorkerJson(), usage: { inputTokens: 1, outputTokens: 1 } });
@@ -666,6 +681,12 @@ test("36/66: external runtime (mlx) → inference_busy; workspace retained; back
   assert.equal(result.inference?.conflict, "mlx");
   assert.equal(result.baseStatus, "fresh");
   assert.deepEqual(result.usage, { in: 0, out: 0 });
+  // Bağlam telemetrisi dispatch ÖNCESİ (assembler) tamamlandı — bütçe seçimi
+  // busy sonuçta da raporlanır (spec 37):
+  assert.equal(result.context.runtimeMaxTokens, 128_000);
+  assert.equal(result.context.inputTokens, 0); // model çağrılmadı
+  assert.equal(result.context.outputReserveTokens, 32_768);
+  assert.equal(result.context.selectedContextTier, "64k");
   assert.deepEqual(result.filesChanged, []);
   assert.equal(result.validation.editsRequested, 0);
   assert.ok(result.summary.length > 0);
@@ -807,7 +828,7 @@ test("74: cleanup failure surfaces as safe task_cleanup_failed (no false 'clean'
   const service = new SplashTaskService({
     config: h.fixture.config,
     coordinator: h.coordinator,
-    capacity: h.backend,
+    contextAssembler: new ContextAssembler({ runtime: h.backend }),
     createWorkspace: brokenDestroyWorkspace,
     processCwd: () => h.fixture.repoRoot,
     newSessionId: () => "cleanup-fail",
@@ -832,10 +853,11 @@ test("35: pre-aborted MCP signal → CoordinatorError(aborted) + cleanup; backen
   const controller = new AbortController();
   controller.abort("client cancelled"); // dispatch'ten ÖNCE iptal
 
+  // Step 7: iptal sinyali ÖNCE assembler'ın `refreshRuntimeInfo`'una düşer —
+  // tip'li backend hatası (network/aborted) aynen yayılır; dispatch'a inilmez.
   await assert.rejects(
     h.service.executeTask({ task: "Anything", files: ["src/a.ts"], signal: controller.signal }),
-    (err: unknown) =>
-      err instanceof Error && err.name === "CoordinatorError" && (err as { kind?: string }).kind === "aborted",
+    (err: unknown) => err instanceof BackendError && err.kind === "network",
   );
   // İptal edilmiş istek: workspace imha + boş dizin temizliği; kayıt defteri boş:
   assert.equal(h.service.activeTasks().length, 0);
@@ -1026,55 +1048,169 @@ test("69: multi-task shutdown — A cleanup fails, B cleanup succeeds; BOTH atte
   assert.equal(h.service.activeTasks().length, 0);
 });
 
-test("21/22: lstat EACCES (fault-injected) on a selected path → workspace_operation_failed; no inference; no ABSENT; cleanup", async (t) => {
-  const h = await makeHarness(t, { newSessionId: () => "lstat-eacces" });
-  const real = getSimpleContextIo();
-  setSimpleContextIo({
-    lstat: async () => {
-      throw Object.assign(new Error("EACCES (fault-injected)"), { code: "EACCES" });
+test("32: context assembly fails (fault-injected) → typed error propagates; no inference; cleanup", async (t) => {
+  // Step 7: bağlam artık ContextAssembler'da — fs arıza sınıflandırması
+  // (ENOENT ≠ EACCES/...) o modülün testlerinde (`context-assembler.test.ts`);
+  // servis katmanı burada yalnız TÜP'li hatanın yayılım + temizlik yolunu
+  // doğrular: bağlam kurulamazsa inference'a ASLA inilmez.
+  const h = await makeHarness(t, {
+    newSessionId: () => "assembly-fail",
+    contextAssembler: {
+      async assemble() {
+        throw new ContextAssemblyError("assembly_failed", "Measuring the prompt failed", {
+          cause: Object.assign(new Error("EACCES (fault-injected)"), { code: "EACCES" }),
+        });
+      },
     },
-    readlink: (p) => real.readlink(p),
-    readFile: (p) => real.readFile(p),
   });
-  t.after(() => setSimpleContextIo(null));
   h.backend.runBehavior = async () => {
     throw new Error("inference must NOT run when the context cannot be built");
+  };
+
+  const err = await h.service
+    .executeTask({ task: "Anything", files: ["src/a.ts"] })
+    .then(() => {
+      throw new Error("unreachable");
+    })
+    .catch((e: unknown) => e);
+  assert.ok(err instanceof ContextAssemblyError && err.kind === "assembly_failed");
+  // `cause` (fs errno) kamu yüzeyine taşınmaz — mesaj SABİТtir:
+  assert.ok(!String(err.message).includes("EACCES"));
+  // Bağlam kurulamadı → dispatch YOK:
+  assert.equal(h.backend.runCalls.length, 0);
+  // Temizlik: kayıt defteri boş + session dizini gitti (spec 73):
+  assert.equal(h.service.activeTasks().length, 0);
+  assert.ok(!(await pathExists(path.join(h.sessionsDir, "assembly-fail"))));
+});
+
+test("32: unsafe read-only path (fault-injected) → ContextAssemblyError(unsafe_path); cleanup", async (t) => {
+  const h = await makeHarness(t, {
+    newSessionId: () => "unsafe-ctx",
+    contextAssembler: {
+      async assemble() {
+        throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
+      },
+    },
+  });
+  h.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run when the context is unsafe");
   };
 
   await assert.rejects(
     h.service.executeTask({ task: "Anything", files: ["src/a.ts"] }),
-    (err: unknown) => err instanceof WorkspaceError && err.kind === "workspace_operation_failed",
+    (err: unknown) => err instanceof ContextAssemblyError && err.kind === "unsafe_path",
   );
-  // Bağlam kurulamadı → mesaj/dispatch YOK (ABSENT marker model'e gitmedi):
   assert.equal(h.backend.runCalls.length, 0);
-  // Temizlik: kayıt defteri boş + session dizini gitti:
   assert.equal(h.service.activeTasks().length, 0);
-  assert.ok(!(await pathExists(path.join(h.sessionsDir, "lstat-eacces"))));
+  assert.ok(!(await pathExists(path.join(h.sessionsDir, "unsafe-ctx"))));
 });
 
-test("23: readlink EIO (fault-injected) on a selected symlink → workspace_operation_failed; no fabricated target", async (t) => {
-  const h = await makeHarness(t, { newSessionId: () => "readlink-eio" });
-  await symlink("a.ts", path.join(h.fixture.repoRoot, "src/link.ts"));
-  git(h.fixture.repoRoot, "add", "-A");
-  git(h.fixture.repoRoot, "commit", "-m", "symlink");
-  const real = getSimpleContextIo();
-  setSimpleContextIo({
-    lstat: (p) => real.lstat(p),
-    readlink: async () => {
-      throw Object.assign(new Error("EIO (fault-injected)"), { code: "EIO" });
-    },
-    readFile: (p) => real.readFile(p),
-  });
-  t.after(() => setSimpleContextIo(null));
+// ── Step 7: bağlam katmanı (assembler) uçtan uca ────────────────────────────
+
+test("32: required context + reserve > runtime max → needs_split; no model call; workspace RETAINED", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "split-1" });
+  // required(100_000) + min pay(32_768) > runtime max(128_000): sığmaz.
+  h.backend.countBehavior = () => 100_000;
+  h.backend.tokenizeBehavior = () => 42; // pressure ipucu: içerik YOK, sayı var
   h.backend.runBehavior = async () => {
-    throw new Error("inference must NOT run when the context cannot be built");
+    throw new Error("inference must NOT run for needs_split");
+  };
+
+  const result = await h.service.executeTask({ task: "Touch everything", files: ["src/a.ts"] });
+
+  assert.equal(result.status, "needs_split"); // NORMAL compact sonuç — hata DEĞİL (spec 32)
+  assert.equal(result.baseStatus, "fresh");
+  assert.equal(result.rulesSource, "none");
+  assert.equal(result.round, 1);
+  assert.deepEqual(result.usage, { in: 0, out: 0 }); // model çağrılmadı
+  assert.deepEqual(result.filesChanged, []);
+  assert.deepEqual(result.diffStats, { files: 0, insertions: 0, deletions: 0 });
+  assert.deepEqual(result.validation, { editsRequested: 0, editsApplied: 0, rejected: [] });
+  assert.ok(result.warnings.length > 0); // SABİТ needs_split uyarısı (kaynak içerik YOK)
+  for (const warning of result.warnings) {
+    assert.ok(!warning.includes("src/"), "uyarı yol taşımaz");
+  }
+  // Telemetri + split ipucı (kaynak içerik YOK — yalnız sayılar + yol adları):
+  assert.equal(result.context.runtimeMaxTokens, 128_000);
+  assert.equal(result.context.inputTokens, 0);
+  assert.equal(result.context.outputReserveTokens, 32_768);
+  assert.equal(result.context.selectedContextTier, "runtime_max");
+  assert.ok("splitHint" in result);
+  if ("splitHint" in result) {
+    assert.equal(result.splitHint.requiredInputTokens, 100_000);
+    assert.equal(result.splitHint.availableMaxTokens, 128_000);
+    assert.equal(result.splitHint.outputReserveTokens, 32_768);
+    assert.deepEqual(result.splitHint.pressureFiles, ["src/a.ts"]);
+  }
+  // Model çağrılmadı (dispatch YOK):
+  assert.equal(h.backend.runCalls.length, 0);
+  // Workspace KORUNDU (Step 9 refine/close kullanabilir) — imha YOK:
+  assert.equal(h.service.activeTasks().length, 1);
+  assert.ok(await pathExists(path.join(h.sessionsDir, "split-1", "workspace")));
+});
+
+test("31: explicit context tier above the runtime maximum → invalid_input + workspace destroyed", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "tier-over" });
+  h.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run for an invalid tier");
   };
 
   await assert.rejects(
-    h.service.executeTask({ task: "Inspect the link", files: ["src/link.ts"] }),
-    (err: unknown) => err instanceof WorkspaceError && err.kind === "workspace_operation_failed",
+    h.service.executeTask({ task: "Anything", files: ["src/a.ts"], contextTier: 131_072 }),
+    (err: unknown) => err instanceof SplashTaskError && err.kind === "invalid_input",
   );
-  // Model hiçbir (icat edilmiş) hedef metni/placeholder göremedi — dispatch YOK:
-  assert.equal(h.backend.runCalls.length, 0);
+  // Sonuç korunamadı → workspace imha + session dizini temiz; dispatch YOK:
   assert.equal(h.service.activeTasks().length, 0);
+  assert.ok(!(await pathExists(path.join(h.sessionsDir, "tier-over"))));
+  assert.equal(h.backend.runCalls.length, 0);
+});
+
+test("31: explicit output reserve below the configured minimum → invalid_input BEFORE workspace", async (t) => {
+  const h = await makeHarness(t);
+  await assert.rejects(
+    h.service.executeTask({ task: "Anything", files: ["src/a.ts"], outputReserveTokens: 1_000 }),
+    (err: unknown) => err instanceof SplashTaskError && err.kind === "invalid_input",
+  );
+  // Bütçe ön-doğrulanır: session dizini bile OLUŞMAZ (spec 13 sıralaması):
+  assert.ok(!(await pathExists(h.sessionsDir)));
+  assert.equal(h.backend.runCalls.length, 0);
+});
+
+test("31: explicit output reserve accepted → negotiated budget + dispatch metadata", async (t) => {
+  const h = await makeHarness(t);
+  h.backend.runBehavior = async () => ({
+    content: okWorkerJson(),
+    usage: { inputTokens: 999, outputTokens: 11 },
+  });
+
+  const result = await h.service.executeTask({
+    task: "Change the value",
+    files: ["src/a.ts"],
+    outputReserveTokens: 40_000,
+  });
+  assert.equal(result.status, "applied");
+  assert.equal(result.context.outputReserveTokens, 40_000); // açık pay müzakere YOK
+  // Kademe yine adaptif (64K'a sığan 128K'a KALKMAZ):
+  assert.equal(result.context.selectedContextTier, "64k");
+  assert.equal(h.backend.runCalls[0]?.options?.maxOutputTokens, 40_000);
+});
+
+test("26: secret in the task → redacted before the worker sees it; warning; never on the wire", async (t) => {
+  const h = await makeHarness(t);
+  h.backend.runBehavior = async () => ({
+    content: workerJson({ summary: "Done.", edits: [] }),
+    usage: { inputTokens: 10, outputTokens: 5 },
+  });
+  const rawSecret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+  const task = `Rotate the credential. Current: ${rawSecret}`;
+
+  const result = await h.service.executeTask({ task, files: ["src/a.ts"] });
+  assert.equal(result.status, "applied");
+  assert.ok(result.warnings.length > 0, "redaksiyon uyarısı raporlanmalı");
+  for (const warning of result.warnings) {
+    assert.ok(!warning.includes(rawSecret), "uyarı secret taşımaz");
+  }
+  const userMessage = h.backend.runCalls[0]?.messages.find((m) => m.role === "user")?.content ?? "";
+  assert.ok(!userMessage.includes(rawSecret), "ham secret model'e ASLA gitmez");
+  assert.ok(userMessage.includes("[REDACTED_SECRET]"), "redakte placeholder yerini alır");
 });

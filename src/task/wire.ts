@@ -8,8 +8,8 @@
  *    KULLANILMAZ (camelCase sızdırırdı); her alan açıkça eşlenir.
  *    Koşullu alanlar (DESIGN §3) YALNIZCA anlamlı olduğunda çıkar:
  *      - `inference`  → yalnız `status == "inference_busy"`
- *      - `split_hint` → yalnız `status == "needs_split"`   (Step 6 üretmez)
- *      - `stale_files`→ yalnız `base_status == "stale"`    (Step 6 üretmez)
+ *      - `split_hint` → yalnız `status == "needs_split"`   (Step 7 üretir)
+ *      - `stale_files`→ yalnız `base_status == "stale"`    (Step 9 üretir)
  *    `null` ile boşta bırakılmaz — BİTTİ (omit) edilir.
  *
  * 2. `serializeToolError` — bilinen tip'li hatalar → güvenli metadata
@@ -22,6 +22,7 @@
 
 import { BackendError } from "../backend/errors.js";
 import { CoordinatorError } from "../backend/InferenceCoordinator.js";
+import { ContextAssemblyError } from "../context/types.js";
 import { WorkspaceError } from "../workspace/Workspace.js";
 import { WorkerContractError, type CompactResult } from "../worker/result.js";
 import { SplashTaskError } from "./SplashTaskService.js";
@@ -56,6 +57,9 @@ export function serializeToolError(err: unknown): ToolErrorWire {
     return { kind: err.kind, message: err.message };
   }
   if (err instanceof WorkerContractError) {
+    return { kind: err.kind, message: err.message };
+  }
+  if (err instanceof ContextAssemblyError) {
     return { kind: err.kind, message: err.message };
   }
   if (err instanceof SplashTaskError) {
@@ -111,8 +115,8 @@ export function serializeCompactResult(result: CompactResult): Record<string, un
     wire.inference = { conflict: result.inference.conflict };
   }
   if (result.status === "needs_split") {
-    // Step 6 bu durumu üretmez (tam bütçe ölçümü yok); serileştirici
-    // DESIGN vocabulary'sini genel olarak korur.
+    // Step 7 (Context Assembler) bu durumu üretir: zorunlu bağlam tavana
+    // sığmadı — `split_hint` kaynak içerik taşımaz, yalnız sayılar + yol adları.
     wire.split_hint = {
       required_input_tokens: result.splitHint.requiredInputTokens,
       available_max_tokens: result.splitHint.availableMaxTokens,

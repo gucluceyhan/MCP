@@ -1,26 +1,32 @@
 /**
- * Step 6: `splash_task` orkestrasyonu (DESIGN.md §3/7, 11 madde 6) —
- * İlk gerçek Splash delege loop'u:
+ * Step 6+7: `splash_task` orkestrasyonu (DESIGN.md §3/5/7, 11 madde 6-7) —
+ * Gerçek Splash delege loop'u:
  *
- *   task → repo keşfi → izole worktree → basit bağlam → worker mesajları →
+ *   task → repo keşfi → izole worktree → bağlam (assembler: redaksiyon +
+ *   tam ölçü + adaptif kademe/pay + azaltma) → worker mesajları →
  *   inference (koordinator) → strict parse → workspace uygulaması → compact
  *
  * SORUMLULUK SINIRI (spec 2): BU ADIM SADECE ORKESTRASYONDUR.
  * - İkinci bir Workspace Manager DEĞİLDİR — `Workspace` sözleşmesini tüketir.
  * - İkinci bir Inference Coordinator DEĞİLDİR — sürece tek coordinator var;
  *   TÜM inference `coordinator.dispatch()` üzerinden (asla `backend.run`).
- * - Context Assembler DEĞİLDİR — Step 7'ye kadar geçici basit bağlam
- *   (`simpleContext.ts`) yeter.
+ * - Context Assembler DEĞİLDİR — sürece tek assembler var; bağlamı
+ *   `contextAssembler.assemble()` üzerinden kurar (Step 7); kendi ölçüm /
+ *   redaksiyon / bütçe mantığı YOK.
  * - Session Manager DEĞİLDİR — Step 9'a kadar asgari in-memory
  *   active-task kayıt defteri (spec 64); disk kalıcılığı YOK.
  *
- * Güvenlik invariantları (spec 10, 13, 16, 73, 74, 75, 79, 84, 85):
+ * Güvenlik invariantları (spec 10, 13, 16, 26-36, 73, 74, 75, 79, 84, 85):
  * - Keşif hata verirse: workspace/oturum/infans YOK — güvenli tip'li hata.
  * - `outputRoot` repository DIŞINDA doğrulanır — session mkdir'ından ÖNCE.
  * - Worker kaynak değişimleri ASLA ana checkout'a yazılmaz (workspace'in
  *   kendi garantisi; bu adım yalnızca worktree administrative metadata'sına
  *   izin verilen tek istisnayı taşır).
  * - Tek görev çağrısı ≤ TEK coordinator dispatch (retry/düzeltme infansı YOK).
+ * - `context.input_tokens` = assembler'ın TAM preflight ölçüsüdür —
+ *   `usage.inputTokens` (runtime'un kendi sayımı) ASLA değildir.
+ * - `needs_split` normal compact SONUCtur (MCP hatası değil): model
+ *   çağrılmaz, workspace KORUNUR (Step 9 refine/close kullanabilir).
  * - Konstrüksiyon hiçbir dosya sistemi / HTTP işlemi yapmaz; session dizini
  *   yalnız `executeTask` içinde, doğrulardan sonra açılır.
  */
@@ -36,14 +42,11 @@ import {
   type InferenceConflict,
 } from "../backend/InferenceCoordinator.js";
 import type {
-  InferenceMessage,
   InferenceRunOptions,
   InferenceUsage,
   ReasoningEffort,
-  RuntimeInfo,
 } from "../backend/InferenceBackend.js";
 import { WorkerContract } from "../worker/WorkerContract.js";
-import type { WorkerPromptInput } from "../worker/WorkerContract.js";
 import {
   WorkerContractError,
   type CompactContextMetadata,
@@ -56,12 +59,18 @@ import { discoverRepoRoot } from "../workspace/git.js";
 import { canonicalizeOutside, isSafeSessionId } from "../workspace/pathSafety.js";
 import { WorkspaceError, type Workspace, type WorkspaceCreateInput } from "../workspace/Workspace.js";
 import { createGitWorktreeWorkspace } from "../workspace/GitWorktreeWorkspace.js";
-import { buildSimpleEditableContext } from "./simpleContext.js";
+import { labelForTier } from "../context/ContextAssembler.js";
+import { redactText } from "../context/redact.js";
+import {
+  ContextAssemblyError,
+  type AssembledContext,
+  type ContextAssemblyInput,
+} from "../context/types.js";
 
 // ── Tip'li görev katmanı hatası (güvenli mesaj; payload YOK) ────────────────
 
 export type SplashTaskErrorKind =
-  /** Görev girdi sözleşmesine uymuyor (task/files) — MCP şemasının derin savunması. */
+  /** Görev girdi sözleşmesine uymuyor (task/files/override'lar) — MCP şemasının derin savunması. */
   | "invalid_input"
   /**
    * Yapılandırılmış outputRoot, repository ile çelişiyor: `outputRoot ==
@@ -92,27 +101,26 @@ export class SplashTaskError extends Error {
 }
 
 /**
- * Step 6'nın sabit (constant) uyarısı (spec 26/52): bağlam katmanı
- * bilinçli olarak eksik. KISA ve SABIТtir; kaynak içeriği, yol, secret adı
- * ya da runtime komutu taşımaz. Step 7/8 tamamlanınca kaldırılır.
+ * `needs_split` turunun SABİТ compact özeti (spec 26/52): kaynak içerik,
+ * dosya, secret, yol YOK — yalnız durum.
  */
-export const SIMPLE_CONTEXT_WARNING =
-  "Simple context mode: adaptive budgeting, redaction, and project rules are not active yet.";
+const NEEDS_SPLIT_SUMMARY =
+  "The required context exceeds the context budget; the task was not started. Split the task into smaller file groups.";
 
 // ── Bağımlılık yüzeyi (küçük DI nesnesi; service locator YOK) ────────────────
 
 /**
- * Salt-okunur kapasite görünümü: yalnız `runtimeInfo` okunur.
- * Servis backend'in İŞLEMLERİNİ (run/refresh/tokenize/...) ASLA çağrıamaz —
- * tüm üretim (generation) coordinator dispatch'inden geçer (spec 4/30).
- * Üretime `OpenAICompatBackend` bu arayüzü yapısal olarak sağlar.
+ * Context Assembler görünümü: yalnız `assemble`. Üretime süreç-tek
+ * `ContextAssembler` (Step 7) bu arayüzü yapısal olarak sağlar; testler
+ * instrument edilmiş bir assembler enjekte edebilir. Service BAĞLAMI
+ * kendisi KURMAZ — yalnız kurucu + tüketici orkestrasyondur.
  */
-export interface RuntimeCapacityReader {
-  readonly runtimeInfo: RuntimeInfo | null;
+export interface ContextAssemblerLike {
+  assemble(input: ContextAssemblyInput): Promise<AssembledContext>;
 }
 
 /**
- * Koordinatör görünümü: yalnız `dispatch`. Üretimde süreç-tek
+ * Koordinatör görünümü: yalnız `dispatch`. Üretime süreç-tek
  * `InferenceCoordinator` bu arayüzü yapısal olarak sağlar; testler
  * instrument edilmiş bir coordinator enjekte edebilir (spec 5/121).
  */
@@ -120,9 +128,8 @@ export interface CoordinatorLike {
   dispatch(request: CoordinatedInferenceRequest): Promise<CoordinatedInferenceResult>;
 }
 
-/** Worker Contract görünümü: mesaj inşası + strict çıktı parseı (saf). */
+/** Worker Contract görünümü: strict çıktı parseı (saf; mesaj inşası Step 7'de assembler'da). */
 export interface WorkerContractLike {
-  buildMessages(input: WorkerPromptInput): InferenceMessage[];
   parseResult(raw: string): WorkerResult;
 }
 
@@ -133,15 +140,18 @@ export interface WorkerContractLike {
 export type WorkspaceFactory = (input: WorkspaceCreateInput) => Promise<Workspace>;
 
 export interface SplashTaskServiceDeps {
-  /** Ortamdan yüklenmiş yapılandırma (outputRoot, repoRoot, context payı). */
+  /** Ortamdan yüklenmiş yapılandırma (outputRoot, repoRoot, context bütçesi). */
   config: SplashConfig;
   /**
    * Sürecin TEK Inference Coordinator'ı (spec 4) — tüm `splash_task`
    * çağrıları bu instance'ı paylaşır; istek başına coordinator YOK.
    */
   coordinator: CoordinatorLike;
-  /** Salt-okunur kapasite görünümü (compact `runtime_max_tokens` için). */
-  capacity?: RuntimeCapacityReader;
+  /**
+   * Sürecin TEK Context Assembler'ı (Step 7) — tüm çağrılar bu instance'ı
+   * paylaşır; istek başına assembler YOK.
+   */
+  contextAssembler: ContextAssemblerLike;
   workerContract?: WorkerContractLike;
   createWorkspace?: WorkspaceFactory;
   /** Kriptografik oturum kimliği (varsayılan: `crypto.randomUUID`). */
@@ -152,10 +162,20 @@ export interface SplashTaskServiceDeps {
 
 /** Bir `splash_task` çağrısının girdisi (MCP katmanı şema doğruladı). */
 export interface SplashTaskRequest {
-  /** Orijinal görev metni — worker'a AYNEN gider (trim yalnız boşluk denetimi). */
+  /** Orijinal görev metni — assembler redakte eder; worker'a redakte EDİLMİŞ form gider. */
   task: string;
   /** Repository-göreceli düzenlenebilir yollar; boş dizi geçerli (create-only). */
   files: readonly string[];
+  /**
+   * Açık bağlam kademesi (token) — VERİLMEDİSE adaptif seçim. Kullanıcı
+   * vermediyse dispatch seçeneklerinde TAMAMEN YOK (spec 34).
+   */
+  contextTier?: number;
+  /**
+   * Açık çıkış payı (token; config minimumunun altı olamaz) — VERİLMEDİSE
+   * adaptif müzakere (preferred/min).
+   */
+  outputReserveTokens?: number;
   /** Kullanıcı vermediyse dispatch seçeneklerinde TAMAMEN YOK (spec 34). */
   reasoningEffort?: ReasoningEffort;
   /** MCP SDK'nın istek sinyali → coordinator `options.signal`'a (spec 35). */
@@ -178,7 +198,7 @@ export interface ActiveTask {
 export class SplashTaskService {
   #config: SplashConfig;
   #coordinator: CoordinatorLike;
-  #capacity: RuntimeCapacityReader | undefined;
+  #contextAssembler: ContextAssemblerLike;
   #workerContract: WorkerContractLike;
   #createWorkspace: WorkspaceFactory;
   #newSessionId: () => string;
@@ -199,7 +219,7 @@ export class SplashTaskService {
   constructor(deps: SplashTaskServiceDeps) {
     this.#config = deps.config;
     this.#coordinator = deps.coordinator;
-    this.#capacity = deps.capacity;
+    this.#contextAssembler = deps.contextAssembler;
     this.#workerContract = deps.workerContract ?? new WorkerContract();
     this.#createWorkspace = deps.createWorkspace ?? ((input) => createGitWorktreeWorkspace(input));
     this.#newSessionId = deps.newSessionId ?? (() => randomUUID());
@@ -228,16 +248,18 @@ export class SplashTaskService {
    *   KENDİ beklenen (await'lenen) temizliğinden geçer — orfan workspace
    *   YOK, fire-and-forget YOK.
    *
-   * Başarıda: `CompactResult` (durum applied/partial/failed/inference_busy —
-   * hepsi NORMAL sonuç; `failed`/`inference_busy` hata DEĞİLdir).
-   * Ara hatada (keşif/outputRoot/oluşum/parse/apply/koordinator): tip'li
-   * hata YAYILIR — `inference_busy` HARİCİ tüm yollarda oluşturulan
-   * workspace imha edilir, boş session dizini `rmdir` ile temizlenir.
+   * Başarıda: `CompactResult` (durum applied/partial/failed/needs_split/
+   * inference_busy — hepsi NORMAL sonuç; `failed`/`needs_split`/
+   * `inference_busy` hata DEĞİLdir).
+   * Ara hatada (keşif/outputRoot/oluşum/bağlam/parse/apply/koordinator):
+   * tip'li hata YAYILIR — `inference_busy` + `needs_split` HARİCİ tüm
+   * yollarda oluşturulan workspace imha edilir, boş session dizini `rmdir`
+   * ile temizlenir.
    *
    * SIRA (güvenlik sıralaması — spec 13):
-   *   girdi → repo keşfi → outputRoot containment → session ID →
-   *   kayıt çakışması → session mkdir → worktree → bağlam → mesaj →
-   *   dispatch → parse → apply → kayıt.
+   *   girdi (task/files/override'lar) → repo keşfi → outputRoot containment
+   *   → session ID → kayıt çakışması → session mkdir → worktree →
+   *   bağlam (assembler) → [needs_split?] → dispatch → parse → apply → kayıt.
    */
   async executeTask(request: SplashTaskRequest): Promise<CompactResult> {
     if (this.#disposed) {
@@ -262,6 +284,24 @@ export class SplashTaskService {
     }
     if (!Array.isArray(request.files) || request.files.some((file) => typeof file !== "string")) {
       throw new SplashTaskError("invalid_input", "The files must be an array of strings");
+    }
+    // Bağlam override'ları workspace OLUŞTURULMADAN ÖNCE doğrulanır (spec 13):
+    // geçersiz bir bütçe istek çalışacak bir worktree açmamalı.
+    const minReserve = this.#config.context.minOutputReserve;
+    if (
+      request.outputReserveTokens !== undefined &&
+      (!Number.isInteger(request.outputReserveTokens) || request.outputReserveTokens < minReserve)
+    ) {
+      throw new SplashTaskError(
+        "invalid_input",
+        "The output reserve must be an integer no smaller than the minimum reserve",
+      );
+    }
+    if (
+      request.contextTier !== undefined &&
+      (!Number.isInteger(request.contextTier) || request.contextTier <= 0)
+    ) {
+      throw new SplashTaskError("invalid_input", "The context tier must be a positive integer");
     }
 
     // ── repository keşfi (spec 9/10) — henüz hiçbir yazma YOK ─────────────
@@ -334,21 +374,41 @@ export class SplashTaskService {
     }
 
     try {
-      // ── basit bağlam (spec 17-25) — workspace'ten, kanonik yollardan ────
-      const context = await buildSimpleEditableContext(workspace.workspaceDir, workspace.editablePaths);
-
-      // ── worker mesajları (spec 33) — sözleşme WorkerContract'ta ─────────
-      const messages = this.#workerContract.buildMessages({
+      // ── bağlam (spec 17-32, Step 7) — süreç-tek assembler ───────────────
+      // Assembler: redaksiyon + immutable taban + tam ölçü + adaptif
+      // kademe/pay + salt-okunur azaltma. Production v1: salt-okunur
+      // referans YOK (`readonlyPaths: []` — spec 86); kurallar (Step 8)
+      // YOK; geçmiş (Step 9) BOŞ.
+      const assembly = await this.#contextAssembler.assemble({
         task: request.task,
-        rules: undefined, // Step 8 kuralları yükler; Step 6: YOK (spec 27)
-        context,
-        history: [], // Step 9 rafine geçmişini getirir; Step 6: BOŞ (spec 28)
-        outputReserveTokens: this.#config.context.minOutputReserve, // spec 29
+        workspace,
+        readonlyPaths: [],
+        rules: undefined, // Step 8 kuralları yükler; Step 7: YOK (spec 27)
+        history: [], // Step 9 rafine geçmişini getirir; Step 7: BOŞ (spec 28)
+        tiers: this.#config.context.tiers,
+        minOutputReserve: this.#config.context.minOutputReserve,
+        preferredOutputReserve: this.#config.context.preferredOutputReserve,
+        contextTier: request.contextTier,
+        outputReserveTokens: request.outputReserveTokens,
+        reasoningEffort: request.reasoningEffort,
+        signal: request.signal,
       });
 
+      // ── needs_split (spec 32): NORMAL compact sonuç — model çağrılmaz, ──
+      //    BİLEŞTİRİLMEZ, KISILMAZ; workspace KORUNUR (Step 9'da
+      //    refine/close onu kullanabilir) — inference'a inmez.
+      if (assembly.status === "needs_split") {
+        const result = this.#needsSplitResult(sessionId, assembly);
+        await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
+        return result;
+      }
+
       // ── inference (spec 34) — süreç-tek coordinator, TAM AMIR tek dispatch ─
+      // `assembly.messages` ölçülen mesajların KENDİSİ — dispatch byte-bayt
+      // aynen taşır (yeniden derleme/ölçüm YOK; spec 30/32 invariantı).
       const runOptions: InferenceRunOptions = {
-        maxOutputTokens: this.#config.context.minOutputReserve,
+        maxOutputTokens: assembly.outputReserveTokens,
+        contextTier: assembly.selectedTierTokens,
       };
       if (request.reasoningEffort !== undefined) {
         runOptions.reasoningEffort = request.reasoningEffort;
@@ -358,7 +418,7 @@ export class SplashTaskService {
       }
       const dispatched = await this.#coordinator.dispatch({
         ownerId: sessionId,
-        messages,
+        messages: assembly.messages,
         options: runOptions,
       });
 
@@ -366,7 +426,7 @@ export class SplashTaskService {
       //    KORUNUR (imha YOK — Step 9'da refine/close onu kullanacak).
       //    (shutdown kazandıysa koruma DEĞİL beklenen self-cleanup + red.) ──
       if (dispatched.status === "inference_busy") {
-        const result = this.#busyResult(sessionId, dispatched.conflict);
+        const result = this.#busyResult(sessionId, dispatched.conflict, assembly);
         await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
         return result;
       }
@@ -380,7 +440,7 @@ export class SplashTaskService {
       // search stringi ön-doğrulamaz, diff hesaplamaz, dosya yazmaz.
       const applyResult = await workspace.applyPatchSet(workerResult);
 
-      const result = this.#completedResult(sessionId, workerResult, applyResult, dispatched.result.usage);
+      const result = this.#completedResult(sessionId, workerResult, applyResult, dispatched.result.usage, assembly);
       await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
       return result;
     } catch (err) {
@@ -394,9 +454,16 @@ export class SplashTaskService {
         throw err;
       }
       // Sonuç korunamadan iş hata verdi (spec 73): workspace imha edilir,
-      // boş dizinler rmdir ile gider. `inference_busy` bu yolun dışındadır
-      // (geçerli sonuç; yukarıda korunur).
+      // boş dizinler rmdir ile gider. `inference_busy` ve `needs_split`
+      // bu yolun dışındadır (geçerli sonuç; yukarıda korunur).
       await this.#cleanupAfterFailure(workspace, sessionDir, err);
+      // Bağlam katmanının girdi sözleşmesi hatası (açık bağlam kademesi
+      // runtime tavanını aşıyor) görev katmanının tip'li girdi hatası olarak
+      // yüzeye çıkar; diğer bağlam hataları (unsafe_path/assembly_failed)
+      // aynen yayılır — MCP wire'i onları ayrı haritalar.
+      if (err instanceof ContextAssemblyError && err.kind === "invalid_input") {
+        throw new SplashTaskError("invalid_input", err.message, { cause: err });
+      }
       throw err;
     }
   }
@@ -455,7 +522,7 @@ export class SplashTaskService {
       try {
         await task.workspace.destroy();
       } catch {
-        destroyFailed = true; // workspace dizini kalabilir — kullanırın incelemesi için
+        destroyFailed = true; // workspace dizini kalabilir — kullanıcının incelemesi için
       }
       let dirsFailed = false;
       try {
@@ -550,45 +617,88 @@ export class SplashTaskService {
     }
   }
 
-  #runtimeMaxTokens(): number {
-    // Step 6 adaptif bütçe YOK (spec 29/31): son başarılı runtime yenilemesinin
-    // yetkili (authoritative) tavanı; hiç yenileme yoksa 0 (kapasite icat edilmez).
-    return this.#capacity?.runtimeInfo?.maximumContextTokens ?? 0;
-  }
-
   /**
-   * `inference_busy` placeholder sonucu (spec 37): deterministik BOŞ değerler.
-   * PID/komut/yol/içerik YOK; workspace korunduğu için sonradan refine/close
-   * (Step 9) aynı oturumu kullanabilir.
+   * `inference_busy` placeholder sonucu (spec 37): inference çalışmadı →
+   * token hakedişi SIFIR; bağlam telemetrisi assembler'ınkindir (bütçe
+   * seçimi dispatch ÖNCESİ tamamlandı). PID/komut/yol/içerik YOK;
+   * workspace korunduğu için sonradan refine/close (Step 9) aynı
+   * oturumu kullanabilir.
    */
-  #busyResult(sessionId: string, conflict: InferenceConflict): CompactResult {
+  #busyResult(
+    sessionId: string,
+    conflict: InferenceConflict,
+    assembly: Extract<AssembledContext, { status: "ready" }>,
+  ): CompactResult {
     const context: CompactContextMetadata = {
-      runtimeMaxTokens: this.#runtimeMaxTokens(),
-      inputTokens: 0,
-      outputReserveTokens: this.#config.context.minOutputReserve,
-      selectedContextTier: "runtime_max", // Step 6 tier seçimi YOK (spec 31)
-      truncatedReadonlyContext: false, // Step 6 salt-okunur bağlam YOK (spec 86)
+      runtimeMaxTokens: assembly.runtimeMaxTokens,
+      inputTokens: 0, // model çağrılmadı — hakediş icat edilmez
+      outputReserveTokens: assembly.outputReserveTokens,
+      selectedContextTier: assembly.selectedContextTier,
+      truncatedReadonlyContext: assembly.truncatedReadonlyContext,
     };
     return {
       sessionId,
-      round: 1, // Step 6'da her çağrı 1. turdur (spec 50)
+      round: 1, // her yeni oturum 1. turdur (spec 50)
       status: "inference_busy",
       baseStatus: "fresh", // her yeni oturum yapısal olarak fresh (spec 49)
-      rulesSource: "none", // Step 8 kurallar; Step 6: YOK (spec 51)
+      rulesSource: "none", // Step 8 kurallar; Step 7: YOK (spec 51)
       context,
       inference: { conflict },
       summary: "Inference is temporarily unavailable; no worker generation was run.",
       filesChanged: [],
       diffStats: { files: 0, insertions: 0, deletions: 0 },
       validation: { editsRequested: 0, editsApplied: 0, rejected: [] },
-      warnings: [SIMPLE_CONTEXT_WARNING],
+      warnings: [...assembly.warnings],
       usage: { in: 0, out: 0 },
     };
   }
 
   /**
+   * `needs_split` turu (spec 32): zorunlu bağlam tavana sığmadı — model
+   * ÇAĞRILMADI (hakediş SIFIR), bileştirilme/kısılma YOK; workspace
+   * KORUNUR. `split_hint` kaynak içerik taşımaz — yalnız sayılar + yol adları.
+   */
+  #needsSplitResult(
+    sessionId: string,
+    needsSplit: Extract<AssembledContext, { status: "needs_split" }>,
+  ): CompactResult {
+    return {
+      sessionId,
+      round: 1, // her yeni oturum 1. turdur (spec 50)
+      status: "needs_split",
+      baseStatus: "fresh", // tur denetimi ÖNCESİ — stale olsaydı `stale_base` olurdu
+      rulesSource: "none", // Step 8 kurallar; Step 7: YOK (spec 51)
+      context: {
+        runtimeMaxTokens: needsSplit.runtimeMaxTokens,
+        inputTokens: 0, // model çağrılmadı — hakediş icat edilmez
+        outputReserveTokens: needsSplit.outputReserveTokens,
+        selectedContextTier: labelForTier(needsSplit.availableMaxTokens),
+        truncatedReadonlyContext: false,
+      },
+      summary: NEEDS_SPLIT_SUMMARY,
+      filesChanged: [],
+      diffStats: { files: 0, insertions: 0, deletions: 0 },
+      validation: { editsRequested: 0, editsApplied: 0, rejected: [] },
+      warnings: [...needsSplit.warnings],
+      usage: { in: 0, out: 0 },
+      splitHint: {
+        requiredInputTokens: needsSplit.requiredInputTokens,
+        availableMaxTokens: needsSplit.availableMaxTokens,
+        outputReserveTokens: needsSplit.outputReserveTokens,
+        pressureFiles: [...needsSplit.pressureFiles],
+      },
+    };
+  }
+
+  /**
    * Tamamlanan turun compact sonucu (spec 31/41-48/51/52):
-   * workspace + coordinator çıktılarının metadata'sı; KAYNAK İÇERİĞİ YOK.
+   * - `context.input_tokens` = assembler'ın TAM preflight ölçüsü
+   *   (`usage.inputTokens` ASLA değil — runtime sayımı dispatch sonrası,
+   *   ayrıca şablon etkisiyle farklı olabilir; telemetri dispatch ÖNCESİ
+   *   kesin olmalı);
+   * - `usage` = runtime'ın KENDİ hakedişi (ayrı gerçeğe ayrı alan);
+   * - `filesChanged`/`diffStats`/`validation` = workspace/git otoriter;
+   * - KAYNAK İÇERİĞİ YOK (summary = WorkerContract'ın normalize ettiği).
    */
   #completedResult(
     sessionId: string,
@@ -599,6 +709,7 @@ export class SplashTaskService {
       diffStats: CompactResult["diffStats"];
     },
     usage: InferenceUsage,
+    assembly: Extract<AssembledContext, { status: "ready" }>,
   ): CompactResult {
     const status = mapValidationToStatus(applyResult.validation);
     return {
@@ -608,13 +719,13 @@ export class SplashTaskService {
       baseStatus: "fresh",
       rulesSource: "none",
       context: {
-        runtimeMaxTokens: this.#runtimeMaxTokens(),
-        inputTokens: usage.inputTokens,
-        outputReserveTokens: this.#config.context.minOutputReserve,
-        selectedContextTier: "runtime_max",
-        truncatedReadonlyContext: false,
+        runtimeMaxTokens: assembly.runtimeMaxTokens,
+        inputTokens: assembly.inputTokens, // tam preflight ölçüsü (spec 31)
+        outputReserveTokens: assembly.outputReserveTokens,
+        selectedContextTier: assembly.selectedContextTier,
+        truncatedReadonlyContext: assembly.truncatedReadonlyContext,
       },
-      summary: workerResult.summary, // WorkerContract'ın normalize ettiği aynen (spec 44)
+      summary: redactText(workerResult.summary), // normalize edilen özet + çıktı-tarafı secret scrub (aynı redaksiyon disiplini; kaynak/değişiklik değil)
       filesChanged: [...applyResult.filesChanged], // workspace/git otoriter (spec 45)
       diffStats: {
         files: applyResult.diffStats.files,
@@ -622,7 +733,7 @@ export class SplashTaskService {
         deletions: applyResult.diffStats.deletions,
       },
       validation: applyResult.validation, // snippet'lar yok — zaten güvenli sözlük (spec 47)
-      warnings: [SIMPLE_CONTEXT_WARNING],
+      warnings: [...assembly.warnings],
       usage: { in: usage.inputTokens, out: usage.outputTokens }, // totalTokens YOK (spec 48)
     };
   }
@@ -635,7 +746,8 @@ export class SplashTaskService {
  * - `task_cleanup_failed` → TEMİZLİK BAŞARISIZ (shutdown'a yayılır).
  * - diğer `SplashTaskError` (invalid_input/output_root_unsafe/session_conflict)
  *   → GÜVENLİ: workspace oluşturulmadan önce atılır — yetkili temizlik YOK.
- * - sıradan tip'li görev hataları (Workspace/Coordinator/Backend/WorkerContract)
+ * - sıradan tip'li görev hataları
+ *   (Workspace/Coordinator/Backend/WorkerContract/ContextAssembly)
  *   → GÜVENLİ: workspace SONRASI hatanın temizliği başarısız olsaydı, red
  *   nedeni orijinal hata değil `task_cleanup_failed` olurdu — orijinal nedenin
  *   bu yola ulaşması temizliğin tamamlandığının KANITIDIR.
@@ -650,7 +762,8 @@ function inFlightRejectionFailsShutdown(reason: unknown): boolean {
     reason instanceof WorkspaceError ||
     reason instanceof CoordinatorError ||
     reason instanceof BackendError ||
-    reason instanceof WorkerContractError
+    reason instanceof WorkerContractError ||
+    reason instanceof ContextAssemblyError
   ) {
     return false;
   }

@@ -71,6 +71,15 @@ export const CONFIG_DEFAULTS = {
   },
 } as const;
 
+/**
+ * Bilinen adaptif bağlam kademeleri (DESIGN.md 2.5/5): 64K / 128K / 192K.
+ * Config'deki `tiers` bu kümenin bir altkümesi olmak zorundadır — dördüncü
+ * kade ("runtime maximum") ASLA config'lenmez (runtime status'undan
+ * çözülür). `SPLASH_CONTEXT_TIERS` bu küme dışında bir değer üretirse
+ * config load REDDEDİLİR (bozuk bir bütçe politikası sessizce çalışmaz).
+ */
+export const KNOWN_CONTEXT_TIERS = [65_536, 131_072, 196_608] as const;
+
 function readString(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
   const trimmed = env[key]?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : fallback;
@@ -114,6 +123,38 @@ function readPositiveIntList(
     }
     return value;
   });
+}
+
+/**
+ * `SPLASH_CONTEXT_TIERS` politikası (Step 7): dize BOŞ olmamalı, değerler
+ * `KNOWN_CONTEXT_TIERS` altkümesinden gelmeli (bilinmeyen değer = tanımlanmamış
+ * bütçe politikası — icat YASAK), tekrar YASAK, sıralama artan OLMALI
+ * (assembler küçükten büyüğe doğru ilk sığanı seçer; sıra politikaya dahildir).
+ */
+function readContextTiers(env: NodeJS.ProcessEnv): number[] {
+  const tiers = readPositiveIntList(env, "SPLASH_CONTEXT_TIERS", CONFIG_DEFAULTS.context.tiers);
+  if (tiers.length === 0) {
+    throw new Error(`Invalid SPLASH_CONTEXT_TIERS: at least one tier is required`);
+  }
+  const seen = new Set<number>();
+  let previous: number | undefined;
+  for (const value of tiers) {
+    if (!(KNOWN_CONTEXT_TIERS as readonly number[]).includes(value)) {
+      throw new Error(
+        `Invalid SPLASH_CONTEXT_TIERS: ${value} is not a known context tier ` +
+          `(${KNOWN_CONTEXT_TIERS.join(", ")})`,
+      );
+    }
+    if (seen.has(value)) {
+      throw new Error(`Invalid SPLASH_CONTEXT_TIERS: duplicate entry ${value}`);
+    }
+    seen.add(value);
+    if (previous !== undefined && value <= previous) {
+      throw new Error(`Invalid SPLASH_CONTEXT_TIERS: tiers must be strictly increasing`);
+    }
+    previous = value;
+  }
+  return tiers;
 }
 
 /**
@@ -190,6 +231,22 @@ function expandHome(value: string): string {
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): SplashConfig {
   const repoRoot = readString(env, "SPLASH_REPO_ROOT", "");
+  const tiers = readContextTiers(env);
+  const minOutputReserve = readPositiveInt(
+    env,
+    "SPLASH_CONTEXT_MIN_OUTPUT_RESERVE",
+    CONFIG_DEFAULTS.context.minOutputReserve,
+  );
+  const preferredOutputReserve = readPositiveInt(
+    env,
+    "SPLASH_CONTEXT_PREFERRED_OUTPUT_RESERVE",
+    CONFIG_DEFAULTS.context.preferredOutputReserve,
+  );
+  if (preferredOutputReserve < minOutputReserve) {
+    throw new Error(
+      `Invalid SPLASH_CONTEXT_PREFERRED_OUTPUT_RESERVE: must not be below the minimum reserve (${minOutputReserve})`,
+    );
+  }
   return {
     backend: {
       baseUrl: readUrl(env, "SPLASH_BACKEND_BASE_URL", CONFIG_DEFAULTS.backend.baseUrl),
@@ -202,17 +259,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SplashConfig {
     ),
     maxRounds: readPositiveInt(env, "SPLASH_MAX_ROUNDS", CONFIG_DEFAULTS.maxRounds),
     context: {
-      tiers: readPositiveIntList(env, "SPLASH_CONTEXT_TIERS", CONFIG_DEFAULTS.context.tiers),
-      minOutputReserve: readPositiveInt(
-        env,
-        "SPLASH_CONTEXT_MIN_OUTPUT_RESERVE",
-        CONFIG_DEFAULTS.context.minOutputReserve,
-      ),
-      preferredOutputReserve: readPositiveInt(
-        env,
-        "SPLASH_CONTEXT_PREFERRED_OUTPUT_RESERVE",
-        CONFIG_DEFAULTS.context.preferredOutputReserve,
-      ),
+      tiers,
+      minOutputReserve,
+      preferredOutputReserve,
       rulesSoftBudget: readPositiveInt(
         env,
         "SPLASH_CONTEXT_RULES_SOFT_BUDGET",

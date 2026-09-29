@@ -1,6 +1,6 @@
 # Splash — Architecture & Design (v2)
 
-Status: **Steps 1–6 implemented; rest design-only.**
+Status: **Steps 1–7 implemented; rest design-only.**
 
 Purpose: let a frontier orchestrator (Claude Code, OpenAI Codex) delegate
 *implementation* work to a **local LLM worker** to **significantly reduce
@@ -1138,20 +1138,27 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
    **complete `--binary --full-index` export**/destroy. *(The safety core.)*
    6. **`splash_task` end-to-end** (context simple) — task → worker → patch →
       validated-apply → **compact result**. *(First real loop.)*
-      **Implementation-stage note (incremental Step 6):** the shipped step uses
-      a *simple* editable-base context only — the exact workspace files, no
-      repository crawl. No adaptive budgeting, secret redaction, exact token
-      measurement, tier selection, `needs_split`, rules loading, stale-base
-      checking, persistence, refinement, diff, or close is active yet; each
-      lands with its designated step above. An oversized Step 6 prompt
-      surfaces the runtime/backend's typed error rather than `needs_split`
-      (Step 7 changes this behavior). Retained-but-unfinished workspaces
-      (in-memory registry) are **process-local memory**: they live until
-      `dispose()`/process exit and are destroyed there — this is NOT Step 9's
-      disk persistence (which does not exist yet).
-7. **Context Assembler + redaction + adaptive budget** — exact tokenization,
-   tier selection, output headroom, rules soft budget, reduction priority,
-   `needs_split` (Section 5).
+       **Implementation-stage note (incremental Step 6, since replaced by
+       Step 7):** the step as shipped used a *simple* editable-base context
+       only — the exact workspace files, no repository crawl, no adaptive
+       budgeting, no redaction, no exact measurement, no `needs_split`.
+       Step 7 replaced that layer with the Context Assembler below.
+       Retained-but-unfinished workspaces (in-memory registry) are
+       **process-local memory**: they live until `dispose()`/process exit and
+       are destroyed there — this is NOT Step 9's disk persistence (which
+       does not exist yet).
+  7. **Context Assembler + redaction + adaptive budget** — exact tokenization,
+     tier selection, output headroom, rules soft budget, reduction priority,
+     `needs_split` (Section 5).
+     **Implementation-stage note (incremental Step 7):** the shipped step
+     implements secret-file suppression, secret/PII redaction, exact token
+     measurement, adaptive tier selection, output-reserve negotiation,
+     read-only context reduction, and `needs_split`; the `splash_task` loop
+     consumes its output (measured messages == dispatched messages;
+     `context.input_tokens` is the exact preflight count). Rules loading
+     (Step 8) and refine history (Step 9) are still absent — the assembler
+     accepts them as placeholders (`rules: undefined`, `history: []`), and
+     production passes no read-only reference paths yet.
 8. **Rules loading** — pinned into the worker prompt.
 9. **Session Manager + `splash_refine`** — rounds, scoped reset + full
    patch-set re-apply, **stale-base check** (content + existence/type/mode +

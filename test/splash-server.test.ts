@@ -145,14 +145,18 @@ class FakeBackend implements InferenceBackend {
     this.runCalls.push({ messages, options });
     return this.runBehavior({ messages, options });
   }
-  async tokenize(): Promise<never> {
-    throw new Error("FakeBackend.tokenize must not be called in Step 6");
+  /** `countPromptTokens` davranışı (varsayılan: 64K'a sığan küçük sayı). */
+  countBehavior: (messages: InferenceMessage[]) => number = () => 1_000;
+  countCalls: InferenceMessage[][] = [];
+  async tokenize(content: string): Promise<{ tokens: number[]; count: number }> {
+    return { tokens: [], count: 0 };
   }
   async renderPrompt(): Promise<never> {
-    throw new Error("FakeBackend.renderPrompt must not be called in Step 6");
+    throw new Error("FakeBackend.renderPrompt must not be called in Step 7");
   }
-  async countPromptTokens(): Promise<never> {
-    throw new Error("FakeBackend.countPromptTokens must not be called in Step 6");
+  async countPromptTokens(messages: InferenceMessage[]): Promise<number> {
+    this.countCalls.push([...messages]);
+    return this.countBehavior(messages);
   }
 }
 
@@ -280,9 +284,16 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
   assert.ok(Array.isArray(schema.required) && schema.required.includes("task"));
   assert.ok(Array.isArray(schema.required) && schema.required.includes("files"), "`files` zorunlu olmalı");
   assert.ok(!("required" in schema) || !(schema.required ?? []).includes("options"));
-  // çağrı başına YASAK alanlar şemada YOK (spec 6/9):
-  for (const forbidden of ["repo_root", "session_id", "output_root", "context_tier", "rules", "system_prompt"]) {
+  // çağrı başına YASAK alanlar şemada YOK (spec 6/9) — `context_tier` artık
+  // `options` altındadır (Step 7 override'ı):
+  for (const forbidden of ["repo_root", "session_id", "output_root", "rules", "system_prompt"]) {
     assert.ok(!Object.hasOwn(schema.properties, forbidden), `yasak alan şemada: ${forbidden}`);
+  }
+  // Step 7: adaptif bütçe override'ları `options` altında:
+  const optionsSchema = schema.properties.options as { properties: Record<string, unknown> } | undefined;
+  assert.ok(optionsSchema !== undefined, "options şeması eksik");
+  for (const option of ["reasoning_effort", "context_tier", "output_reserve_tokens"]) {
+    assert.ok(Object.hasOwn(optionsSchema.properties, option), `options.${option} şemada olmalı`);
   }
 
   // `splash_ping` — hiçbir şeye dokunmaz:
@@ -301,6 +312,9 @@ test("123/124: splash_task over MCP — compact snake_case wire; NO source/diff/
     content: workerOkJson(),
     usage: { inputTokens: 777, outputTokens: 123 },
   });
+  // Tam preflight ölçüsü `usage.in` (777) ile AYRI — telemetri dispatch
+  // öncesi kesin olmalı (spec 31):
+  session.backend.countBehavior = () => 1_234;
 
   const res = (await session.client.callTool({
     name: "splash_task",
@@ -323,7 +337,16 @@ test("123/124: splash_task over MCP — compact snake_case wire; NO source/diff/
   assert.deepEqual(wire.diff_stats, { files: 1, insertions: 1, deletions: 1 });
   assert.equal((wire.usage as { in: number }).in, 777);
   assert.equal((wire.usage as { out: number }).out, 123);
-  assert.equal((wire.context as { selected_context_tier: string }).selected_context_tier, "runtime_max");
+  const context = wire.context as {
+    runtime_max_tokens: number;
+    input_tokens: number;
+    output_reserve_tokens: number;
+    selected_context_tier: string;
+  };
+  assert.equal(context.runtime_max_tokens, 65_536);
+  assert.equal(context.input_tokens, 1_234); // tam preflight ölçüsü — usage.in (777) ASLA değil
+  assert.equal(context.output_reserve_tokens, 32_768);
+  assert.equal(context.selected_context_tier, "64k");
   // Koşullu alanlar BOŞTA (spec 55/108):
   assert.ok(!("inference" in wire) && !("split_hint" in wire) && !("stale_files" in wire));
   // Sıfır source sızıntısı (spec 50/123):
