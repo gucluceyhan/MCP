@@ -305,6 +305,50 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
   assert.ok(!(await pathExists(fixture.sessionsDir)), "ping sessions dizini OLUŞTURMAMALI");
 });
 
+test("BLOCKER 4: MCP context_tier is a canonical enum (numeric / unknown rejected)", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const session = await makeMcpSession(t, fixture);
+  const tools = (await session.client.listTools()).tools;
+  const schema = tools.find((tool) => tool.name === "splash_task")?.inputSchema as {
+    properties: { options?: { properties: Record<string, { enum?: string[] }> } };
+  };
+  const tier = schema.properties.options?.properties.context_tier;
+  assert.ok(tier !== undefined, "options.context_tier şemada olmalı");
+  // Kanonik sembolik küme (sayısal değer şemada YOK):
+  assert.deepEqual(tier.enum, ["64k", "128k", "192k", "runtime_max"]);
+
+  // Sayısal değer (131072) MCP şeması tarafından REDDEDİLİR:
+  const badNumeric = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "X", files: ["src/a.ts"], options: { context_tier: 131_072 } },
+  })) as WireContent;
+  assert.ok(badNumeric.isError, "sayısal context_tier şema tarafından reddedilmeli");
+
+  // Bilinmeyen string ("80k") REDDEDİLİR:
+  const badString = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "X", files: ["src/a.ts"], options: { context_tier: "80k" } },
+  })) as WireContent;
+  assert.ok(badString.isError, "bilinmeyen context_tier şema tarafından reddedilmeli");
+
+  // Geçerli kanonik değer şemadan GEÇER + işlem ilerler (backend ok JSON):
+  session.backend.nextInfo = {
+    ready: true,
+    maximumContextTokens: 196_608,
+    servedModel: "fixture-model",
+    runtimeProcessId: 4242,
+  };
+  session.backend.runBehavior = async () => ({
+    content: workerOkJson(),
+    usage: { inputTokens: 100, outputTokens: 10 },
+  });
+  const ok = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "X", files: ["src/a.ts"], options: { context_tier: "128k" } },
+  })) as WireContent;
+  assert.ok(!ok.isError, `kanonik context_tier kabul edilmeli: ${ok.content?.[0]?.text}`);
+});
+
 test("123/124: splash_task over MCP — compact snake_case wire; NO source/diff/patch/context content; shared coordinator", async (t) => {
   const fixture = await makeMcpFixture(t);
   const session = await makeMcpSession(t, fixture);

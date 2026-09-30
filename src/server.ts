@@ -75,9 +75,10 @@ export interface SplashRuntimeOptions {
  *   (create-only görev) (spec 8). Her string açık repository-göreceli
  *   yoldur — glob/dizin/regex YOK.
  * - `options.reasoning_effort`: `none|low|medium|xhigh` (spec 6).
- * - `options.context_tier`: bağlam kademesi (token) — pozitif tam sayı;
- *   VERİLMEDİSE adaptif seçim (Step 7). Runtime max'ı aşan değer servis
- *   katmanında `invalid_input`'tur.
+ * - `options.context_tier`: kanonik SEMBOLİK kademe (`64k`/`128k`/`192k`/
+ *   `runtime_max`) — sayısal değer kabul EDİLMEZ (BLOCKER 4). VERİLMEDİSE
+ *   adaptif seçim (Step 7). Runtime max'ı aşan kanonik kademe servis +
+ *   assembler katmanında `invalid_input`'tur (sessizce sıkıştırılmaz).
  * - `options.output_reserve_tokens`: çıkış payı (token) — pozitif tam sayı;
  *   VERİLMEDİSE adaptif müzakere (preferred/min). Config minimumunun altı
  *   servis katmanında `invalid_input`'tur.
@@ -93,7 +94,7 @@ const splashTaskInputSchema = z.object({
   options: z
     .object({
       reasoning_effort: z.enum(["none", "low", "medium", "xhigh"]).optional(),
-      context_tier: z.number().int().positive().optional(),
+      context_tier: z.enum(["64k", "128k", "192k", "runtime_max"]).optional(),
       output_reserve_tokens: z.number().int().positive().optional(),
     })
     .strict()

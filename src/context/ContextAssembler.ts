@@ -17,34 +17,35 @@
  *   2. `refreshRuntimeInfo` → yetkili tavan (`R`) — başarısızlık tip'li
  *      hata olarak aynen yayılır (backend sorununu icat edilmiş bir duruma
  *      çevrilmez)
- *   3. geçerli tavan = açık kademe override'ı (≤ R; daha büyük →
- *      `invalid_input`) veya `R`
+ *   3. geçerli tavan = açık SEMBOLİK kademe (`64k`/`128k`/`192k`/
+ *      `runtime_max`; `refreshRuntimeInfo` SONRASI token'a çözülür — kanonik
+ *      kademe `R`'yi aşıyorsa `invalid_input`, sessizce sıkıştırılmaz) veya
+ *      `R`. Provenance (etiket) `TierCandidate`'da taşınır.
  *   4. görev metni redakte edilir (worker'a redakte EDİLMİŞ form gider)
  *   5. düzenlenebilir bloklar (lexicographic): secret dosya → marker
  *      (içerik girmez); binary → BINARY marker; symlink → metadata; yok →
  *      ABSENT; metin → strict UTF-8 + redaksiyon
- *   6. salt-okunur bloklar (lexicographic): path güvenliği + symlink
- *      kuralları + ENOENT → ABSENT; diğer errno → fail-closed
- *   7. PREFLIGHT (zorunlu: görev + düzenlenebilir): tam ölçü;
- *      `required + pay > tavan` → `needs_split` (BİLEŞTİRİLMEZ, KISILMAZ,
- *      inference'a inmez) + pressure dosyaları (token ölçümü, içerik YOK)
- *   8. kademe seçimi: sığan EN KÜÇÜK kade (64K'ya sığan 128K'a KALKMAZ);
- *      açık override → tek aday (inflation YOK)
- *   9. pay müzakeresi (yalnız açık pay verilmEDİSE): `required + preferred
- *      ≤ seçilen kade` → preferred; değilse min. (Kademeye ASLA çıkılmaz.)
- *   10. TAM paket (zorunlu + salt-okunur) tam ölçülmüş; sığmıyorsa
- *      salt-okunur bloklar LEXICOGRAPHİK SONDAN TAM DOSYA olarak atılır ve
- *      her atımdan sonra YENİDEN TAM ölçülür; ilk sığmaya kadar.
- *      Düzenlenebilir kod ASLA kıpırdamaz — sığmazsa sonuç `needs_split`
- *      olurdu (7'de kanıtlandı).
- *   11. `messages` = ölçülen mesajların KENDİSİ — dispatch byte-bayt aynen
+ *   6. salt-okunur bloklar: HER yol ÖNCE `normalizeRepoPath` (`.git`/`..`/
+ *      mutlak/backslash/NUL → `unsafe_path`) + DEDUPE + sort; kök fail-closed
+ *      `realpath`; symlink ATAL fail-closed; ENOENT → ABSENT; diğer →
+ *      fail-closed
+ *   7. PREFLIGHT (zorunlu: görev + düzenlenebilir; salt-okunur YOK): tam
+ *      ölçü; `required + pay > tavan` → `needs_split` (BİLEŞTİRİLMEZ,
+ *      KISILMAZ, inference'a inmez) + pressure dosyaları (tam blok tokenize,
+ *      içerik YOK; ölçüm/iptal hatası sahte sıralamaya dönüştürülmez)
+ *   8. TAM bağlam (zorunlu + TÜM salt-okunur) + adaptif kade: en küçük
+ *      sığan kade; sığmıyorsa salt-okunur LEXICOGRAPHİK SONDAN TAM DOSYA
+ *      atılır + yeniden TAM ölçülür. Düzenlenebilir kod ASLA kıpırdamaz.
+ *   9. pay müzakeresi (yalnız açık pay verilmEDİSE): tercih payı YALNIZCA
+ *      seçilen kadeye sığıyorsa kullanılır; salt-okunur atılmaz, kade
+ *      yükseltilmez. (usable context > preferred reserve)
+ *   10. `messages` = ölçülen mesajların KENDİSİ — dispatch byte-bayt aynen
  *      onu taşır (`context.input_tokens` = bu tam ölçü, `usage.in` ASLA değil).
  *
  * Uyarılar SABİТ sözlüktür (kaynak/secret/path/komut YOK) — yalnız olay
  * türü bildirilir.
  */
 
-import path from "node:path";
 import { lstat, readFile, readlink, realpath } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { BackendError } from "../backend/errors.js";
@@ -99,6 +100,74 @@ export function labelForTier(tokens: number): SelectedContextTier {
     return "192k";
   }
   return "runtime_max";
+}
+
+/**
+ * Bağlam kade ADAYI — token + KANONİK etiket (BLOCKER 4 provenance).
+ * `labelForTier(tokens)` ile tersine türetmek yerine ETİKET adayın
+ * kendisinde taşınır: açık `runtime_max` (131072) ≡ `128k` (131072)
+ * sayısal değeri AYNI olsa da provenance'ı (etiket) korunur.
+ */
+export interface TierCandidate {
+  tokens: number;
+  label: SelectedContextTier;
+}
+
+/**
+ * Kanonik SEMBOLİK kademe → token (BLOCKER 4). `runtime_max` taze runtime
+ * tavanıdır (`refreshRuntimeInfo` SONRASI çözülen `runtimeMax`'a eşit).
+ */
+function canonicalTierTokens(label: SelectedContextTier, runtimeMax: number): number {
+  switch (label) {
+    case "64k":
+      return 65_536;
+    case "128k":
+      return 131_072;
+    case "192k":
+      return 196_608;
+    case "runtime_max":
+      return runtimeMax;
+  }
+}
+
+/**
+ * `inputTokens + reserve` için en küçük sığan kade (BLOCKER 2).
+ * `candidates` token'a ARTAN sıralı olmalı; ilk sığan = en küçük. Hiçbiri
+ * sıymıyorsa `null` (çağrı tarafı salt-okunur azaltır). Tek bir saf yardımcı —
+ * kademe seçimi mantığı birden fazla döngüye yayılmaz.
+ */
+function findSmallestFittingTier(args: {
+  inputTokens: number;
+  reserve: number;
+  candidates: readonly TierCandidate[];
+}): TierCandidate | null {
+  for (const candidate of args.candidates) {
+    if (args.inputTokens + args.reserve <= candidate.tokens) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Adaptif (açık override YOK) kade aday listesi (BLOCKER 2/4): config
+ * kademeleri (≤ runtime max) kanonik etiketle + runtime max `runtime_max`
+ * etiketiyle. Aynı token değeri ÇİFT aday üretmez — config kanonik
+ * (`128k`) redundant `runtime_max` fallback'ine TERCİH edilir (provenance).
+ * Token'a artan sıralı döner.
+ */
+function automaticTierCandidates(tiers: readonly number[], runtimeMax: number): TierCandidate[] {
+  const candidates: TierCandidate[] = [];
+  for (const tier of tiers) {
+    if (tier <= runtimeMax) {
+      candidates.push({ tokens: tier, label: labelForTier(tier) });
+    }
+  }
+  if (!candidates.some((candidate) => candidate.tokens === runtimeMax)) {
+    candidates.push({ tokens: runtimeMax, label: "runtime_max" });
+  }
+  candidates.sort((a, b) => a.tokens - b.tokens);
+  return candidates;
 }
 
 // ── Production fs (varsayılan seam) ──────────────────────────────────────────
@@ -192,13 +261,10 @@ export class ContextAssembler {
       }
       reserve = input.outputReserveTokens;
     }
-    let explicitTier: number | null = null;
-    if (input.contextTier !== undefined) {
-      if (!Number.isInteger(input.contextTier) || input.contextTier <= 0) {
-        throw new ContextAssemblyError("invalid_input", "The context tier must be a positive integer");
-      }
-      explicitTier = input.contextTier;
-    }
+    // Açık kademe override'ı SEMBOLİKTİR (BLOCKER 4): `64k`/`128k`/`192k`/
+    // `runtime_max`. Sayısal token `refreshRuntimeInfo` SONRASI çözülür; MCP
+    // şeması zaten sayısal/gayrIKANONIK değeri reddetmiştir (savunma derinliği).
+    const explicitTier = input.contextTier;
 
     // ── 2) yetkili tavan (taze yenileme) ─────────────────────────────────
     let info: RuntimeInfo;
@@ -212,13 +278,27 @@ export class ContextAssembler {
       throw new ContextAssemblyError("assembly_failed", "Refreshing the runtime state failed", { cause: err });
     }
     const runtimeMax = info.maximumContextTokens;
-    if (explicitTier !== null && explicitTier > runtimeMax) {
-      throw new ContextAssemblyError(
-        "invalid_input",
-        "The requested context tier exceeds the runtime maximum",
-      );
+    // Açık override'ı SEMBOLİK → token çöz (BLOCKER 4): kanonik kademe
+    // runtime max'ı aşıyorsa SESSİZCE SIKIŞTIRILMAZ (`invalid_input`);
+    // `runtime_max` her zaman geçerli (kendi tanımı = taze tavan). Provenance
+    // (etiket) aday nesnesinde taşınır.
+    let explicitCandidate: TierCandidate | null = null;
+    if (explicitTier !== undefined) {
+      const tokens = canonicalTierTokens(explicitTier, runtimeMax);
+      if (explicitTier !== "runtime_max" && tokens > runtimeMax) {
+        throw new ContextAssemblyError(
+          "invalid_input",
+          "The requested context tier exceeds the runtime maximum",
+        );
+      }
+      explicitCandidate = { tokens, label: explicitTier };
     }
-    const effectiveMax = explicitTier ?? runtimeMax;
+    const effectiveMax = explicitCandidate !== null ? explicitCandidate.tokens : runtimeMax;
+    // Geçerli tavanın KANONİK etiketi (provenance): adaptif → `runtime_max`;
+    // açık override → kendi etiketi. needs_split telemetrisi bunu kullanır
+    // (`labelForTier(availableMaxTokens)` ile türetilmez — BLOCKER 5).
+    const effectiveMaxLabel: SelectedContextTier =
+      explicitCandidate !== null ? explicitCandidate.label : "runtime_max";
 
     // ── 3) görev metni redaksiyonu ───────────────────────────────────────
     const redactedTask = redactText(input.task);
@@ -257,18 +337,45 @@ export class ContextAssembler {
     }
 
     // ── 5) salt-okunur bloklar (canlı ana ağaç — ContextFs) ──────────────
-    const orderedReadonly = [...(input.readonlyPaths ?? [])].sort();
+    // ÖNCE kanonik normalize (BLOCKER 1) + DEDUPE + sort. `normalizeRepoPath`
+    // `null` → yol GÜVENLİ DEĞİL (`.git`, `..`, mutlak, backslash, NUL, UNC)
+    // → `unsafe_path` (SABİТ mesaj; ham yol yüzeye KATILMAZ). Alias'lar
+    // (`src/./a.ts` ≡ `src//a.ts` ≡ `src/a.ts`) TEK kanonik yol → TEK blok.
+    const readonlySeen = new Set<string>();
+    const orderedReadonly: string[] = [];
+    for (const raw of input.readonlyPaths ?? []) {
+      const canonical = normalizeRepoPath(raw);
+      if (canonical === null) {
+        throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
+      }
+      if (!readonlySeen.has(canonical)) {
+        readonlySeen.add(canonical);
+        orderedReadonly.push(canonical);
+      }
+    }
+    orderedReadonly.sort();
+
+    // Kanonik kök (fail-closed, BLOCKER 1): `realpath` başarısızsa sözdizisel
+    // fallback YOK — workspace kök zaten mevcut/geçerli; hata abnormal.
     const readonlyBlocks: ContextBlock[] = [];
-    for (const canonical of orderedReadonly) {
-      const body = await this.#readReadonlyBody(input.workspace.repoRoot, canonical, input.signal);
-      const redacted = redactText(body);
-      if (redacted !== body) {
-        contentRedacted = true;
+    if (orderedReadonly.length > 0) {
+      let canonicalRoot: string;
+      try {
+        canonicalRoot = await this.#fs.realpath(input.workspace.repoRoot);
+      } catch (err) {
+        throw new ContextAssemblyError("assembly_failed", "Reading the read-only context failed", { cause: err });
       }
-      if (isSecretFilePath(canonical) && !secretFileSeen) {
-        secretFileSeen = true;
+      for (const canonical of orderedReadonly) {
+        const body = await this.#readReadonlyBody(canonicalRoot, canonical, input.signal);
+        const redacted = redactText(body);
+        if (redacted !== body) {
+          contentRedacted = true;
+        }
+        if (isSecretFilePath(canonical) && !secretFileSeen) {
+          secretFileSeen = true;
+        }
+        readonlyBlocks.push({ canonical, label: "READ-ONLY REFERENCE", body: redacted });
       }
-      readonlyBlocks.push({ canonical, label: "READ-ONLY REFERENCE", body: redacted });
     }
 
     // ── mesaj inşası (WorkerContract — saf) ──────────────────────────────
@@ -300,7 +407,11 @@ export class ContextAssembler {
       });
     };
 
-    // ── 6) PREFLIGHT (zorunlu: görev + düzenlenebilir; salt-okunur YOK) ──
+    // ── 6) PREFLIGHT — zorunlu bağlam (görev + düzenlenebilir; salt-okunur YOK)
+    // Zorunlu bağlam + pay tavana sığmıyorsa görev TEMELDE çalışamaz →
+    // needs_split. (BLOCKER 2: kade seçimi BURALARA AİT DEĞİLDİR — tam bağlam
+    // karar verir; zorunlu bağlam yalnız "görev çalışabilir mi?" sorusunu
+    // cevaplar ve tier'ı kalıcı olarak seçmez.)
     const requiredMessages = build(reserve, []);
     const requiredCount = await measure(requiredMessages);
     if (requiredCount + reserve > effectiveMax) {
@@ -319,69 +430,81 @@ export class ContextAssembler {
         availableMaxTokens: effectiveMax,
         outputReserveTokens: reserve,
         runtimeMaxTokens: runtimeMax,
+        selectedContextTier: effectiveMaxLabel,
         pressureFiles,
         warnings,
       };
     }
 
-    // ── 7) kademe seçimi (inflation YOK) ─────────────────────────────────
-    let candidates: number[];
-    if (explicitTier !== null) {
-      candidates = [explicitTier];
-    } else {
-      candidates = [...input.tiers].filter((tier) => tier <= runtimeMax);
-      if (!candidates.includes(runtimeMax)) {
-        candidates.push(runtimeMax);
+    // ── 7) TAM bağlam + adaptif tier (BLOCKER 2) ──────────────────────────
+    // KADE, zorunlu bağlamdan DEĞİL; TAM bağlamdan (görev + düzenlenebilir +
+    // TÜM salt-okunur) seçilir — en küçük sığan kade. Açık override → tek
+    // aday (asla üzerine KALKMAZ). Sığmıyorsa lexicographic SON TAM salt-
+    // okunur dosya atılır + yeniden TAM ölçülür; ilk sığana kadar. Düzenle-
+    // nebilir kod ASLA kıpırdamaz.
+    const candidates =
+      explicitCandidate !== null
+        ? [explicitCandidate]
+        : automaticTierCandidates(input.tiers, runtimeMax);
+    let activeReadonly = [...readonlyBlocks];
+    let minMessages = build(reserve, activeReadonly);
+    let minCount = await measure(minMessages);
+    let selectedCandidate = findSmallestFittingTier({ inputTokens: minCount, reserve, candidates });
+    let truncatedReadonly = false;
+    while (selectedCandidate === null) {
+      if (activeReadonly.length === 0) {
+        // Preflight tavana sığılmıştı; yapısal olarak ulaşılmaz. Fail-closed.
+        throw new ContextAssemblyError(
+          "assembly_failed",
+          "The assembled context exceeds the context budget",
+        );
       }
-      candidates.sort((a, b) => a - b);
+      activeReadonly = activeReadonly.slice(0, -1); // lexicographic SON tam dosya
+      truncatedReadonly = true;
+      minMessages = build(reserve, activeReadonly);
+      minCount = await measure(minMessages);
+      selectedCandidate = findSmallestFittingTier({ inputTokens: minCount, reserve, candidates });
     }
-    let selectedTier: number | null = null;
-    for (const tier of candidates) {
-      if (requiredCount + reserve <= tier) {
-        selectedTier = tier;
-        break;
-      }
-    }
-    if (selectedTier === null) {
-      // Yapısal olarak ulaşılmaz (preflight, effectiveMax içinde sığdı ve
-      // adaylar effectiveMax'ı içerir); yine de fail-closed.
+    if (selectedCandidate === null) {
       throw new ContextAssemblyError("assembly_failed", "Selecting a context tier failed");
     }
 
-    // ── 8) pay müzakeresi (yalnız açık pay YOKSA; kademe KALIR) ──────────
-    let finalReserve = reserve;
-    if (input.outputReserveTokens === undefined) {
-      const preferredMessages = build(input.preferredOutputReserve, []);
+    // ── 8) pay müzakeresi (BLOCKER 3: SEÇİLEN kade İÇİNDE; salt-okunur atılmaz)
+    // Öncelik: zorunlu düzenlenebilir > salt-okunur > tercih payı. Tercih payı
+    // yalnız seçilen kadeye sığıyorsa kullanılır; salt-okunur atılmaz, kade
+    // yükseltilmez (usable context > preferred reserve).
+    let finalReserve: number;
+    let finalMessages: InferenceMessage[];
+    let finalCount: number;
+    if (input.outputReserveTokens !== undefined) {
+      finalReserve = input.outputReserveTokens;
+      finalMessages = minMessages;
+      finalCount = minCount;
+    } else {
+      const preferredMessages = build(input.preferredOutputReserve, activeReadonly);
       const preferredCount = await measure(preferredMessages);
-      if (preferredCount + input.preferredOutputReserve <= selectedTier) {
+      if (preferredCount + input.preferredOutputReserve <= selectedCandidate.tokens) {
         finalReserve = input.preferredOutputReserve;
+        finalMessages = preferredMessages;
+        finalCount = preferredCount;
+      } else {
+        finalReserve = input.minOutputReserve;
+        finalMessages = minMessages;
+        // Invariant: SON ölçüm = dispatch edilecek mesajlar. Preferred
+        // ölçüldü ama kullanılmadı → min'i yeniden ölç (byte-bayt eşitlik).
+        finalCount = await measure(minMessages);
       }
     }
 
-    // ── 9) TAM paket + salt-okunur azaltımı ──────────────────────────────
-    let activeReadonly = [...readonlyBlocks];
-    let messages = build(finalReserve, activeReadonly);
-    let inputTokens = await measure(messages);
-    let truncatedReadonly = false;
-    while (activeReadonly.length > 0 && inputTokens + finalReserve > selectedTier) {
-      // LEXICOGRAPHİK SON (büyük) dosya TAM olarak atılır; yeniden TAM ölçü.
-      activeReadonly = activeReadonly.slice(0, -1);
-      messages = build(finalReserve, activeReadonly);
-      inputTokens = await measure(messages);
-    }
-    if (activeReadonly.length < readonlyBlocks.length) {
-      truncatedReadonly = true;
-    }
-    // Invariant koruması: atımlar sıfıra iner ise paket, preflight'te
-    // sığılmış zorunlu yapıya eşittir → sığar. Yine de fail-closed:
-    if (inputTokens + finalReserve > selectedTier || inputTokens > runtimeMax) {
+    // Invariant koruması: final paket seçilen kadeye + runtime tavana sığmalı.
+    if (finalCount + finalReserve > selectedCandidate.tokens || finalCount > runtimeMax) {
       throw new ContextAssemblyError(
         "assembly_failed",
         "The assembled context exceeds the context budget",
       );
     }
 
-    // ── 10) uyarılar + sonuç ─────────────────────────────────────────────
+    // ── 9) uyarılar + sonuç ───────────────────────────────────────────────
     if (secretFileSeen) {
       warnings.push(SECRET_FILE_WARNING);
     }
@@ -394,12 +517,12 @@ export class ContextAssembler {
 
     return {
       status: "ready",
-      messages,
-      inputTokens,
+      messages: finalMessages,
+      inputTokens: finalCount,
       runtimeMaxTokens: runtimeMax,
       outputReserveTokens: finalReserve,
-      selectedContextTier: labelForTier(selectedTier),
-      selectedTierTokens: selectedTier,
+      selectedContextTier: selectedCandidate.label,
+      selectedTierTokens: selectedCandidate.tokens,
       truncatedReadonlyContext: truncatedReadonly,
       warnings,
     };
@@ -407,16 +530,32 @@ export class ContextAssembler {
 
   // ── iç yardımcılar ───────────────────────────────────────────────────────
 
-  /** `needs_split` pressure dosyaları: tam tokenize, içerik YOK (en büyük 8). */
+  /**
+   * `needs_split` pressure dosyaları (BLOCKER 5): gerçek model-görünür
+   * DÜZENLENEBİLİR BLOKUN TAMAMINI (`blockFor`) tam tokenize eder — `body`
+   * değil (blok çerçevesi + marker da ölçümdedir). Ölçüm/iptal ASLA 0'a ya da
+   * sahte alfabetik sıralamaya dönüştürülmez: tip'li backend/iptal hatası
+   * aynen yayılır, diğer hata fail-closed. Sıralama token'a göre, eşitlikte
+   * yol asc; en büyük 8.
+   */
   async #pressureFiles(blocks: readonly ContextBlock[], signal: AbortSignal | undefined): Promise<string[]> {
     const sized: Array<{ canonical: string; tokens: number }> = [];
     for (const block of blocks) {
-      let tokens = 0;
+      let tokens: number;
       try {
-        const result = await this.#runtime.tokenize(block.body, { signal });
+        const result = await this.#runtime.tokenize(blockFor(block), { signal });
         tokens = result.count;
-      } catch {
-        // İpucu metadata'sı danışmaktır: ölçüm hatası raporu bozamaz.
+      } catch (err) {
+        // İptal (→ BackendError "network") / backend hatası aynen; diğer hata
+        // fail-closed. Needs_split ASLA sahte sıralamayla üretilmez.
+        if (err instanceof BackendError) {
+          throw err;
+        }
+        throw new ContextAssemblyError(
+          "assembly_failed",
+          "Computing the pressure-file ranking failed",
+          { cause: err },
+        );
       }
       sized.push({ canonical: block.canonical, tokens });
     }
@@ -443,38 +582,45 @@ export class ContextAssembler {
   }
 
   /**
-   * Bir salt-okunur yolun CANLI ana-ağaç gövdesi (yol güvenliği zinciri):
-   * normalize → containment → symlink ATAL (hiç takip edilmez) → lstat
-   * (ENOENT → ABSENT; diğer errno → fail-closed) → link hedefi İÇ içinde
-   * (dış/kaçan → `unsafe_path`) → dosya oku (strict UTF-8 / BINARY marker).
+   * Bir salt-okunur yolun CANLI ana-ağaç gövdesi (yol güvenliği zinciri,
+   * BLOCKER 1): `root` KANONİK (caller fail-closed `realpath`; sözdizisel
+   * fallback YOK) + `canonical` normalize EDİLMİŞ (caller `normalizeRepoPath`
+   * — `.git`/`..`/mutlak/backslash/NUL zaten caller'da `unsafe_path`) →
+   * containment (defans) → symlink ATAL (fail-closed: I/O → `assembly_failed`;
+   * symlink → `unsafe_path`) → lstat (ENOENT → ABSENT; diğer → fail-closed)
+   * → link hedefi İÇ içinde (fail-closed) → dosya oku (strict UTF-8 / BINARY).
+   * `.git` içeriği buraya ULAŞMAZ (caller'da normalize `null` → `unsafe_path`).
    */
   async #readReadonlyBody(
-    repoRoot: string,
+    root: string,
     canonical: string,
     signal: AbortSignal | undefined,
   ): Promise<string> {
-    // Kök kanonik: macOS `/var` → `/private/var` gibi zincirler containment
-    // denetimini boşlamasın (pathSafety'nin `canonicalizeOutside` deseni).
-    let root: string;
-    try {
-      root = await this.#fs.realpath(repoRoot);
-    } catch {
-      root = path.resolve(repoRoot);
-    }
     const abs = resolveContained(root, canonical);
     if (abs === null) {
       throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
     }
-    if (await hasSymlinkInPath(abs, root, { includeTarget: false, lstatFn: this.#fs.lstat })) {
-      throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
+    // Atal sembolik bağlantı (fail-closed): I/O hatası (EACCES/EPERM/EIO/
+    // ELOOP) "sembolik bağlantı yok" sayılmaz → `assembly_failed`; symlink →
+    // `unsafe_path`. (hasSymlinkInPath fail-closed modu hatayı ATAR.)
+    try {
+      if (
+        await hasSymlinkInPath(abs, root, { includeTarget: false, lstatFn: this.#fs.lstat, failClosed: true })
+      ) {
+        throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
+      }
+    } catch (err) {
+      if (err instanceof ContextAssemblyError) {
+        throw err;
+      }
+      throw new ContextAssemblyError("assembly_failed", "Reading the read-only context failed", { cause: err });
     }
 
     let stat: Stats;
     try {
       stat = await this.#fs.lstat(abs);
     } catch (err) {
-      // YALNIZ GERÇEK yokluk "yok"tur; izin/IO/... fail-closed (yokmuş
-      // gibi değerlendirilmez — bağlam, ağaçla uyuşmazsa kullanılmaz).
+      // YALNIZ GERÇEK yokluk "yok"tur; izin/IO/... fail-closed.
       if (hasErrno(err, "ENOENT")) {
         return ABSENT_MARKER;
       }
@@ -489,7 +635,9 @@ export class ContextAssembler {
       } catch (err) {
         throw new ContextAssemblyError("assembly_failed", "Reading the read-only context failed", { cause: err });
       }
-      if (!(await symlinkTargetStaysInside(root, abs, target, this.#fs.realpath))) {
+      // Hedefi doğrularken `realpath` beklenmedik I/O ile başarısız olursa
+      // fail-closed (inference'a sızdırılmaz); kırık hedef (ENOENT) meşru.
+      if (!(await symlinkTargetStaysInside(root, abs, target, this.#fs.realpath, true))) {
         throw new ContextAssemblyError("unsafe_path", "A selected path is an unsafe symlink");
       }
       return `${SYMLINK_MARKER_PREFIX}${target}]`;

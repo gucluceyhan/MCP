@@ -167,7 +167,16 @@ Seven components. Deliberately few; each is small.
   including the orchestrator's uncommitted changes (the truth the user sees).
   Two-tier supply (Section 7.5): **editable base files** are served from the
   *immutable base*, never from the live tree; **additional read-only files**
-  are read fresh from the live tree at call time.
+  are read fresh from the live tree at call time. Every read-only path goes
+  through the **canonical path-safety boundary** (the same
+  `normalizeRepoPath` vocabulary as the Workspace): `.git` (case-insensitive),
+  traversal (`..`), absolute / backslash / NUL paths are rejected
+  (`unsafe_path`), alias paths are deduplicated, and uncertain I/O (root
+  `realpath`, ancestor `lstat`) fails closed — so no private repo metadata can
+  leak into the context. (Known residual: the check-then-`readFile` chain is
+  not atomic, so an *active concurrent local writer* racing the read could in
+  principle swap a path for a symlink; a static hostile repo is fully covered.
+  This is latent in v1, which feeds no read-only paths.)
 - Input: the file paths the orchestrator chose (Section 5) + the **resolved
   rules** (Section 6: a session-supplied payload, or — as fallback —
   `CLAUDE.md` / `AGENTS.md` read from the repo root; this read is the
@@ -182,15 +191,24 @@ Seven components. Deliberately few; each is small.
     inference request*; no character/line/byte heuristics.
   - **Output headroom** — reserve minimum **32,768** tokens, preferred
     **65,536** when capacity permits (both configurable); the input is never
-    allowed to consume the whole window.
-  - **Adaptive tiers** — select the smallest tier that safely fits
-    (64K / 128K / 192K / runtime maximum — scheduling targets, not hard
-    limits); never exceed `maximum_context_tokens`; a task that fits in 64K
-    is not inflated to 128K/192K; large Zeus tasks move up automatically.
-  - **Reduction priority** (when the candidate does not fit): (1) evict old
-    refinement history, (2) drop obsolete previous worker responses,
-    (3) reduce/truncate additional **read-only** reference context,
-    (4) trim non-essential ancillary context.
+    allowed to consume the whole window. Reserve priority: **required editable
+    > read-only > preferred reserve** — the preferred reserve is used only if it
+    fits the *already-selected* tier; it never inflates the tier and never evicts
+    read-only context.
+  - **Adaptive tiers** — the tier is chosen from the **FULL** context (required
+    + all read-only), selecting the smallest tier that fits it (64K / 128K / 192K
+    / runtime maximum — scheduling targets, not hard limits); never exceed
+    `maximum_context_tokens`. The **required-only** context is only the viability
+    gate (required + reserve > effective maximum → `needs_split`); it does *not*
+    pick the tier. A full context that fits 64K stays at 64K; one that needs 128K
+    moves up *before* any read-only is dropped. The public tier is the canonical
+    symbolic label (`64k`/`128k`/`192k`/`runtime_max`) carrying its provenance.
+  - **Reduction priority** (only when the **full** context cannot fit any
+    available tier / the effective maximum): (1) evict old refinement history,
+    (2) drop obsolete previous worker responses, (3) reduce **read-only**
+    reference context whole-file in deterministic (lexicographic) order with an
+    exact re-measure after each removal. Editable source is **never** truncated,
+    and the preferred output reserve is irrelevant to this decision.
   - **Rules soft budget** — default 8,192 tokens; over budget → compact
     redundant rule material deterministically where safe + record a warning;
     never silently drop safety-critical or task-critical rules.

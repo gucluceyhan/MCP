@@ -26,6 +26,16 @@ import path from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import type { Stats } from "node:fs";
 
+/** `err` bir `NodeJS.ErrnoException` ve `code` verilen errno'ya eşit mi? */
+function errnoIs(err: unknown, code: string): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as NodeJS.ErrnoException).code === code
+  );
+}
+
 /** Windows sürücülü mutlak: `C:\x`, `C:/x` (tek karakter sürücü). */
 const WINDOWS_DRIVE = /^[A-Za-z]:[\\/]/;
 /** Windows sürücü-göreceli: `C:foo` (mevcut dizin C:). */
@@ -68,8 +78,11 @@ export function normalizeRepoPath(raw: string): string | null {
     if (segment === "..") {
       return null;
     }
-    // Git yönetim alanı ASLA hedef olamaz (spec 14) — her konumda, her işlemdede.
-    if (segment === ".git") {
+    // Git yönetim alanı ASLA hedef olamaz (spec 14) — her konumda, her
+    // işlemde. BÜYÜK/KÜÇÜK harf duyarsız: case-insensitive dosya sistemlerinde
+    // (macOS APFS, Windows NTFS) `.GIT`/`.Git` gerçek `.git`'e çözümlenir —
+    // git metadata'sı bağlama ASLA sızdırılmaz (fail-safe: aşırı ret kabul).
+    if (segment.toLowerCase() === ".git") {
       return null;
     }
   }
@@ -225,12 +238,19 @@ export async function symlinkTargetStaysInside(
   linkAbs: string,
   target: string,
   resolveFn: (target: string) => Promise<string> = realpath,
+  failClosedOnResolveError = false,
 ): Promise<boolean> {
   const lexical = path.isAbsolute(target) ? path.resolve(target) : path.resolve(path.dirname(linkAbs), target);
   try {
     const resolved = await resolveFn(lexical);
     return isPathInsideOrEqual(repoRoot, resolved);
-  } catch {
+  } catch (err) {
+    // Kırık hedef (ENOENT) → sözdizimsel çözüm meşru (metadata raporlanır).
+    // Beklenmedik I/O (EACCES/EPERM/EIO/ELOOP) fail-closed: içerme
+    // belirlenemedi → REDDET (kaynağı takip edip okuyamayız).
+    if (failClosedOnResolveError && !errnoIs(err, "ENOENT")) {
+      return false;
+    }
     return isPathInsideOrEqual(repoRoot, lexical);
   }
 }
@@ -252,9 +272,17 @@ export async function symlinkTargetStaysInside(
 export async function hasSymlinkInPath(
   absolute: string,
   root: string,
-  options: { includeTarget: boolean; lstatFn?: (target: string) => Promise<Stats> } = {
-    includeTarget: true,
-  },
+  options: {
+    includeTarget: boolean;
+    lstatFn?: (target: string) => Promise<Stats>;
+    /**
+     * `true` (Context Assembler live read sınırı): atal `lstat`'ta ENOENT
+     * DIŞINDAKI I/O hatası (EACCES/EPERM/EIO/ELOOP) "sembolik bağlantı yok"
+     * olarak YORUMLANMAZ — hata ATILIR (çağrı tarafı `assembly_failed` yapar).
+     * `false`/verilmezse: atal var değil → denetim orada durar (Step 5).
+     */
+    failClosed?: boolean;
+  } = { includeTarget: true },
 ): Promise<boolean> {
   const rel = path.relative(root, absolute);
   if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
@@ -263,6 +291,7 @@ export async function hasSymlinkInPath(
   const segments = rel.split(path.sep).filter((segment) => segment !== "");
   const limit = options.includeTarget ? segments.length : Math.max(0, segments.length - 1);
   const probe = options.lstatFn ?? lstat;
+  const failClosed = options.failClosed === true;
 
   let current = root;
   for (let i = 0; i < limit; i++) {
@@ -274,8 +303,11 @@ export async function hasSymlinkInPath(
     let stat: Stats;
     try {
       stat = await probe(current);
-    } catch {
-      break; // Atal var değil → gerisi de var olamaz.
+    } catch (err) {
+      if (failClosed && !errnoIs(err, "ENOENT")) {
+        throw err; // Belirsiz I/O → fail-closed (güvenli taraf).
+      }
+      break; // Atal var değil (ENOENT) veya legacy → gerisi var olamaz.
     }
     if (stat.isSymbolicLink()) {
       return true;

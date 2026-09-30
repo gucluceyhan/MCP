@@ -1156,7 +1156,7 @@ test("31: explicit context tier above the runtime maximum → invalid_input + wo
   };
 
   await assert.rejects(
-    h.service.executeTask({ task: "Anything", files: ["src/a.ts"], contextTier: 131_072 }),
+    h.service.executeTask({ task: "Anything", files: ["src/a.ts"], contextTier: "128k" }),
     (err: unknown) => err instanceof SplashTaskError && err.kind === "invalid_input",
   );
   // Sonuç korunamadı → workspace imha + session dizini temiz; dispatch YOK:
@@ -1193,6 +1193,69 @@ test("31: explicit output reserve accepted → negotiated budget + dispatch meta
   // Kademe yine adaptif (64K'a sığan 128K'a KALKMAZ):
   assert.equal(result.context.selectedContextTier, "64k");
   assert.equal(h.backend.runCalls[0]?.options?.maxOutputTokens, 40_000);
+});
+
+// BLOCKER 4: açık "128k" (runtime ≥ 128K) → kade 131072 + etiket "128k".
+test("BLOCKER 4: context_tier \"128k\" (runtime 131072) → selected 131072, label 128k", async (t) => {
+  const h = await makeHarness(t);
+  h.backend.nextInfo = {
+    ready: true,
+    maximumContextTokens: 131_072,
+    servedModel: "fixture-model",
+    runtimeProcessId: 4242,
+  };
+  h.backend.runBehavior = async () => ({
+    content: okWorkerJson(),
+    usage: { inputTokens: 100, outputTokens: 10 },
+  });
+  const result = await h.service.executeTask({
+    task: "Change the value",
+    files: ["src/a.ts"],
+    contextTier: "128k",
+  });
+  assert.equal(result.status, "applied");
+  assert.equal(result.context.selectedContextTier, "128k");
+});
+
+// BLOCKER 4: açık "runtime_max" (max 131072) → etiket "runtime_max" (128k DEĞİL).
+test("BLOCKER 4: context_tier \"runtime_max\" (max 131072) → label runtime_max (provenance)", async (t) => {
+  const h = await makeHarness(t);
+  h.backend.nextInfo = {
+    ready: true,
+    maximumContextTokens: 131_072,
+    servedModel: "fixture-model",
+    runtimeProcessId: 4242,
+  };
+  h.backend.runBehavior = async () => ({
+    content: okWorkerJson(),
+    usage: { inputTokens: 100, outputTokens: 10 },
+  });
+  const result = await h.service.executeTask({
+    task: "Change the value",
+    files: ["src/a.ts"],
+    contextTier: "runtime_max",
+  });
+  assert.equal(result.status, "applied");
+  assert.equal(result.context.selectedContextTier, "runtime_max");
+});
+
+// BLOCKER 4: açık "192k" (max 131072) → invalid_input (sessizce sıkıştırılmaz); inference YOK.
+test("BLOCKER 4: context_tier \"192k\" (max 131072) → invalid_input, no inference", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "tier-192" });
+  h.backend.nextInfo = {
+    ready: true,
+    maximumContextTokens: 131_072,
+    servedModel: "fixture-model",
+    runtimeProcessId: 4242,
+  };
+  h.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run for an invalid tier");
+  };
+  await assert.rejects(
+    h.service.executeTask({ task: "Anything", files: ["src/a.ts"], contextTier: "192k" }),
+    (err: unknown) => err instanceof SplashTaskError && err.kind === "invalid_input",
+  );
+  assert.equal(h.backend.runCalls.length, 0);
 });
 
 test("26: secret in the task → redacted before the worker sees it; warning; never on the wire", async (t) => {

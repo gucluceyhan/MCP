@@ -210,12 +210,8 @@ test("explicit reserve below the minimum → invalid_input", async () => {
   );
 });
 
-test("non-integer tier / reserve → invalid_input", async () => {
+test("non-integer reserve → invalid_input", async () => {
   const assembler = new ContextAssembler({ runtime: new FakeRuntime() });
-  await assert.rejects(
-    assembler.assemble(baseInput({ contextTier: 65_536.5 })),
-    (err: unknown) => err instanceof ContextAssemblyError && err.kind === "invalid_input",
-  );
   await assert.rejects(
     assembler.assemble(baseInput({ outputReserveTokens: 32_768.5 })),
     (err: unknown) => err instanceof ContextAssemblyError && err.kind === "invalid_input",
@@ -227,7 +223,7 @@ test("explicit tier above the runtime maximum → invalid_input (never inflated)
   runtime.maxTokens = 65_536;
   const assembler = new ContextAssembler({ runtime });
   await assert.rejects(
-    assembler.assemble(baseInput({ contextTier: 131_072 })),
+    assembler.assemble(baseInput({ contextTier: "128k" })),
     (err: unknown) => err instanceof ContextAssemblyError && err.kind === "invalid_input",
   );
 });
@@ -307,7 +303,7 @@ test("explicit tier: single candidate — never inflated beyond it", async () =>
   runtime.countFn = () => 1_000; // 64K'a bile sığar; açık 128K verildi.
   const assembler = new ContextAssembler({ runtime });
 
-  const result = await assembler.assemble(baseInput({ contextTier: 131_072 }));
+  const result = await assembler.assemble(baseInput({ contextTier: "128k" }));
 
   assert.equal(result.status, "ready");
   if (result.status !== "ready") {
@@ -424,15 +420,16 @@ test("pressureFiles: at most 8, token-desc then path-asc, tokenizer failure → 
     "src/f04.ts",
   ]);
 
-  // Tokenizer hatası ipucunu bozamaz: o dosya 0'la sıralanır.
+  // BLOCKER 5: tokenizer arızası sıralamayı 0'a SAHTELEMEZ — tip'li hata
+  // YAYILIR; `needs_split` ASLA sahte sıralamayla üretilmez.
   const runtime2 = new FakeRuntime();
   runtime2.maxTokens = 65_536;
-  runtime2.countFn = () => 50_000;
+  runtime2.countFn = () => 50_000; // needs_split
   const failing = new Proxy(runtime2, {
     get(target, prop) {
       if (prop === "tokenize") {
         return async () => {
-          throw new Error("tokenizer down");
+          throw new BackendError("network", "tokenizer down");
         };
       }
       const value = (target as unknown as Record<string | symbol, unknown>)[prop];
@@ -440,22 +437,33 @@ test("pressureFiles: at most 8, token-desc then path-asc, tokenizer failure → 
     },
   }) as ContextRuntime;
   const assembler2 = new ContextAssembler({ runtime: failing });
-  const result2 = await assembler2.assemble(baseInput({ workspace }));
-  assert.equal(result2.status, "needs_split");
-  if (result2.status !== "needs_split") {
-    throw new Error("unreachable");
-  }
-  // Hepsi 0 token → path asc sıralaması: f00..f07.
-  assert.deepEqual(result2.pressureFiles, [
-    "src/f00.ts",
-    "src/f01.ts",
-    "src/f02.ts",
-    "src/f03.ts",
-    "src/f04.ts",
-    "src/f05.ts",
-    "src/f06.ts",
-    "src/f07.ts",
-  ]);
+  await assert.rejects(
+    assembler2.assemble(baseInput({ workspace })),
+    (err: unknown) => err instanceof BackendError && err.kind === "network",
+  );
+
+  // AbortSignal → iptal aynen YAYILIR (`needs_split`'a dönüştürülmez).
+  const controller = new AbortController();
+  controller.abort();
+  const runtime3 = new FakeRuntime();
+  runtime3.maxTokens = 65_536;
+  runtime3.countFn = () => 50_000; // needs_split
+  const aborting = new Proxy(runtime3, {
+    get(target, prop) {
+      if (prop === "tokenize") {
+        return async () => {
+          throw new BackendError("network", "aborted");
+        };
+      }
+      const value = (target as unknown as Record<string | symbol, unknown>)[prop];
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  }) as ContextRuntime;
+  const assembler3 = new ContextAssembler({ runtime: aborting });
+  await assert.rejects(
+    assembler3.assemble(baseInput({ workspace, signal: controller.signal })),
+    (err: unknown) => err instanceof BackendError,
+  );
 });
 
 // ── redaksiyon + secret dosya ────────────────────────────────────────────────
@@ -765,12 +773,14 @@ test("read-only reduction: lexicographic-last whole file evicted; editable never
   const runtime = new FakeRuntime();
   runtime.maxTokens = 131_072;
   // Bütçe modeli (deterministik, sistem şablonu boyutundan bağımsız):
-  // 1_000 + her salt-okunur blok 12_000 → 3 blok 37_000 (+32_768 pay = 69_768
-  // > 65_536 → c atılır; 2 blok 25_000 + 32_768 = 57_768 ≤ 65_536 → dur, a+b).
+  // 1_000 + her salt-okunur blok 45_000 → TAM bağlam 3 blok 136_000 + 32_768
+  // = 168_768 > 131_072 (runtime_max) → azaltım BAŞLAR: lexicographic SON
+  // (c) atılır; 2 blok 91_000 + 32_768 = 123_768 ≤ 131_072 → dur (a+b, 128k).
+  // (BLOCKER 2: kade TAM bağlamdan seçilir; yalnız tavan aşımında atılır.)
   runtime.countFn = (messages) => {
     const user = messages.find((m) => m.role === "user");
     const blocks = user ? (user.content.match(/===== READ-ONLY REFERENCE:/g) ?? []).length : 0;
-    return 1_000 + blocks * 12_000;
+    return 1_000 + blocks * 45_000;
   };
   const assembler = new ContextAssembler({ runtime, fs: h.fs });
 
@@ -818,6 +828,255 @@ test("measured messages ARE the dispatched messages (byte-identical; no rebuild)
   // — ölçüm çağrısı renderOptions'u aldı (reasoningEffort "xhigh"):
   // (burada dolaylı: aynı mesaj dizisi + aynı runtime = aynı prompt)
   void 0;
+});
+
+// ── BLOCKER düzeltmeleri (Step 7 güvenlik + bütçe önceliği) ─────────────────
+
+// BLOCKER 1: read-only kanonik yol güvenliği (.git ASLA okunamaz).
+test("BLOCKER 1: .git paths → unsafe_path (normalize null; içerik ASLA okunmaz)", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "src"), { recursive: true });
+  await writeFile(path.join(h.root, "src", "a.ts"), "x");
+  await mkdir(path.join(h.root, ".git"), { recursive: true });
+  await writeFile(path.join(h.root, ".git", "config"), "token=LEAKME\n");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("x") });
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: h.fs });
+  for (const bad of [".git", ".git/config", "foo/.git/config", "src/../.git/config", ".GIT/config", ".Git/config"]) {
+    await assert.rejects(
+      assembler.assemble(baseInput({ workspace, readonlyPaths: [bad] })),
+      (err: unknown) => err instanceof ContextAssemblyError && err.kind === "unsafe_path",
+    );
+  }
+});
+
+// BLOCKER 1: atal lstat I/O hatası → fail-closed (assembly_failed; hedef okunmaz).
+test("BLOCKER 1: ancestor lstat EACCES → assembly_failed (fail-closed; hedef okunmaz)", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "refs"), { recursive: true });
+  await writeFile(path.join(h.root, "refs", "doc.md"), "secret-target\n");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("x") });
+  const faults = new Map<string, string>([[path.join(h.root, "refs"), "EACCES"]]);
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: faultLayer(h.fs, faults) });
+  await assert.rejects(
+    assembler.assemble(baseInput({ workspace, readonlyPaths: ["refs/doc.md"] })),
+    (err: unknown) => err instanceof ContextAssemblyError && err.kind === "assembly_failed",
+  );
+});
+
+// BLOCKER 1: kök realpath başarısızlığı → fail-closed (sözdizisel fallback YOK).
+test("BLOCKER 1: repoRoot realpath EACCES → assembly_failed (no lexical fallback)", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "refs"), { recursive: true });
+  await writeFile(path.join(h.root, "refs", "doc.md"), "x");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("x") });
+  const fs: ContextFs = {
+    lstat: h.fs.lstat,
+    readFile: h.fs.readFile,
+    readlink: h.fs.readlink,
+    realpath: async () => {
+      throw Object.assign(new Error("EACCES (fault)"), { code: "EACCES" });
+    },
+  };
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs });
+  await assert.rejects(
+    assembler.assemble(baseInput({ workspace, readonlyPaths: ["refs/doc.md"] })),
+    (err: unknown) => err instanceof ContextAssemblyError && err.kind === "assembly_failed",
+  );
+});
+
+// BLOCKER 1: alias'lar tek kanonik blok (aynı dosya birden çok kez okunmaz).
+test("BLOCKER 1: aliases (src/./a.ts ≡ src//a.ts ≡ src/a.ts) → one canonical block", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "src"), { recursive: true });
+  await writeFile(path.join(h.root, "src", "a.ts"), "CONTENT");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("x") });
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: h.fs });
+  const result = await assembler.assemble(
+    baseInput({ workspace, readonlyPaths: ["src/./a.ts", "src//a.ts", "src/a.ts"] }),
+  );
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  const user = result.messages.find((m) => m.role === "user")?.content ?? "";
+  // Yalnız başlık (footer `END ...` aynı alt-diziyi içerir → başlığı sabitle).
+  assert.equal((user.match(/===== READ-ONLY REFERENCE: src\/a\.ts =====/g) ?? []).length, 1);
+});
+
+// BLOCKER 2: tam bağlam → kade. Required 64k'a sığar, tam 128k'a sığar → 128k,
+// salt-okunur KORUNUR (atılmaz).
+test("BLOCKER 2: required fits 64k, full fits 128k → 128k, readonly preserved", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "refs"), { recursive: true });
+  await writeFile(path.join(h.root, "refs", "big.md"), "x");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("small") });
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 196_608; // 64k/128k/192k kullanılabilir
+  runtime.countFn = (messages) => {
+    const user = messages.find((m) => m.role === "user")!;
+    const blocks = user.content.match(/===== READ-ONLY REFERENCE:/g) ?? [];
+    return 1_000 + blocks.length * 50_000; // required 1_000 (64k), tam 51_000 (128k)
+  };
+  const assembler = new ContextAssembler({ runtime, fs: h.fs });
+  const result = await assembler.assemble(baseInput({ workspace, readonlyPaths: ["refs/big.md"] }));
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  assert.equal(result.selectedContextTier, "128k");
+  assert.equal(result.selectedTierTokens, 131_072);
+  assert.equal(result.truncatedReadonlyContext, false); // salt-okunur atılmadı
+  const user = result.messages.find((m) => m.role === "user")?.content ?? "";
+  assert.ok(user.includes("READ-ONLY REFERENCE: refs/big.md"), "salt-okunur korundu");
+});
+
+// BLOCKER 2: tam bağlam 192k'a sığar → 192k, salt-okunur korunu.
+test("BLOCKER 2: full fits 192k → 192k, readonly preserved", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "refs"), { recursive: true });
+  await writeFile(path.join(h.root, "refs", "big.md"), "x");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("small") });
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 196_608;
+  runtime.countFn = (messages) => {
+    const user = messages.find((m) => m.role === "user")!;
+    const blocks = user.content.match(/===== READ-ONLY REFERENCE:/g) ?? [];
+    return 1_000 + blocks.length * 140_000; // tam 141_000 → 192k'a sığar, 128k'a değil
+  };
+  const assembler = new ContextAssembler({ runtime, fs: h.fs });
+  const result = await assembler.assemble(baseInput({ workspace, readonlyPaths: ["refs/big.md"] }));
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  assert.equal(result.selectedContextTier, "192k");
+  assert.equal(result.selectedTierTokens, 196_608);
+  assert.equal(result.truncatedReadonlyContext, false);
+  const user = result.messages.find((m) => m.role === "user")?.content ?? "";
+  assert.ok(user.includes("READ-ONLY REFERENCE: refs/big.md"));
+});
+
+// BLOCKER 3 (kritik): tercih payı sığmasa bile TÜM salt-okunur korunur + min;
+// bir salt-okunuru atmak preferred'i sığdıracaksa da atılmaz.
+test("BLOCKER 3: preferred doesn't fit → ALL readonly preserved + min (no eviction for preferred)", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "refs"), { recursive: true });
+  await writeFile(path.join(h.root, "refs", "a.md"), "x");
+  await writeFile(path.join(h.root, "refs", "b.md"), "x");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("s") });
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 196_608;
+  runtime.countFn = (messages) => {
+    const user = messages.find((m) => m.role === "user")!;
+    const blocks = user.content.match(/===== READ-ONLY REFERENCE:/g) ?? [];
+    return 8_000 + blocks.length * 36_000; // 2 blok = 80_000
+  };
+  const assembler = new ContextAssembler({ runtime, fs: h.fs });
+  const result = await assembler.assemble(
+    baseInput({ workspace, readonlyPaths: ["refs/a.md", "refs/b.md"] }),
+  );
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  assert.equal(result.selectedContextTier, "128k"); // tam bağlam 128k'a sığar (min payla)
+  assert.equal(result.outputReserveTokens, 32_768); // preferred (65536) sığmıyor → min
+  assert.equal(result.truncatedReadonlyContext, false); // BLOCKER 3: hiçbiri atılmadı
+  const user = result.messages.find((m) => m.role === "user")?.content ?? "";
+  assert.ok(user.includes("READ-ONLY REFERENCE: refs/a.md"));
+  assert.ok(user.includes("READ-ONLY REFERENCE: refs/b.md"), "ikisi de korundu");
+});
+
+// BLOCKER 4: açık `runtime_max` provenance (etiket sayısal türevi değil).
+test("BLOCKER 4: explicit runtime_max (max=131072) → label runtime_max (128k DEĞİL)", async () => {
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 131_072;
+  runtime.countFn = () => 1_000;
+  const assembler = new ContextAssembler({ runtime });
+  const result = await assembler.assemble(baseInput({ contextTier: "runtime_max" }));
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  assert.equal(result.selectedTierTokens, 131_072);
+  assert.equal(result.selectedContextTier, "runtime_max");
+});
+
+// BLOCKER 4: adaptif kanonik — config 128k seçilirse etiket 128k (runtime_max değil).
+test("BLOCKER 4: automatic canonical (max=131072, fits 128k not 64k) → label 128k", async () => {
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 131_072;
+  runtime.countFn = () => 90_000; // 90_000+32_768=122_768 > 65_536, ≤ 131_072
+  const assembler = new ContextAssembler({ runtime });
+  const result = await assembler.assemble(baseInput());
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  assert.equal(result.selectedTierTokens, 131_072);
+  assert.equal(result.selectedContextTier, "128k");
+});
+
+// BLOCKER 4: açık kanonik kademe runtime max'ı aşıyorsa → invalid_input (clamp YOK).
+test("BLOCKER 4: explicit 192k with max 131072 → invalid_input (no silent clamp)", async () => {
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 131_072;
+  const assembler = new ContextAssembler({ runtime });
+  await assert.rejects(
+    assembler.assemble(baseInput({ contextTier: "192k" })),
+    (err: unknown) => err instanceof ContextAssemblyError && err.kind === "invalid_input",
+  );
+});
+
+// BLOCKER 5/4: needs_split provenance — açık runtime_max → runtime_max (128k değil).
+test("needs_split provenance: forced runtime_max (max=131072) → selected_context_tier=runtime_max", async () => {
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 131_072;
+  runtime.countFn = () => 200_000; // 200_000+32_768 > 131_072 → needs_split
+  const workspace = fakeWorkspace("/repo", ["src/a.ts"], { "src/a.ts": fileEntry("x".repeat(5)) });
+  const assembler = new ContextAssembler({ runtime });
+  const result = await assembler.assemble(baseInput({ workspace, contextTier: "runtime_max" }));
+  assert.equal(result.status, "needs_split");
+  if (result.status !== "needs_split") {
+    throw new Error("unreachable");
+  }
+  assert.equal(result.selectedContextTier, "runtime_max");
+  assert.equal(result.availableMaxTokens, 131_072); // sayısal kalır
+});
+
+// needs_split provenance: adaptif (açık override yok) → runtime_max.
+test("needs_split provenance: automatic → selected_context_tier=runtime_max", async () => {
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 90_000; // kanonik kademeden küçük
+  runtime.countFn = () => 60_000; // 60_000+32_768=92_768 > 90_000 → needs_split
+  const workspace = fakeWorkspace("/repo", ["src/a.ts"], { "src/a.ts": fileEntry("x".repeat(5)) });
+  const assembler = new ContextAssembler({ runtime });
+  const result = await assembler.assemble(baseInput({ workspace }));
+  assert.equal(result.status, "needs_split");
+  if (result.status !== "needs_split") {
+    throw new Error("unreachable");
+  }
+  assert.equal(result.selectedContextTier, "runtime_max");
+  assert.equal(result.availableMaxTokens, 90_000);
+});
+
+// BLOCKER 5: pressure sıralaması TAM formatlanmış bloğu tokenize eder (body değil).
+test("BLOCKER 5: pressure ranking tokenizes the FULL formatted editable block", async () => {
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 65_536;
+  runtime.countFn = () => 50_000; // needs_split
+  runtime.tokenFn = (content) => content.length;
+  const workspace = fakeWorkspace("/repo", ["src/a.ts"], { "src/a.ts": fileEntry("body") });
+  const assembler = new ContextAssembler({ runtime });
+  const result = await assembler.assemble(baseInput({ workspace }));
+  assert.equal(result.status, "needs_split");
+  if (result.status !== "needs_split") {
+    throw new Error("unreachable");
+  }
+  const call = runtime.tokenCalls.at(-1) ?? "";
+  assert.ok(call.includes("===== EDITABLE BASE: src/a.ts ====="), "tam block başlığı");
+  assert.ok(call.includes("body"), "body içerikte");
+  assert.ok(call.includes("===== END EDITABLE BASE: src/a.ts ====="), "tam block sonu");
 });
 
 /** tmp yardımcıları ────────────────────────────────────────────────────────── */

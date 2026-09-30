@@ -114,8 +114,13 @@ export interface ContextAssemblyInput {
   minOutputReserve: number;
   /** Tercih edilen çıkış payı (token; ≥ min). */
   preferredOutputReserve: number;
-  /** Açık kademe override'ı (token) — runtime max'ı aşamaz. */
-  contextTier?: number;
+  /**
+   * Açık kademe override'ı — kanonik SEMBOLİK değer (`64k`/`128k`/`192k`/
+   * `runtime_max`). Token sayısalı `refreshRuntimeInfo` SONRASI runtime'a
+   * çözülür (BLOCKER 4); `runtime_max` → taze `maximumContextTokens`.
+   * Kanonik kademenin token değeri runtime max'ı aşıyorsa `invalid_input`.
+   */
+  contextTier?: SelectedContextTier;
   /** Açık çıkış payı override'ı (token) — config minimumu altı olamaz. */
   outputReserveTokens?: number;
   /** Ölçüm + dispatch render kimliğini aynen taşır. */
@@ -165,6 +170,12 @@ export interface ContextAssemblyNeedsSplit {
   /** Sığma denetiminde kullanılan pay (açık veya minimum). */
   outputReserveTokens: number;
   runtimeMaxTokens: number;
+  /**
+   * Geçerli tavanın KANONİK etiketi (provenance). Assembler doğrudan
+   * taşır; `labelForTier(availableMaxTokens)` ile yeniden türetilmez
+   * (açık `runtime_max` ≡ 131072 durumunu `128k`'tan ayırır — BLOCKER 4/5).
+   */
+  selectedContextTier: SelectedContextTier;
   /** Baskı oluşturan düzenlenebilir taban dosyaları (en büyük 8; içerik YOK). */
   pressureFiles: string[];
   warnings: string[];

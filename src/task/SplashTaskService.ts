@@ -51,6 +51,7 @@ import {
   WorkerContractError,
   type CompactContextMetadata,
   type CompactResult,
+  type SelectedContextTier,
   type ValidationResult,
   type WorkerResult,
 } from "../worker/result.js";
@@ -59,7 +60,6 @@ import { discoverRepoRoot } from "../workspace/git.js";
 import { canonicalizeOutside, isSafeSessionId } from "../workspace/pathSafety.js";
 import { WorkspaceError, type Workspace, type WorkspaceCreateInput } from "../workspace/Workspace.js";
 import { createGitWorktreeWorkspace } from "../workspace/GitWorktreeWorkspace.js";
-import { labelForTier } from "../context/ContextAssembler.js";
 import { redactText } from "../context/redact.js";
 import {
   ContextAssemblyError,
@@ -167,10 +167,12 @@ export interface SplashTaskRequest {
   /** Repository-göreceli düzenlenebilir yollar; boş dizi geçerli (create-only). */
   files: readonly string[];
   /**
-   * Açık bağlam kademesi (token) — VERİLMEDİSE adaptif seçim. Kullanıcı
-   * vermediyse dispatch seçeneklerinde TAMAMEN YOK (spec 34).
+   * Açık bağlam kademesi — kanonik SEMBOLİK değer (`64k`/`128k`/`192k`/
+   * `runtime_max`; BLOCKER 4). Token'ı assembler `refreshRuntimeInfo`
+   * SONRASI çözer. VERİLMEDİSE adaptif seçim; dispatch seçeneklerinde TAMAMEN
+   * YOK (spec 34).
    */
-  contextTier?: number;
+  contextTier?: SelectedContextTier;
   /**
    * Açık çıkış payı (token; config minimumunun altı olamaz) — VERİLMEDİSE
    * adaptif müzakere (preferred/min).
@@ -297,11 +299,16 @@ export class SplashTaskService {
         "The output reserve must be an integer no smaller than the minimum reserve",
       );
     }
+    // Açık kademe kanonik SEMBOLİK kümede olmalı (BLOCKER 4): sayısal veya
+    // bilinmeyen değer MCP şemasında zaten reddedilir; burası savunma derinliği.
     if (
       request.contextTier !== undefined &&
-      (!Number.isInteger(request.contextTier) || request.contextTier <= 0)
+      !(["64k", "128k", "192k", "runtime_max"] as readonly string[]).includes(request.contextTier)
     ) {
-      throw new SplashTaskError("invalid_input", "The context tier must be a positive integer");
+      throw new SplashTaskError(
+        "invalid_input",
+        "The context tier must be one of: 64k, 128k, 192k, runtime_max",
+      );
     }
 
     // ── repository keşfi (spec 9/10) — henüz hiçbir yazma YOK ─────────────
@@ -672,7 +679,7 @@ export class SplashTaskService {
         runtimeMaxTokens: needsSplit.runtimeMaxTokens,
         inputTokens: 0, // model çağrılmadı — hakediş icat edilmez
         outputReserveTokens: needsSplit.outputReserveTokens,
-        selectedContextTier: labelForTier(needsSplit.availableMaxTokens),
+        selectedContextTier: needsSplit.selectedContextTier,
         truncatedReadonlyContext: false,
       },
       summary: NEEDS_SPLIT_SUMMARY,
