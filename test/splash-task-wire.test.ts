@@ -11,6 +11,7 @@
  * - 58/59: bilinen tip'li hataların güvenli sözlüğü korunur; bilinmeyen
  *   istisna → `internal_error` / sabit mesaj; `cause`/stack/payload ASLA yok.
  */
+import { ContextAssemblyError } from "../dist/context/types.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -47,7 +48,7 @@ function appliedResult(): CompactResult {
       editsApplied: 3,
       rejected: [{ file: "src/c.ts", edit: 1, reason: "search text not found at operation 0" }],
     },
-    warnings: ["Simple context mode: adaptive budgeting, redaction, and project rules are not active yet."],
+    warnings: ["Sensitive values were redacted from the context."],
     usage: { in: 1_234, out: 256 },
   };
 }
@@ -301,6 +302,21 @@ test("59: WorkerContractError kinds preserved verbatim", () => {
     kind: "invalid_output",
     message: "Worker output is not valid JSON",
   });
+});
+
+test("59: ContextAssemblyError kinds preserved verbatim (safe fixed messages)", () => {
+  for (const [kind, message] of [
+    ["invalid_input", "The requested context tier exceeds the runtime maximum"],
+    ["unsafe_path", "A selected path is unsafe"],
+    ["assembly_failed", "Reading the read-only context failed"],
+  ] as Array<["invalid_input" | "unsafe_path" | "assembly_failed", string]>) {
+    const err = new ContextAssemblyError(kind, message, {
+      cause: new Error("fs errno + repo path + raw I/O fragment"),
+    });
+    const wire = serializeToolError(err);
+    assert.deepEqual(wire, { kind, message });
+    assert.ok(!JSON.stringify(wire).includes("errno") && !JSON.stringify(wire).includes("fs"));
+  }
 });
 
 test("59: SplashTaskError kinds preserved verbatim (incl. task_cleanup_failed)", () => {

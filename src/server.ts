@@ -8,7 +8,8 @@ import type { InferenceBackend } from "./backend/InferenceBackend.js";
 import { WorkerContract } from "./worker/WorkerContract.js";
 import { createGitWorktreeWorkspace } from "./workspace/GitWorktreeWorkspace.js";
 import type { Workspace, WorkspaceCreateInput } from "./workspace/Workspace.js";
-import { SplashTaskService } from "./task/SplashTaskService.js";
+import { ContextAssembler } from "./context/ContextAssembler.js";
+import { SplashTaskService, type ContextAssemblerLike } from "./task/SplashTaskService.js";
 import { serializeCompactResult, serializeToolError } from "./task/wire.js";
 
 /** Service name reported in MCP `initialize` and by the dev ping tool. */
@@ -48,6 +49,12 @@ export interface SplashRuntimeOptions {
    * verilmelidir — coordinator'ın arkasındaki backend aynı object'tir.
    */
   coordinator?: InferenceCoordinator;
+  /**
+   * İnjeksiyon: instrument edilmiş context assembler (varsayılan: süreç-tek
+   * `ContextAssembler`). Verilirse `backend` dikişi ile BİRLİKTE verilmelidir
+   * — assembler'ın ölçüm yüzeyi aynı backend object'idir (süreç-tek).
+   */
+  contextAssembler?: ContextAssemblerLike;
   /** İnjeksiyon: sahte/instrument edilmiş worker contract (spec 5). */
   workerContract?: WorkerContract;
   /** İnjeksiyon: sahte workspace fabrikası (varsayılan: Step 5 worktree). */
@@ -68,10 +75,16 @@ export interface SplashRuntimeOptions {
  *   (create-only görev) (spec 8). Her string açık repository-göreceli
  *   yoldur — glob/dizin/regex YOK.
  * - `options.reasoning_effort`: `none|low|medium|xhigh` (spec 6).
- *   Adaptif bütçe override'ları YOK (Step 7).
- * - `repo_root`/`session_id`/`output_root`/`context_tier`/`rules`/
- *   `system_prompt` çağrı başına ASLA alınmaz (spec 6/9): config + süreç
- *   CWD'sinden çözülür; şemada tanımsız alanlar SDK tarafında düşer.
+ * - `options.context_tier`: kanonik SEMBOLİK kademe (`64k`/`128k`/`192k`/
+ *   `runtime_max`) — sayısal değer kabul EDİLMEZ (BLOCKER 4). VERİLMEDİSE
+ *   adaptif seçim (Step 7). Runtime max'ı aşan kanonik kademe servis +
+ *   assembler katmanında `invalid_input`'tur (sessizce sıkıştırılmaz).
+ * - `options.output_reserve_tokens`: çıkış payı (token) — pozitif tam sayı;
+ *   VERİLMEDİSE adaptif müzakere (preferred/min). Config minimumunun altı
+ *   servis katmanında `invalid_input`'tur.
+ * - `repo_root`/`session_id`/`output_root`/`rules`/`system_prompt` çağrı
+ *   başına ASLA alınmaz (spec 6/9): config + süreç CWD'sinden çözülür;
+ *   şemada tanımsız alanlar SDK tarafında düşer.
  */
 const splashTaskInputSchema = z.object({
   task: z
@@ -81,6 +94,8 @@ const splashTaskInputSchema = z.object({
   options: z
     .object({
       reasoning_effort: z.enum(["none", "low", "medium", "xhigh"]).optional(),
+      context_tier: z.enum(["64k", "128k", "192k", "runtime_max"]).optional(),
+      output_reserve_tokens: z.number().int().positive().optional(),
     })
     .strict()
     .optional(),
@@ -90,9 +105,10 @@ const splashTaskInputSchema = z.object({
  * Transport-agnostic server kompozisyonu (DESIGN.md §2.1, 10, 11).
  *
  * SÜREÇ TEK instance'ları (spec 4):
- *   OpenAICompatBackend + InferenceCoordinator + WorkerContract +
- *   SplashTaskService — hepsi burada, birer kez kurulur; tüm `splash_task`
- *   çağrıları AYNI coordinator'ı paylaşır (istek başına coordinator YOK).
+ *   OpenAICompatBackend + InferenceCoordinator + ContextAssembler +
+ *   WorkerContract + SplashTaskService — hepsi burada, birer kez kurulur;
+ *   tüm `splash_task` çağrıları AYNI coordinator + assembler'ı paylaşır
+ *   (istek başına coordinator/assembler YOK).
  *
  * Konstrüksiyon tembel kalır (spec 84/85): hiçbir HTTP çağrısı (status/
  * models/completions) ve hiçbir dosya dizini oluşturmaz — bunlar yalnız
@@ -110,13 +126,14 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
       runtimeDir: path.join(config.outputRoot, "runtime"),
     });
   const workerContract = options.workerContract ?? new WorkerContract();
+  // SÜREÇ TEK (spec 4): assembler, coordinator ile AYNI backend instance'ını
+  // paylaşır — ölçüm (assembler) ve jenerasyon (coordinator) tek seri kaynaktan.
+  const contextAssembler = options.contextAssembler ?? new ContextAssembler({ runtime: backend });
 
   const taskService = new SplashTaskService({
     config,
     coordinator,
-    // Salt-okunur kapasite görünümü (runtime_max_tokens metadata'sı için);
-    // servis backend'in işlemlerini asla çağırmaz — üretim coordinator'da.
-    capacity: backend,
+    contextAssembler,
     workerContract,
     createWorkspace: options.createWorkspace ?? ((input) => createGitWorktreeWorkspace(input)),
     newSessionId: options.newSessionId,
@@ -159,7 +176,7 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
     }),
   );
 
-  // ── splash_task (Step 6 — ilk production aracı) ─────────────────────────
+  // ── splash_task (Step 6+7 — ilk production aracı) ────────────────────────
   // El çok incedir: şema doğrulaması (yukarıda) → servis orkestrasyonu →
   // wire serileştirme. İş mantığı `SplashTaskService`'tadır, burada YOK.
   server.registerTool(
@@ -177,6 +194,9 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
         const result = await taskService.executeTask({
           task: args.task,
           files: args.files,
+          // Verilmediyse undefined → adaptif bütçe (kademe/pay müzakeresi).
+          contextTier: args.options?.context_tier,
+          outputReserveTokens: args.options?.output_reserve_tokens,
           // Kullanıcı vermediyse undefined → dispatch seçeneklerinde TAMAMEN YOK.
           reasoningEffort: args.options?.reasoning_effort,
           // MCP SDK istek sinyali → coordinator `options.signal` (spec 35).

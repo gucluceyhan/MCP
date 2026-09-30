@@ -63,6 +63,17 @@ test("normalizeRepoPath: rejects .git in ANY component (spec 14)", () => {
   assert.equal(normalizeRepoPath("foo/.git/../../x"), null);
 });
 
+test("normalizeRepoPath: rejects .git case-insensitively (case-variant dirs, spec 14)", () => {
+  // case-insensitive dosya sistemlerinde (macOS APFS, Windows NTFS) `.GIT`
+  // gerçek `.git`'e çözümlenir — git metadata'sı bağlama sızdırılmaz:
+  assert.equal(normalizeRepoPath(".GIT"), null);
+  assert.equal(normalizeRepoPath(".GIT/config"), null);
+  assert.equal(normalizeRepoPath(".Git/config"), null);
+  assert.equal(normalizeRepoPath(".gIT/HEAD"), null);
+  assert.equal(normalizeRepoPath("src/.GIT/config"), null);
+  assert.equal(normalizeRepoPath("foo/.Git"), null);
+});
+
 test("normalizeRepoPath: rejects empty / bare-dot / NUL", () => {
   assert.equal(normalizeRepoPath(""), null);
   assert.equal(normalizeRepoPath("."), null);

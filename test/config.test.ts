@@ -154,3 +154,58 @@ test("base URL: a token-bearing query string is rejected without leaking it (sec
 test("base URL: a fragment is rejected without echoing it", () => {
   expectSafeRejection(`https://example.com/#${MARKER}`);
 });
+
+// ── Step 7: bağlam bütçesi doğrulaması (SPLASH_CONTEXT_TIERS / reserve'ler) ──
+
+test("context: clean env keeps the finalized tier/reserve defaults", () => {
+  const config = loadConfig({});
+  assert.deepEqual(config.context.tiers, [65_536, 131_072, 196_608]);
+  assert.equal(config.context.minOutputReserve, 32_768);
+  assert.equal(config.context.preferredOutputReserve, 65_536);
+});
+
+test("context: a valid tier subset (ascending) round-trips", () => {
+  const config = loadConfig({ SPLASH_CONTEXT_TIERS: "131072,196608" });
+  assert.deepEqual(config.context.tiers, [131_072, 196_608]);
+});
+
+test("context: a single known tier round-trips", () => {
+  const config = loadConfig({ SPLASH_CONTEXT_TIERS: "65536" });
+  assert.deepEqual(config.context.tiers, [65_536]);
+});
+
+test("context: an unknown tier value is rejected (no invented budget policy)", () => {
+  assert.throws(() => loadConfig({ SPLASH_CONTEXT_TIERS: "70000" }), /not a known context tier/);
+});
+
+test("context: a duplicate tier entry is rejected", () => {
+  assert.throws(() => loadConfig({ SPLASH_CONTEXT_TIERS: "65536,65536" }), /duplicate/);
+});
+
+test("context: a non-ascending tier list is rejected (order is part of the policy)", () => {
+  assert.throws(() => loadConfig({ SPLASH_CONTEXT_TIERS: "131072,65536" }), /strictly increasing/);
+});
+
+test("context: an empty tier entry is rejected", () => {
+  assert.throws(() => loadConfig({ SPLASH_CONTEXT_TIERS: "65536,,196608" }), /empty entry/);
+});
+
+test("context: preferred reserve below the minimum reserve is rejected", () => {
+  assert.throws(
+    () =>
+      loadConfig({
+        SPLASH_CONTEXT_MIN_OUTPUT_RESERVE: "40000",
+        SPLASH_CONTEXT_PREFERRED_OUTPUT_RESERVE: "30000",
+      }),
+    /must not be below the minimum reserve/,
+  );
+});
+
+test("context: preferred reserve equal to the minimum reserve is accepted", () => {
+  const config = loadConfig({
+    SPLASH_CONTEXT_MIN_OUTPUT_RESERVE: "40000",
+    SPLASH_CONTEXT_PREFERRED_OUTPUT_RESERVE: "40000",
+  });
+  assert.equal(config.context.minOutputReserve, 40_000);
+  assert.equal(config.context.preferredOutputReserve, 40_000);
+});
