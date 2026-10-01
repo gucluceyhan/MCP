@@ -9,6 +9,8 @@ import { WorkerContract } from "./worker/WorkerContract.js";
 import { createGitWorktreeWorkspace } from "./workspace/GitWorktreeWorkspace.js";
 import type { Workspace, WorkspaceCreateInput } from "./workspace/Workspace.js";
 import { ContextAssembler } from "./context/ContextAssembler.js";
+import { RulesResolver } from "./rules/RulesResolver.js";
+import type { RulesResolverLike } from "./rules/types.js";
 import { SplashTaskService, type ContextAssemblerLike } from "./task/SplashTaskService.js";
 import { serializeCompactResult, serializeToolError } from "./task/wire.js";
 
@@ -55,6 +57,12 @@ export interface SplashRuntimeOptions {
    * — assembler'ın ölçüm yüzeyi aynı backend object'idir (süreç-tek).
    */
   contextAssembler?: ContextAssemblerLike;
+  /**
+   * İnjeksiyon: instrument edilmiş rules resolver (varsayılan: süreç-tek
+   * `RulesResolver`). State YOKTUR (stateless) — tek instance paylaşımı
+   * yalnızca süreç-tek disiplinindendir.
+   */
+  rulesResolver?: RulesResolverLike;
   /** İnjeksiyon: sahte/instrument edilmiş worker contract (spec 5). */
   workerContract?: WorkerContract;
   /** İnjeksiyon: sahte workspace fabrikası (varsayılan: Step 5 worktree). */
@@ -82,9 +90,15 @@ export interface SplashRuntimeOptions {
  * - `options.output_reserve_tokens`: çıkış payı (token) — pozitif tam sayı;
  *   VERİLMEDİSE adaptif müzakere (preferred/min). Config minimumunun altı
  *   servis katmanında `invalid_input`'tur.
- * - `repo_root`/`session_id`/`output_root`/`rules`/`system_prompt` çağrı
- *   başına ASLA alınmaz (spec 6/9): config + süreç CWD'sinden çözülür;
- *   şemada tanımsız alanlar SDK tarafında düşer.
+ * - `options.rules` (Step 8): session/hook tarafından sağlanan proje
+ *   kuralları — düz string. BOŞLUK-TEK değer GEÇERLİDİR ama YOK sayılır
+ *   (repository fallback'i: root CLAUDE.md/AGENTS.md); geçerli bir payload
+ *   birincil kaynaktır ve repository'ya ASLA bakılmaz. VERİLMEDİSE de
+ *   repository fallback'i geçerlidir. Çözülen kuralların İÇERİĞİ wire'a
+ *   ASLA döndürülmez — yalnız `rules_source` provenance'ı döner.
+ * - `repo_root`/`session_id`/`output_root`/`system_prompt` çağrı başına
+ *   ASLA alınmaz (spec 6/9): config + süreç CWD'sinden çözülür; şemada
+ *   tanımsız alanlar SDK tarafında düşer.
  */
 const splashTaskInputSchema = z.object({
   task: z
@@ -96,6 +110,7 @@ const splashTaskInputSchema = z.object({
       reasoning_effort: z.enum(["none", "low", "medium", "xhigh"]).optional(),
       context_tier: z.enum(["64k", "128k", "192k", "runtime_max"]).optional(),
       output_reserve_tokens: z.number().int().positive().optional(),
+      rules: z.string().optional(),
     })
     .strict()
     .optional(),
@@ -106,9 +121,10 @@ const splashTaskInputSchema = z.object({
  *
  * SÜREÇ TEK instance'ları (spec 4):
  *   OpenAICompatBackend + InferenceCoordinator + ContextAssembler +
- *   WorkerContract + SplashTaskService — hepsi burada, birer kez kurulur;
- *   tüm `splash_task` çağrıları AYNI coordinator + assembler'ı paylaşır
- *   (istek başına coordinator/assembler YOK).
+ *   RulesResolver (Step 8) + WorkerContract + SplashTaskService — hepsi
+ *   burada, birer kez kurulur; tüm `splash_task` çağrıları AYNI
+ *   coordinator + assembler + resolver'ı paylaşır (istek başına
+ *   coordinator/assembler YOK).
  *
  * Konstrüksiyon tembel kalır (spec 84/85): hiçbir HTTP çağrısı (status/
  * models/completions) ve hiçbir dosya dizini oluşturmaz — bunlar yalnız
@@ -129,12 +145,16 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
   // SÜREÇ TEK (spec 4): assembler, coordinator ile AYNI backend instance'ını
   // paylaşır — ölçüm (assembler) ve jenerasyon (coordinator) tek seri kaynaktan.
   const contextAssembler = options.contextAssembler ?? new ContextAssembler({ runtime: backend });
+  // SÜREÇ TEK (Step 8): stateless resolver — tek instance tüm çağrılar için.
+  // Konstrüksiyon tembel: filesystem'e hiçbir şey dokunmaz.
+  const rulesResolver = options.rulesResolver ?? new RulesResolver();
 
   const taskService = new SplashTaskService({
     config,
     coordinator,
     contextAssembler,
     workerContract,
+    rulesResolver,
     createWorkspace: options.createWorkspace ?? ((input) => createGitWorktreeWorkspace(input)),
     newSessionId: options.newSessionId,
     processCwd: options.processCwd,
@@ -199,6 +219,9 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
           outputReserveTokens: args.options?.output_reserve_tokens,
           // Kullanıcı vermediyse undefined → dispatch seçeneklerinde TAMAMEN YOK.
           reasoningEffort: args.options?.reasoning_effort,
+          // Step 8: hook kuralları — verilmezse repository fallback'i
+          // (root CLAUDE.md / AGENTS.md) devreye girer.
+          rules: args.options?.rules,
           // MCP SDK istek sinyali → coordinator `options.signal` (spec 35).
           signal: extra.signal,
         });

@@ -23,6 +23,7 @@
 import { BackendError } from "../backend/errors.js";
 import { CoordinatorError } from "../backend/InferenceCoordinator.js";
 import { ContextAssemblyError } from "../context/types.js";
+import { RulesResolutionError } from "../rules/types.js";
 import { WorkspaceError } from "../workspace/Workspace.js";
 import { WorkerContractError, type CompactResult } from "../worker/result.js";
 import { SplashTaskError } from "./SplashTaskService.js";
@@ -60,6 +61,9 @@ export function serializeToolError(err: unknown): ToolErrorWire {
     return { kind: err.kind, message: err.message };
   }
   if (err instanceof ContextAssemblyError) {
+    return { kind: err.kind, message: err.message };
+  }
+  if (err instanceof RulesResolutionError) {
     return { kind: err.kind, message: err.message };
   }
   if (err instanceof SplashTaskError) {

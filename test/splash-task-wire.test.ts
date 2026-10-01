@@ -21,7 +21,8 @@ import {
 import { BackendError } from "../dist/backend/errors.js";
 import { CoordinatorError } from "../dist/backend/InferenceCoordinator.js";
 import { WorkspaceError } from "../dist/workspace/Workspace.js";
-import { WorkerContractError, type CompactResult } from "../dist/worker/result.js";
+import { WorkerContractError, type CompactResult, type RulesSource } from "../dist/worker/result.js";
+import { RULES_RESOLUTION_FAILED_MESSAGE, RulesResolutionError } from "../dist/rules/types.js";
 import { SplashTaskError } from "../dist/task/SplashTaskService.js";
 
 // ── fixture'lar ──────────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ function appliedResult(): CompactResult {
       editsApplied: 3,
       rejected: [{ file: "src/c.ts", edit: 1, reason: "search text not found at operation 0" }],
     },
-    warnings: ["Sensitive values were redacted from the context."],
+    warnings: ["Sensitive values were redacted before local-model transfer."],
     usage: { in: 1_234, out: 256 },
   };
 }
@@ -340,4 +341,32 @@ test("59: unknown exceptions never surface their payload → internal_error", ()
     message: "Internal Splash error",
   });
   assert.deepEqual(serializeToolError(null), { kind: "internal_error", message: "Internal Splash error" });
+});
+
+// ── Step 8: kurallar wire davranışı ─────────────────────────────────────────
+
+test("Step 8: RulesResolutionError → kind + fixed safe message; cause/path/errno never surface", () => {
+  const err = new RulesResolutionError("rules_resolution_failed", RULES_RESOLUTION_FAILED_MESSAGE, {
+    cause: new Error("EACCES /Users/secret/CLAUDE.md — raw errno + path"),
+  });
+  const wire = serializeToolError(err);
+  assert.deepEqual(wire, {
+    kind: "rules_resolution_failed",
+    message: "Project rules could not be resolved safely",
+  });
+  const text = JSON.stringify(wire);
+  assert.ok(!text.includes("EACCES") && !text.includes("CLAUDE.md") && !text.includes("errno"));
+});
+
+test("Step 8: every rules_source vocabulary value round-trips verbatim; content is never a wire field", () => {
+  const sources: RulesSource[] = ["hook", "CLAUDE.md", "AGENTS.md", "CLAUDE.md + AGENTS.md", "none"];
+  for (const rulesSource of sources) {
+    const wire = serializeCompactResult({ ...appliedResult(), rulesSource });
+    assert.equal(wire.rules_source, rulesSource);
+    // Kurallar İÇERİĞİ wire'da hiçbir alan olarak yaşamaz (DESIGN §6):
+    const keys = collectKeys(wire);
+    for (const forbidden of ["rules", "project_rules", "effective_rules", "rule_documents", "rules_content"]) {
+      assert.ok(!keys.has(forbidden), `content-bearing key "${forbidden}" leaked into the wire`);
+    }
+  }
 });

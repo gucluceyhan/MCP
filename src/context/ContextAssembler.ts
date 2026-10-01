@@ -9,11 +9,14 @@
  * - git YOK, yazma YOK: düzenlenebilir taraf BİREBİR immutable base
  *   snapshot'ından (`Workspace.readBaseEntry` — bellek, I/O'suz);
  *   salt-okunur taraf CANLI ana ağaçtan salt-okunur fs ile (ContextFs).
- * - Kurallar (Step 8) bu modülde DEĞİLDİR — `rules` hazır string olarak
- *   gelir (Step 7: `undefined`); `rules_soft_budget` yalnız config'te yaşar.
+ * - Kurallar (Step 8): `RulesResolver`'in bir kez çözümü (`resolvedRules`)
+ *   HAZIR gelir; bu modül onları REDAKTE + SOFT BÜTÇE + güvenli kompaksiyon
+ *   disiplininden geçirip worker prompt'una bayt-tam olarak sabitler
+ *   (çözüm/keşif — `src/rules` — BURADA YOK; `rulesSoftBudget` config'ten).
  *
  * Algoritma (deterministik sıra):
- *   1. girdi/override doğrulaması (sabit güvenli mesajlar)
+ *   1. girdi/override doğrulaması (sabit güvenli mesajlar; `rulesSoftBudget`
+ *      dahil)
  *   2. `refreshRuntimeInfo` → yetkili tavan (`R`) — başarısızlık tip'li
  *      hata olarak aynen yayılır (backend sorununu icat edilmiş bir duruma
  *      çevrilmez)
@@ -29,17 +32,23 @@
  *      mutlak/backslash/NUL → `unsafe_path`) + DEDUPE + sort; kök fail-closed
  *      `realpath`; symlink ATAL fail-closed; ENOENT → ABSENT; diğer →
  *      fail-closed
- *   7. PREFLIGHT (zorunlu: görev + düzenlenebilir; salt-okunur YOK): tam
- *      ölçü; `required + pay > tavan` → `needs_split` (BİLEŞTİRİLMEZ,
- *      KISILMAZ, inference'a inmez) + pressure dosyaları (tam blok tokenize,
- *      içerik YOK; ölçüm/iptal hatası sahte sıralamaya dönüştürülmez)
- *   8. TAM bağlam (zorunlu + TÜM salt-okunur) + adaptif kade: en küçük
+ *   7. KURALLAR (Step 8): belge başına redaksiyon (raw secret ASLA
+ *      tokenize/prompt'a girmez) → RULES SOURCE blokları → TAM tokenize
+ *      (soft bütçe karşılaştırması); aşım → YALNIZ birebir kopya belgeler
+ *      atılır (yeniden TAM ölçü) → hâlâ aşım: benzersiz içerik KORUNUR +
+ *      sabit uyarı. `none` → prompt'ta kurallar bloğu YOK.
+ *   8. PREFLIGHT (zorunlu: görev + düzenlenebilir + KURALLAR; salt-okunur
+ *      YOK): tam ölçü; `required + pay > tavan` → `needs_split`
+ *      (BİLEŞTİRİLMEZ, KISILMAZ, inference'a inmez) + pressure dosyaları
+ *      (tam blok tokenize, içerik YOK; ölçüm/iptal hatası sahte sıralamaya
+ *      dönüştürülmez)
+ *   9. TAM bağlam (zorunlu + TÜM salt-okunur) + adaptif kade: en küçük
  *      sığan kade; sığmıyorsa salt-okunur LEXICOGRAPHİK SONDAN TAM DOSYA
  *      atılır + yeniden TAM ölçülür. Düzenlenebilir kod ASLA kıpırdamaz.
- *   9. pay müzakeresi (yalnız açık pay verilmEDİSE): tercih payı YALNIZCA
+ *   10. pay müzakeresi (yalnız açık pay verilmEDİSE): tercih payı YALNIZCA
  *      seçilen kadeye sığıyorsa kullanılır; salt-okunur atılmaz, kade
  *      yükseltilmez. (usable context > preferred reserve)
- *   10. `messages` = ölçülen mesajların KENDİSİ — dispatch byte-bayt aynen
+ *   11. `messages` = ölçülen mesajların KENDİSİ — dispatch byte-bayt aynen
  *      onu taşır (`context.input_tokens` = bu tam ölçü, `usage.in` ASLA değil).
  *
  * Uyarılar SABİТ sözlüktür (kaynak/secret/path/komut YOK) — yalnız olay
@@ -60,12 +69,19 @@ import {
 } from "../workspace/pathSafety.js";
 import { isSecretFilePath, redactText, SECRET_FILE_MARKER } from "./redact.js";
 import {
+  dedupeRuleDocuments,
+  formatRuleDocuments,
+  RULES_COMPACTION_WARNING,
+  RULES_OVER_BUDGET_WARNING,
+} from "./rules.js";
+import {
   ContextAssemblyError,
   type AssembledContext,
   type ContextAssemblyInput,
   type ContextFs,
   type ContextRuntime,
 } from "./types.js";
+import type { RuleDocument } from "../rules/types.js";
 import type { SelectedContextTier } from "../worker/result.js";
 
 // ── Bağlam blok marker'ları (Step 6'nın simpleContext formatının devamı) ────
@@ -83,7 +99,12 @@ export const NOT_REPRESENTABLE_MARKER = "[NOT REPRESENTABLE IN IMMUTABLE BASE]";
 // ── Sabit uyarı sözlüğü (kaynak/secret/path YOK) ─────────────────────────────
 
 export const SECRET_FILE_WARNING = "Secret files were omitted from the context.";
-export const REDACTION_WARNING = "Sensitive values were redacted from the context.";
+/**
+ * Step 8: redaction now covers EVERYTHING that moves to the local model —
+ * task, editable base, read-only reference AND the resolved rules — so the
+ * warning says "before local-model transfer", not "from the context".
+ */
+export const REDACTION_WARNING = "Sensitive values were redacted before local-model transfer.";
 export const CONTEXT_REDUCTION_WARNING = "Read-only reference context was reduced to fit the context budget.";
 export const NEEDS_SPLIT_WARNING =
   "The required context exceeds the context budget; split the task into smaller files.";
@@ -248,6 +269,11 @@ export class ContextAssembler {
         "The preferred output reserve must not be below the minimum reserve",
       );
     }
+    // Soft bütçe pozitif tam sayıdır (config load zaten doğruladı; burası
+    // savunma derinliği — bozuk bir bütçe politikası sessizce çalışmaz).
+    if (!Number.isInteger(input.rulesSoftBudget) || input.rulesSoftBudget <= 0) {
+      throw new ContextAssemblyError("invalid_input", "The rules soft budget must be a positive integer");
+    }
     let reserve: number = input.minOutputReserve;
     if (input.outputReserveTokens !== undefined) {
       if (
@@ -378,7 +404,48 @@ export class ContextAssembler {
       }
     }
 
-    // ── mesaj inşası (WorkerContract — saf) ──────────────────────────────
+    // ── 7) KURALLAR (Step 8) — redaksiyon + soft bütçe + güvenli kompaksiyon ──
+    // Resolver'ın bayt-tam belgeleri burada REDAKTE edilir: raw secret
+    // değerler tokenizer'a, ölçüme veya prompt'a ASLA ulaşmaz (DESIGN.md §9).
+    // Soft bütçe aşımında TEK izinli kompaksiyon = birebir kopya belgeler;
+    // benzersiz kural malzemesi ASLA silinmez (aşım yalnız bildirilir).
+    // `none` (boş belgeler) → prompt'ta kurallar bloğu YOK.
+    let rulesText = "";
+    let rulesRedacted = false;
+    let rulesCompacted = false;
+    let rulesOverBudget = false;
+    let redactedDocuments: RuleDocument[] = [];
+    for (const doc of input.resolvedRules?.documents ?? []) {
+      const redacted = redactText(doc.content);
+      if (redacted !== doc.content) {
+        rulesRedacted = true;
+      }
+      // Redaksiyon placeholder üretir; normalde boşluk-tek'e düşmez —
+      // yine de kuralsız içerik bloğa girmesin (defansif, içerik dokunmaz).
+      if (redacted.trim().length > 0) {
+        redactedDocuments.push({ source: doc.source, content: redacted });
+      }
+    }
+    if (redactedDocuments.length > 0) {
+      rulesText = formatRuleDocuments(redactedDocuments);
+      let rulesTokens = await this.#measureRules(rulesText, input.signal);
+      if (rulesTokens > input.rulesSoftBudget) {
+        const deduped = dedupeRuleDocuments(redactedDocuments);
+        if (deduped.removed > 0) {
+          rulesCompacted = true;
+          redactedDocuments = deduped.kept;
+          rulesText = formatRuleDocuments(redactedDocuments);
+          // Kompaksiyonun etkisi KESİN olmalı → yeniden TAM ölç.
+          rulesTokens = await this.#measureRules(rulesText, input.signal);
+        }
+        if (rulesTokens > input.rulesSoftBudget) {
+          // Benzersiz içerik korunur; soft bütçe (yumuşak) aşım yalnız bildirilir.
+          rulesOverBudget = true;
+        }
+      }
+    }
+
+    // ── 8) mesaj inşası (WorkerContract — saf) ────────────────────────────
     const renderOptions: PromptRenderOptions = {};
     if (input.reasoningEffort !== undefined) {
       renderOptions.reasoningEffort = input.reasoningEffort;
@@ -398,16 +465,19 @@ export class ContextAssembler {
     };
     const build = (activeReserve: number, activeReadonly: readonly ContextBlock[]): InferenceMessage[] => {
       const context = [...editableBlocks, ...activeReadonly].map(blockFor).join("\n\n");
+      // Redakte + bütçelenmiş kurallar: worker'a byte-bayt aynen gider
+      // (boş string → WorkerContract PROJECT RULES bloğunu YOK sayar).
       return buildWorkerMessages({
         task: redactedTask,
-        rules: input.rules,
+        rules: rulesText,
         context,
         history: input.history,
         outputReserveTokens: activeReserve,
       });
     };
 
-    // ── 6) PREFLIGHT — zorunlu bağlam (görev + düzenlenebilir; salt-okunur YOK)
+    // ── 8) PREFLIGHT — zorunlu bağlam (görev + düzenlenebilir + KURALLAR;
+    //    salt-okunur YOK)
     // Zorunlu bağlam + pay tavana sığmıyorsa görev TEMELDE çalışamaz →
     // needs_split. (BLOCKER 2: kade seçimi BURALARA AİT DEĞİLDİR — tam bağlam
     // karar verir; zorunlu bağlam yalnız "görev çalışabilir mi?" sorusunu
@@ -421,8 +491,14 @@ export class ContextAssembler {
       if (secretFileSeen) {
         warnings.push(SECRET_FILE_WARNING);
       }
-      if (contentRedacted || taskRedacted) {
+      if (contentRedacted || taskRedacted || rulesRedacted) {
         warnings.push(REDACTION_WARNING);
+      }
+      if (rulesCompacted) {
+        warnings.push(RULES_COMPACTION_WARNING);
+      }
+      if (rulesOverBudget) {
+        warnings.push(RULES_OVER_BUDGET_WARNING);
       }
       return {
         status: "needs_split",
@@ -436,7 +512,7 @@ export class ContextAssembler {
       };
     }
 
-    // ── 7) TAM bağlam + adaptif tier (BLOCKER 2) ──────────────────────────
+    // ── 9) TAM bağlam + adaptif tier (BLOCKER 2) ──────────────────────────
     // KADE, zorunlu bağlamdan DEĞİL; TAM bağlamdan (görev + düzenlenebilir +
     // TÜM salt-okunur) seçilir — en küçük sığan kade. Açık override → tek
     // aday (asla üzerine KALKMAZ). Sığmıyorsa lexicographic SON TAM salt-
@@ -504,12 +580,18 @@ export class ContextAssembler {
       );
     }
 
-    // ── 9) uyarılar + sonuç ───────────────────────────────────────────────
+    // ── 11) uyarılar + sonuç ──────────────────────────────────────────────
     if (secretFileSeen) {
       warnings.push(SECRET_FILE_WARNING);
     }
-    if (contentRedacted || taskRedacted) {
+    if (contentRedacted || taskRedacted || rulesRedacted) {
       warnings.push(REDACTION_WARNING);
+    }
+    if (rulesCompacted) {
+      warnings.push(RULES_COMPACTION_WARNING);
+    }
+    if (rulesOverBudget) {
+      warnings.push(RULES_OVER_BUDGET_WARNING);
     }
     if (truncatedReadonly) {
       warnings.push(CONTEXT_REDUCTION_WARNING);
@@ -529,6 +611,23 @@ export class ContextAssembler {
   }
 
   // ── iç yardımcılar ───────────────────────────────────────────────────────
+
+  /**
+   * Kuralların TAM token ölçümü (Step 8 soft bütçe). İptal/backend hatası
+   * aynen yayılır (güvenli tip'li sözlük; sahte sayıya dönüştürülmez);
+   * diğer her hata fail-closed `assembly_failed` (sabit güvenli mesaj).
+   */
+  async #measureRules(content: string, signal: AbortSignal | undefined): Promise<number> {
+    try {
+      const result = await this.#runtime.tokenize(content, { signal });
+      return result.count;
+    } catch (err) {
+      if (err instanceof BackendError) {
+        throw err;
+      }
+      throw new ContextAssemblyError("assembly_failed", "Measuring the project rules failed", { cause: err });
+    }
+  }
 
   /**
    * `needs_split` pressure dosyaları (BLOCKER 5): gerçek model-görünür

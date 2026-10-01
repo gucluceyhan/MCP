@@ -2,9 +2,10 @@
  * Step 6+7: `splash_task` orkestrasyonu (DESIGN.md §3/5/7, 11 madde 6-7) —
  * Gerçek Splash delege loop'u:
  *
- *   task → repo keşfi → izole worktree → bağlam (assembler: redaksiyon +
- *   tam ölçü + adaptif kademe/pay + azaltma) → worker mesajları →
- *   inference (koordinator) → strict parse → workspace uygulaması → compact
+ *   task → repo keşfi → kurallar (resolver: hook → CLAUDE.md/AGENTS.md) →
+ *   izole worktree → bağlam (assembler: redaksiyon + tam ölçü + adaptif
+ *   kademe/pay + azaltma) → worker mesajları → inference (koordinator) →
+ *   strict parse → workspace uygulaması → compact
  *
  * SORUMLULUK SINIRI (spec 2): BU ADIM SADECE ORKESTRASYONDUR.
  * - İkinci bir Workspace Manager DEĞİLDİR — `Workspace` sözleşmesini tüketir.
@@ -13,6 +14,9 @@
  * - Context Assembler DEĞİLDİR — sürece tek assembler var; bağlamı
  *   `contextAssembler.assemble()` üzerinden kurar (Step 7); kendi ölçüm /
  *   redaksiyon / bütçe mantığı YOK.
+ * - Rules Resolver DEĞİLDİR — sürece tek resolver var (Step 8); kuralları
+ *   `rulesResolver.resolve()` üzerinden bir kez çözer ve CANLI görev
+ *   kaydına pin'ler; kendi keşif/okuma mantığı YOK.
  * - Session Manager DEĞİLDİR — Step 9'a kadar asgari in-memory
  *   active-task kayıt defteri (spec 64); disk kalıcılığı YOK.
  *
@@ -51,10 +55,18 @@ import {
   WorkerContractError,
   type CompactContextMetadata,
   type CompactResult,
+  type RulesSource,
   type SelectedContextTier,
   type ValidationResult,
   type WorkerResult,
 } from "../worker/result.js";
+import { RulesResolver } from "../rules/RulesResolver.js";
+import {
+  RULES_RESOLUTION_FAILED_MESSAGE,
+  RulesResolutionError,
+  type ResolvedRules,
+  type RulesResolverLike,
+} from "../rules/types.js";
 import { BackendError } from "../backend/errors.js";
 import { discoverRepoRoot } from "../workspace/git.js";
 import { canonicalizeOutside, isSafeSessionId } from "../workspace/pathSafety.js";
@@ -153,6 +165,11 @@ export interface SplashTaskServiceDeps {
    */
   contextAssembler: ContextAssemblerLike;
   workerContract?: WorkerContractLike;
+  /**
+   * Sürecin TEK Rules Resolver'ı (Step 8) — tüm çağrılar bu instance'ı
+   * paylaşır (stateless); istek başına resolver YOK.
+   */
+  rulesResolver?: RulesResolverLike;
   createWorkspace?: WorkspaceFactory;
   /** Kriptografik oturum kimliği (varsayılan: `crypto.randomUUID`). */
   newSessionId?: () => string;
@@ -180,18 +197,29 @@ export interface SplashTaskRequest {
   outputReserveTokens?: number;
   /** Kullanıcı vermediyse dispatch seçeneklerinde TAMAMEN YOK (spec 34). */
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Session/hook tarafından sağlanan proje kuralları (Step 8, spec 6/9/213):
+   * geçerli (boşluk-tek değil) bir payload → birincil kural kaynağı
+   * (`hook`); repository'ya ASLA bakılmaz. Boşluk-tek/eksik → repository
+   * keşfi (root CLAUDE.md / AGENTS.md). Orijinal payload aynen korunur
+   * (trim yalnız boşluk-tek denetimi içindir).
+   */
+  rules?: string;
   /** MCP SDK'nın istek sinyali → coordinator `options.signal`'a (spec 35). */
   signal?: AbortSignal;
 }
 
 /**
  * Geçici active-task kaydı (spec 64) — Step 9'un kalıcı Session Manager'ı
- * bunu değiştirir. Kurallar/geçmiş/kalıcı metadata/stale/bütçe YOK.
+ * bunu değiştirir. Kurallar Step 8'de BİLEK pin'lidir (canlı görev süresi;
+ * Step 9 onları disk metadata'sına taşır); geçmiş/stale/kalıcı bütçe YOK.
  */
 export interface ActiveTask {
   workspace: Workspace;
   /** `<outputRoot>/sessions/<sessionId>` — dizin temizliği için tek referans. */
   sessionDir: string;
+  /** Görev açılışında bir kez çözülüp pin'lenen kurallar (Step 8, spec 118). */
+  resolvedRules: ResolvedRules;
   latestResult: CompactResult;
 }
 
@@ -202,6 +230,7 @@ export class SplashTaskService {
   #coordinator: CoordinatorLike;
   #contextAssembler: ContextAssemblerLike;
   #workerContract: WorkerContractLike;
+  #rulesResolver: RulesResolverLike;
   #createWorkspace: WorkspaceFactory;
   #newSessionId: () => string;
   #processCwd: () => string;
@@ -223,6 +252,7 @@ export class SplashTaskService {
     this.#coordinator = deps.coordinator;
     this.#contextAssembler = deps.contextAssembler;
     this.#workerContract = deps.workerContract ?? new WorkerContract();
+    this.#rulesResolver = deps.rulesResolver ?? new RulesResolver();
     this.#createWorkspace = deps.createWorkspace ?? ((input) => createGitWorktreeWorkspace(input));
     this.#newSessionId = deps.newSessionId ?? (() => randomUUID());
     this.#processCwd = deps.processCwd ?? (() => process.cwd());
@@ -260,7 +290,8 @@ export class SplashTaskService {
    *
    * SIRA (güvenlik sıralaması — spec 13):
    *   girdi (task/files/override'lar) → repo keşfi → outputRoot containment
-   *   → session ID → kayıt çakışması → session mkdir → worktree →
+   *   → kurallar (resolver — Step 8; workspace ÖNCESİ fail-closed) →
+   *   session ID → kayıt çakışması → session mkdir → worktree →
    *   bağlam (assembler) → [needs_split?] → dispatch → parse → apply → kayıt.
    */
   async executeTask(request: SplashTaskRequest): Promise<CompactResult> {
@@ -310,6 +341,11 @@ export class SplashTaskService {
         "The context tier must be one of: 64k, 128k, 192k, runtime_max",
       );
     }
+    // Kurallar string'dir (Step 8) — MCP şeması zaten doğruladı; savunma
+    // derinliği (boşluk-tek payload GEÇERLİDİR: repository fallback'i tetikler).
+    if (request.rules !== undefined && typeof request.rules !== "string") {
+      throw new SplashTaskError("invalid_input", "The rules must be a string");
+    }
 
     // ── repository keşfi (spec 9/10) — henüz hiçbir yazma YOK ─────────────
     // Başlangıç = MCP süreci CWD'si; config `repoRoot` override olarak gider.
@@ -327,6 +363,28 @@ export class SplashTaskService {
     const canonicalOutputRoot = await canonicalizeOutside(this.#config.outputRoot, repoRoot);
     if (canonicalOutputRoot === null) {
       throw new SplashTaskError("output_root_unsafe", "The output root must be outside the repository");
+    }
+
+    // ── kurallar (Step 8, spec 27/138) — workspace/oturum OLUŞTURULMADAN ──
+    // Bir kez çöz + pin. Güvenli başarısızlık (non-regular entry, I/O,
+    // invalid UTF-8, belirsiz kök): istek workspace/oturum AÇILMADAN
+    // tip'li `rules_resolution_failed` ile düşer (kayıt defteri/
+    // session dizini yok — temizlik sahipliği gerektirmez).
+    let resolvedRules: ResolvedRules;
+    try {
+      resolvedRules = await this.#rulesResolver.resolve({
+        suppliedRules: request.rules,
+        repoRoot,
+      });
+    } catch (err) {
+      if (err instanceof RulesResolutionError) {
+        throw err; // zaten güvenli: sabit mesaj, fs detayı YOK
+      }
+      // Savunma derinliği: enjekte/bilinmeyen istisna da aynı güvenli
+      // tip'e düşer (yüzeye cause/stack/path ASLA gitmez).
+      throw new RulesResolutionError("rules_resolution_failed", RULES_RESOLUTION_FAILED_MESSAGE, {
+        cause: err,
+      });
     }
 
     // ── session ID (spec 11) — her deneme için TAZE kriptografik kimlik ──
@@ -381,17 +439,19 @@ export class SplashTaskService {
     }
 
     try {
-      // ── bağlam (spec 17-32, Step 7) — süreç-tek assembler ───────────────
+      // ── bağlam (spec 17-32, Step 7+8) — süreç-tek assembler ────────────
       // Assembler: redaksiyon + immutable taban + tam ölçü + adaptif
-      // kademe/pay + salt-okunur azaltma. Production v1: salt-okunur
-      // referans YOK (`readonlyPaths: []` — spec 86); kurallar (Step 8)
-      // YOK; geçmiş (Step 9) BOŞ.
+      // kademe/pay + salt-okunur azaltma + kurallar (Step 8: redakteli,
+      // soft bütçeli, güvenli komprime EDİLMİŞ form). Production v1:
+      // salt-okunur referans YOK (`readonlyPaths: []` — spec 86); geçmiş
+      // (Step 9) BOŞ.
       const assembly = await this.#contextAssembler.assemble({
         task: request.task,
         workspace,
         readonlyPaths: [],
-        rules: undefined, // Step 8 kuralları yükler; Step 7: YOK (spec 27)
-        history: [], // Step 9 rafine geçmişini getirir; Step 7: BOŞ (spec 28)
+        resolvedRules, // Step 8: görev açılışında bir kez çözüldü (spec 27/118)
+        rulesSoftBudget: this.#config.context.rulesSoftBudget,
+        history: [], // Step 9 rafine geçmişini getirir; Step 8: BOŞ (spec 28)
         tiers: this.#config.context.tiers,
         minOutputReserve: this.#config.context.minOutputReserve,
         preferredOutputReserve: this.#config.context.preferredOutputReserve,
@@ -405,8 +465,8 @@ export class SplashTaskService {
       //    BİLEŞTİRİLMEZ, KISILMAZ; workspace KORUNUR (Step 9'da
       //    refine/close onu kullanabilir) — inference'a inmez.
       if (assembly.status === "needs_split") {
-        const result = this.#needsSplitResult(sessionId, assembly);
-        await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
+        const result = this.#needsSplitResult(sessionId, assembly, resolvedRules.source);
+        await this.#retainOrCleanup(sessionId, workspace, sessionDir, resolvedRules, result);
         return result;
       }
 
@@ -433,8 +493,8 @@ export class SplashTaskService {
       //    KORUNUR (imha YOK — Step 9'da refine/close onu kullanacak).
       //    (shutdown kazandıysa koruma DEĞİL beklenen self-cleanup + red.) ──
       if (dispatched.status === "inference_busy") {
-        const result = this.#busyResult(sessionId, dispatched.conflict, assembly);
-        await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
+        const result = this.#busyResult(sessionId, dispatched.conflict, assembly, resolvedRules.source);
+        await this.#retainOrCleanup(sessionId, workspace, sessionDir, resolvedRules, result);
         return result;
       }
 
@@ -447,8 +507,15 @@ export class SplashTaskService {
       // search stringi ön-doğrulamaz, diff hesaplamaz, dosya yazmaz.
       const applyResult = await workspace.applyPatchSet(workerResult);
 
-      const result = this.#completedResult(sessionId, workerResult, applyResult, dispatched.result.usage, assembly);
-      await this.#retainOrCleanup(sessionId, workspace, sessionDir, result);
+      const result = this.#completedResult(
+        sessionId,
+        workerResult,
+        applyResult,
+        dispatched.result.usage,
+        assembly,
+        resolvedRules.source,
+      );
+      await this.#retainOrCleanup(sessionId, workspace, sessionDir, resolvedRules, result);
       return result;
     } catch (err) {
       // `#retainOrCleanup`'ın sonuçları (shutting_down / task_cleanup_failed)
@@ -565,13 +632,14 @@ export class SplashTaskService {
     sessionId: string,
     workspace: Workspace,
     sessionDir: string,
+    resolvedRules: ResolvedRules,
     result: CompactResult,
   ): Promise<void> {
     if (this.#disposed) {
       await this.#cleanupAfterFailure(workspace, sessionDir, null);
       throw new SplashTaskError("shutting_down", "Splash is shutting down");
     }
-    this.#active.set(sessionId, { workspace, sessionDir, latestResult: result });
+    this.#active.set(sessionId, { workspace, sessionDir, resolvedRules, latestResult: result });
   }
 
   /**
@@ -635,6 +703,7 @@ export class SplashTaskService {
     sessionId: string,
     conflict: InferenceConflict,
     assembly: Extract<AssembledContext, { status: "ready" }>,
+    rulesSource: RulesSource,
   ): CompactResult {
     const context: CompactContextMetadata = {
       runtimeMaxTokens: assembly.runtimeMaxTokens,
@@ -648,7 +717,7 @@ export class SplashTaskService {
       round: 1, // her yeni oturum 1. turdur (spec 50)
       status: "inference_busy",
       baseStatus: "fresh", // her yeni oturum yapısal olarak fresh (spec 49)
-      rulesSource: "none", // Step 8 kurallar; Step 7: YOK (spec 51)
+      rulesSource, // Step 8: çözülen provenance (content ASLA — spec 51)
       context,
       inference: { conflict },
       summary: "Inference is temporarily unavailable; no worker generation was run.",
@@ -668,13 +737,14 @@ export class SplashTaskService {
   #needsSplitResult(
     sessionId: string,
     needsSplit: Extract<AssembledContext, { status: "needs_split" }>,
+    rulesSource: RulesSource,
   ): CompactResult {
     return {
       sessionId,
       round: 1, // her yeni oturum 1. turdur (spec 50)
       status: "needs_split",
       baseStatus: "fresh", // tur denetimi ÖNCESİ — stale olsaydı `stale_base` olurdu
-      rulesSource: "none", // Step 8 kurallar; Step 7: YOK (spec 51)
+      rulesSource, // Step 8: çözülen provenance (content ASLA — spec 51)
       context: {
         runtimeMaxTokens: needsSplit.runtimeMaxTokens,
         inputTokens: 0, // model çağrılmadı — hakediş icat edilmez
@@ -717,6 +787,7 @@ export class SplashTaskService {
     },
     usage: InferenceUsage,
     assembly: Extract<AssembledContext, { status: "ready" }>,
+    rulesSource: RulesSource,
   ): CompactResult {
     const status = mapValidationToStatus(applyResult.validation);
     return {
@@ -724,7 +795,7 @@ export class SplashTaskService {
       round: 1,
       status,
       baseStatus: "fresh",
-      rulesSource: "none",
+      rulesSource, // Step 8: çözülen provenance (content ASLA — spec 51)
       context: {
         runtimeMaxTokens: assembly.runtimeMaxTokens,
         inputTokens: assembly.inputTokens, // tam preflight ölçüsü (spec 31)
@@ -753,6 +824,9 @@ export class SplashTaskService {
  * - `task_cleanup_failed` → TEMİZLİK BAŞARISIZ (shutdown'a yayılır).
  * - diğer `SplashTaskError` (invalid_input/output_root_unsafe/session_conflict)
  *   → GÜVENLİ: workspace oluşturulmadan önce atılır — yetkili temizlik YOK.
+ * - `RulesResolutionError` (Step 8) → GÜVENLİ: workspace/session OLUŞTURULMA-
+ *   DAN ÖNCE atılır (sıra: outputRoot → kurallar → session) — temizlik
+ *   yetkisi gerektirmez (dizin henüz yok).
  * - sıradan tip'li görev hataları
  *   (Workspace/Coordinator/Backend/WorkerContract/ContextAssembly)
  *   → GÜVENLİ: workspace SONRASI hatanın temizliği başarısız olsaydı, red
@@ -770,7 +844,8 @@ function inFlightRejectionFailsShutdown(reason: unknown): boolean {
     reason instanceof CoordinatorError ||
     reason instanceof BackendError ||
     reason instanceof WorkerContractError ||
-    reason instanceof ContextAssemblyError
+    reason instanceof ContextAssemblyError ||
+    reason instanceof RulesResolutionError
   ) {
     return false;
   }
