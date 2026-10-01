@@ -13,7 +13,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -53,6 +53,12 @@ import {
 } from "../dist/context/ContextAssembler.js";
 import { ContextAssemblyError } from "../dist/context/types.js";
 import type { SplashConfig } from "../dist/config.js";
+import { RulesResolver } from "../dist/rules/RulesResolver.js";
+import {
+  RulesResolutionError,
+  RULES_RESOLUTION_FAILED_MESSAGE,
+  type RulesFs,
+} from "../dist/rules/types.js";
 import { randomUUID } from "node:crypto";
 
 // ── Hermetic git ortamı ─────────────────────────────────────────────────────
@@ -1276,4 +1282,208 @@ test("26: secret in the task → redacted before the worker sees it; warning; ne
   const userMessage = h.backend.runCalls[0]?.messages.find((m) => m.role === "user")?.content ?? "";
   assert.ok(!userMessage.includes(rawSecret), "ham secret model'e ASLA gitmez");
   assert.ok(userMessage.includes("[REDACTED_SECRET]"), "redakte placeholder yerini alır");
+});
+
+// ── Step 8: proje kuralları (bir kez çöz + pin; worker'a; wire'a YOK) ───────
+
+/** Resolver fs çağılarını kaydeden kayıt defteri (hook önceliği kanıtı). */
+function recordingRulesFs(calls: string[]): RulesFs {
+  return {
+    async lstat(target: string) {
+      calls.push(`lstat:${target}`);
+      return lstat(target);
+    },
+    async readFile(target: string) {
+      calls.push(`readFile:${target}`);
+      return readFile(target);
+    },
+    async realpath(target: string) {
+      calls.push(`realpath:${target}`);
+      return realpath(target);
+    },
+  };
+}
+
+/** System mesajının içeriğini çıkarır (kurallar SYSTEM bloğundadır). */
+function systemOf(call: RunCall | undefined): string {
+  return call?.messages.find((m) => m.role === "system")?.content ?? "";
+}
+
+test("Step 8: repository CLAUDE.md → rulesSource `CLAUDE.md`; worker prompt'ta; ana checkout bayt-bayt dokunulmadı", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "rules-claude" });
+  const rulesText = "CLAUDE_RULE_MARKER always run tests before commit.\n";
+  await writeFile(path.join(h.fixture.repoRoot, "CLAUDE.md"), rulesText);
+  h.backend.runBehavior = async () => ({
+    content: okWorkerJson(),
+    usage: { inputTokens: 3, outputTokens: 2 },
+  });
+
+  const result = await h.service.executeTask({ task: "Change the value", files: ["src/a.ts"] });
+  assert.equal(result.status, "applied");
+  assert.equal(result.rulesSource, "CLAUDE.md");
+  const system = systemOf(h.backend.runCalls[0]);
+  assert.ok(system.includes("PROJECT RULES"), "kurallar bloğu system prompt'ta");
+  assert.ok(system.includes(rulesText), "kural içeriği worker'a verbatim gider");
+  // Resolver salt-okunurdur — görev sonrasında ana checkout'taki dosya AYNEN:
+  assert.equal(await readFile(path.join(h.fixture.repoRoot, "CLAUDE.md"), "utf8"), rulesText);
+});
+
+test("Step 8: CLAUDE.md YOK, AGENTS.md var → rulesSource `AGENTS.md`", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "rules-agents" });
+  await writeFile(path.join(h.fixture.repoRoot, "AGENTS.md"), "AGENTS_RULE_MARKER use the shared logger.\n");
+  h.backend.runBehavior = async () => ({
+    content: okWorkerJson(),
+    usage: { inputTokens: 3, outputTokens: 2 },
+  });
+
+  const result = await h.service.executeTask({ task: "Change the value", files: ["src/a.ts"] });
+  assert.equal(result.rulesSource, "AGENTS.md");
+  assert.ok(systemOf(h.backend.runCalls[0]).includes("AGENTS_RULE_MARKER"));
+});
+
+test("Step 8: options.rules (hook) + repository CLAUDE.md → `hook` kazanır; repository ASLA okunmaz", async (t) => {
+  const calls: string[] = [];
+  const h = await makeHarness(t, {
+    newSessionId: () => "rules-hook",
+    rulesResolver: new RulesResolver({ fs: recordingRulesFs(calls) }),
+  });
+  await writeFile(path.join(h.fixture.repoRoot, "CLAUDE.md"), "REPO_RULE_MARKER must not be read.\n");
+  h.backend.runBehavior = async () => ({
+    content: okWorkerJson(),
+    usage: { inputTokens: 3, outputTokens: 2 },
+  });
+
+  const hookRules = "HOOK_RULE_MARKER prefer hooks over effects.\n";
+  const result = await h.service.executeTask({ task: "Change the value", files: ["src/a.ts"], rules: hookRules });
+  assert.equal(result.rulesSource, "hook");
+  // Geçerli hook payload'ında repository'ya TEK BİR I/O bile düşmez (spec 9/139):
+  assert.deepEqual(calls, [], "hook önceliğinde repository I/O'su olmamalı");
+  const system = systemOf(h.backend.runCalls[0]);
+  assert.ok(system.includes(hookRules), "hook kuralları verbatim gider");
+  assert.ok(!system.includes("REPO_RULE_MARKER"), "repository kuralları bu görevde YOK");
+});
+
+test("Step 8: kurallı çözüm FAIL-CLOSED → rules_resolution_failed; session dizini YOK, dispatch YOK, kayıt defteri boş", async (t) => {
+  const h = await makeHarness(t, {
+    newSessionId: () => "rules-fail",
+    rulesResolver: {
+      async resolve() {
+        throw new RulesResolutionError("rules_resolution_failed", RULES_RESOLUTION_FAILED_MESSAGE, {
+          cause: new Error("EACCES /repo/CLAUDE.md"),
+        });
+      },
+    },
+  });
+  h.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run for a rules resolution failure");
+  };
+
+  await assert.rejects(
+    h.service.executeTask({ task: "Anything", files: ["src/a.ts"] }),
+    (err: unknown) => err instanceof RulesResolutionError,
+  );
+  // Resolution workspace/oturum ÖNCESİ düştü — hiçbir iz kalmamalı (spec 27/138):
+  assert.ok(!(await pathExists(h.sessionsDir)), "session dizini oluşmamalı");
+  assert.equal(h.service.activeTasks().length, 0);
+  assert.equal(h.backend.runCalls.length, 0);
+});
+
+test("Step 8: resolver'dan BİLİNMEYEN istisna → aynı güvenli tip (sabit mesaj; cause yüzeye çıkmaz)", async (t) => {
+  const h = await makeHarness(t, {
+    newSessionId: () => "rules-unknown",
+    rulesResolver: {
+      async resolve() {
+        throw new Error("EACCES /secret/rules/path with detail");
+      },
+    },
+  });
+
+  await assert.rejects(
+    h.service.executeTask({ task: "Anything", files: ["src/a.ts"] }),
+    (err: unknown) => {
+      assert.ok(err instanceof RulesResolutionError);
+      assert.equal(err.message, RULES_RESOLUTION_FAILED_MESSAGE); // fs detayı YOK
+      assert.ok(!String(err.stack ?? "").includes("/secret/rules/path"), "cause detayı yüzeye çıkmaz");
+      return true;
+    },
+  );
+  assert.ok(!(await pathExists(h.sessionsDir)));
+  assert.equal(h.service.activeTasks().length, 0);
+});
+
+test("Step 8: kurallar görev başına yeniden çözülür — task 1 V1'i pinler; ana tree değişince task 2 V2'yi görür", async (t) => {
+  let id = 0;
+  const h = await makeHarness(t, { newSessionId: () => `rules-pin-${(id += 1)}` });
+  await writeFile(path.join(h.fixture.repoRoot, "CLAUDE.md"), "V1_MARKER first version.\n");
+  h.backend.runBehavior = async () => ({
+    content: okWorkerJson(),
+    usage: { inputTokens: 3, outputTokens: 2 },
+  });
+
+  const first = await h.service.executeTask({ task: "A", files: ["src/a.ts"] });
+  assert.equal(first.rulesSource, "CLAUDE.md");
+  assert.ok(systemOf(h.backend.runCalls[0]).includes("V1_MARKER"));
+  assert.ok(!systemOf(h.backend.runCalls[0]).includes("V2_MARKER"));
+
+  // Ana checkout'taki kural dosyası görev ARASINDA değişir (resolver her görevde
+  // O ANKİ main tree'i okur; pin yalnız o görevin sonucu için geçerlidir):
+  await writeFile(path.join(h.fixture.repoRoot, "CLAUDE.md"), "V2_MARKER second version.\n");
+
+  const second = await h.service.executeTask({ task: "B", files: ["src/a.ts"] });
+  assert.equal(second.rulesSource, "CLAUDE.md");
+  assert.ok(systemOf(h.backend.runCalls[1]).includes("V2_MARKER"));
+  assert.ok(!systemOf(h.backend.runCalls[1]).includes("V1_MARKER"));
+});
+
+test("Step 8: inference_busy sonucu gerçek rulesSource taşır (hardcoded `none` değil)", async (t) => {
+  const h = await makeHarness(t, {}, async () => [
+    { pid: 1, ppid: 0, command: "/sbin/launchd" },
+    { pid: 777, ppid: 1, command: "/opt/homebrew/bin/mlx_lm.server --port 8080" },
+  ]);
+  await writeFile(path.join(h.fixture.repoRoot, "CLAUDE.md"), "BUSY_RULE_MARKER stay out.\n");
+  h.backend.runBehavior = async () => {
+    throw new Error("backend.run must NOT be called when the host is busy");
+  };
+
+  const result = await h.service.executeTask({ task: "Anything", files: ["src/a.ts"] });
+  assert.equal(result.status, "inference_busy");
+  assert.equal(result.rulesSource, "CLAUDE.md");
+  assert.equal(h.service.activeTasks().length, 1); // workspace korundu
+});
+
+test("Step 8: needs_split sonucu gerçek rulesSource taşır", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "split-rules" });
+  await writeFile(path.join(h.fixture.repoRoot, "AGENTS.md"), "SPLIT_RULE_MARKER stay out.\n");
+  h.backend.countBehavior = () => 100_000; // sığmaz → needs_split
+  h.backend.tokenizeBehavior = () => 42;
+  h.backend.runBehavior = async () => {
+    throw new Error("inference must NOT run for needs_split");
+  };
+
+  const result = await h.service.executeTask({ task: "Touch everything", files: ["src/a.ts"] });
+  assert.equal(result.status, "needs_split");
+  assert.equal(result.rulesSource, "AGENTS.md");
+});
+
+test("Step 8: failed (0 applied) sonucu gerçek rulesSource taşır; workspace korunur", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "failed-rules" });
+  await writeFile(path.join(h.fixture.repoRoot, "CLAUDE.md"), "FAILED_RULE_MARKER stay out.\n");
+  h.backend.runBehavior = async () => ({
+    content: workerJson({
+      summary: "Tried, but the base moved.",
+      edits: [
+        {
+          kind: "modify",
+          path: "src/a.ts",
+          operations: [{ search: "a string that is not in the base at all", replace: "x" }],
+        },
+      ],
+    }),
+    usage: { inputTokens: 10, outputTokens: 5 },
+  });
+
+  const result = await h.service.executeTask({ task: "Change something", files: ["src/a.ts"] });
+  assert.equal(result.status, "failed");
+  assert.equal(result.rulesSource, "CLAUDE.md");
+  assert.equal(h.service.activeTasks().length, 1);
 });

@@ -1,6 +1,6 @@
 # Splash — Architecture & Design (v2)
 
-Status: **Steps 1–7 implemented; rest design-only.**
+Status: **Steps 1–8 implemented; rest design-only.**
 
 Purpose: let a frontier orchestrator (Claude Code, OpenAI Codex) delegate
 *implementation* work to a **local LLM worker** to **significantly reduce
@@ -1165,19 +1165,37 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
        **process-local memory**: they live until `dispose()`/process exit and
        are destroyed there — this is NOT Step 9's disk persistence (which
        does not exist yet).
-  7. **Context Assembler + redaction + adaptive budget** — exact tokenization,
-     tier selection, output headroom, rules soft budget, reduction priority,
-     `needs_split` (Section 5).
-     **Implementation-stage note (incremental Step 7):** the shipped step
-     implements secret-file suppression, secret/PII redaction, exact token
-     measurement, adaptive tier selection, output-reserve negotiation,
-     read-only context reduction, and `needs_split`; the `splash_task` loop
-     consumes its output (measured messages == dispatched messages;
-     `context.input_tokens` is the exact preflight count). Rules loading
-     (Step 8) and refine history (Step 9) are still absent — the assembler
-     accepts them as placeholders (`rules: undefined`, `history: []`), and
-     production passes no read-only reference paths yet.
-8. **Rules loading** — pinned into the worker prompt.
+   7. **Context Assembler + redaction + adaptive budget** — exact tokenization,
+      tier selection, output headroom, rules soft budget, reduction priority,
+      `needs_split` (Section 5).
+      **Implementation-stage note (incremental Step 7, superseded for rules
+      by Step 8):** the shipped step implements secret-file suppression,
+      secret/PII redaction, exact token measurement, adaptive tier selection,
+      output-reserve negotiation, read-only context reduction, and
+      `needs_split`; the `splash_task` loop consumes its output (measured
+      messages == dispatched messages; `context.input_tokens` is the exact
+      preflight count). Refine history (Step 9) is still absent — the
+      assembler accepts it as a placeholder (`history: []`) — and production
+      passes no read-only reference paths yet.
+   8. **Rules loading** — pinned into the worker prompt.
+      **Implementation-stage note (incremental Step 8):** the shipped step
+      resolves the rules **once per `splash_task`** with the deterministic
+      fallback chain of Section 6: a valid, non-blank
+      `options.rules` payload wins absolutely (`hook`; the repository is
+      never touched); otherwise exactly two known root surfaces are read in
+      fixed order (`CLAUDE.md`, then `AGENTS.md`) — no crawling, no Git —
+      with fail-closed semantics (symlink/non-regular entry, any I/O error
+      other than `ENOENT`, invalid UTF-8, or an uncertain root
+      canonicalization all fail the request before any workspace/session
+      exists, with one fixed safe error). The Context Assembler then redacts
+      every rule document before any measurement, exact-measures the
+      formatted rules against the 8,192-token soft budget, and compacts ONLY
+      exact duplicates when over budget (unique rule material is never
+      silently removed; a remaining over-budget is reported with a fixed
+      warning). The resolved rules + provenance are pinned in the in-memory
+      active-task registry for the process lifetime — Step 9 moves that pin
+      (and the rest of the session state) to disk persistence. The rules
+      content never appears on the wire; only `rules_source` does.
 9. **Session Manager + `splash_refine`** — rounds, scoped reset + full
    patch-set re-apply, **stale-base check** (content + existence/type/mode +
    created-path collision, Section 7.5), read-only context on refine, history

@@ -34,6 +34,7 @@ import {
 } from "../dist/backend/InferenceBackend.js";
 import { BackendError } from "../dist/backend/errors.js";
 import type { SplashConfig } from "../dist/config.js";
+import { RulesResolutionError } from "../dist/rules/types.js";
 
 // ── Hermetic git fixture (service testleriyle aynı disiplin) ────────────────
 
@@ -289,10 +290,11 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
   for (const forbidden of ["repo_root", "session_id", "output_root", "rules", "system_prompt"]) {
     assert.ok(!Object.hasOwn(schema.properties, forbidden), `yasak alan şemada: ${forbidden}`);
   }
-  // Step 7: adaptif bütçe override'ları `options` altında:
+  // Step 7: adaptif bütçe override'ları `options` altında; Step 8: hook
+  // kuralları da `options` altında (top-level `rules` hâlâ YASAK — yukarıda):
   const optionsSchema = schema.properties.options as { properties: Record<string, unknown> } | undefined;
   assert.ok(optionsSchema !== undefined, "options şeması eksik");
-  for (const option of ["reasoning_effort", "context_tier", "output_reserve_tokens"]) {
+  for (const option of ["reasoning_effort", "context_tier", "output_reserve_tokens", "rules"]) {
     assert.ok(Object.hasOwn(optionsSchema.properties, option), `options.${option} şemada olmalı`);
   }
 
@@ -529,4 +531,119 @@ test("125: runtime.dispose() → session cleaned; subsequent task → shutting_d
   })) as WireContent;
   assert.ok(after.isError === true);
   assert.equal(parseWire(after).kind, "shutting_down");
+});
+
+// ── Step 8: kurallar MCP seviyesinde ─────────────────────────────────────────
+
+test("Step 8: options.rules over MCP → rules_source `hook`; worker sees it; content NEVER returns on the wire", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const session = await makeMcpSession(t, fixture);
+  session.backend.runBehavior = async () => ({
+    content: workerOkJson(),
+    usage: { inputTokens: 5, outputTokens: 5 },
+  });
+
+  const ruleText = "HOOKE_SPECIAL_RULE_MARKER use tabs everywhere.";
+  const res = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "Change the value", files: ["src/a.ts"], options: { rules: ruleText } },
+  })) as WireContent;
+
+  assert.ok(!res.isError, `beklenmedik hata: ${res.content?.[0]?.text}`);
+  const wire = parseWire(res);
+  assert.equal(wire.rules_source, "hook");
+  // Worker kuralları GÖRDÜ (prompt'ta) — ama wire'a ASLA dönmedi:
+  const prompt = session.backend.runCalls[0]?.messages[0]?.content ?? "";
+  assert.ok(prompt.includes(ruleText), "hook rules must reach the worker prompt");
+  const text = (res.content?.[0]?.text ?? "") as string;
+  assert.ok(!text.includes("HOOKE_SPECIAL_RULE_MARKER"), "rules content must not return on the wire");
+  assert.ok(!text.includes("use tabs everywhere"), "rules content must not return on the wire");
+});
+
+test("Step 8: repository CLAUDE.md over MCP → rules_source `CLAUDE.md`; content NEVER returns on the wire", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  await writeFile(
+    path.join(fixture.repoRoot, "CLAUDE.md"),
+    "CLAUDE_SPECIAL_RULE_MARKER never log credentials.\n",
+  );
+  const session = await makeMcpSession(t, fixture);
+  session.backend.runBehavior = async () => ({
+    content: workerOkJson(),
+    usage: { inputTokens: 5, outputTokens: 5 },
+  });
+
+  const res = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "Change the value", files: ["src/a.ts"] },
+  })) as WireContent;
+
+  assert.ok(!res.isError, `beklenmedik hata: ${res.content?.[0]?.text}`);
+  const wire = parseWire(res);
+  assert.equal(wire.rules_source, "CLAUDE.md");
+  const prompt = session.backend.runCalls[0]?.messages[0]?.content ?? "";
+  assert.ok(prompt.includes("CLAUDE_SPECIAL_RULE_MARKER"), "repository rules must reach the worker prompt");
+  const text = (res.content?.[0]?.text ?? "") as string;
+  assert.ok(!text.includes("CLAUDE_SPECIAL_RULE_MARKER"), "rules content must not return on the wire");
+  assert.ok(!text.includes("never log credentials"), "rules content must not return on the wire");
+  // Resolver salt-okunurdur: ana checkout'taki dosya görev sonrasında aynen:
+  assert.equal(await readFile(path.join(fixture.repoRoot, "CLAUDE.md"), "utf8"), "CLAUDE_SPECIAL_RULE_MARKER never log credentials.\n");
+});
+
+test("Step 8: rules resolution failure over MCP → safe typed error; no session dir, no inference", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const backend = new FakeBackend();
+  backend.runBehavior = async () => {
+    throw new Error("inference must NOT run for a rules resolution failure");
+  };
+  const runtime = createSplashRuntime(fixture.config, {
+    backend,
+    coordinator: new InferenceCoordinator({
+      backend,
+      runtimeDir: path.join(fixture.outputRoot, "runtime"),
+      scanner: CLEAN_SCANNER,
+      lock: new FakeLock(),
+    }),
+    rulesResolver: {
+      async resolve() {
+        throw new RulesResolutionError(
+          "rules_resolution_failed",
+          "Project rules could not be resolved safely",
+          { cause: new Error("EACCES /repo/CLAUDE.md") },
+        );
+      },
+    },
+    processCwd: () => fixture.repoRoot,
+  });
+  await runtime.server.connect(serverTransport);
+  const client = new Client({ name: "splash-step8-test", version: "0.0.1" });
+  await client.connect(clientTransport);
+  t.after(async () => {
+    try {
+      await client.close();
+    } catch {
+      // kapanış zaten gerçekleşmiş olabilir
+    }
+    try {
+      await runtime.server.close();
+    } catch {
+      // aynısı
+    }
+    await runtime.dispose().catch(() => undefined);
+  });
+
+  const res = (await client.callTool({
+    name: "splash_task",
+    arguments: { task: "Anything", files: ["src/a.ts"] },
+  })) as WireContent;
+
+  assert.ok(res.isError === true);
+  assert.deepEqual(parseWire(res), {
+    kind: "rules_resolution_failed",
+    message: "Project rules could not be resolved safely",
+  });
+  assert.ok(!String(res.content?.[0]?.text).includes("EACCES"), "fs detail must not surface");
+  // Resolution workspace/session ÖNCESİ düşer — hiçbir iz kalmamalı:
+  assert.equal(backend.runCalls.length, 0);
+  assert.ok(!(await pathExists(fixture.sessionsDir)), "no session directory must be created");
 });

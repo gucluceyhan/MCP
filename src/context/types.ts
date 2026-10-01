@@ -29,6 +29,7 @@ import type {
   TokenizeOptions,
   TokenizeResult,
 } from "../backend/InferenceBackend.js";
+import type { ResolvedRules } from "../rules/types.js";
 import type { SelectedContextTier } from "../worker/result.js";
 import type { WorkerHistoryMessage } from "../worker/WorkerContract.js";
 import type { Workspace } from "../workspace/Workspace.js";
@@ -96,8 +97,14 @@ export class ContextAssemblyError extends Error {
  * - `readonlyPaths`: salt-okunur referans yollar (canlı ana ağaçtan taze
  *   okunur). Production v1: her zaman `[]` — assembler yeteneğidir;
  *   Step 6/7 onu doldurmaz (spec: `readonlyPaths=[]`).
- * - `rules` / `history`: Step 8 (kurallar) / Step 9 (rafine geçmişi)
- *   için yer tutucular — Step 7'de sırasıyla `undefined` / `[]`.
+ * - `resolvedRules`: Step 8'de `RulesResolver` tarafından BİR KERE
+ *   çözülmüş proje kuralları (hook / CLAUDE.md / AGENTS.md / none +
+ *   bayt-tam belgeler). Assembler onları REDAKTE + SOFT BÜTÇE + güvenli
+ *   kompaksiyon'dan geçirip worker prompt'una sabitler; `source`
+ *   (`rules_source`) content'siz olarak compact result'a gider.
+ * - `rulesSoftBudget`: config'ten doğrulanmış kurallar soft bütçesi
+ *   (token; `SPLASH_CONTEXT_RULES_SOFT_BUDGET`).
+ * - `history`: Step 9 (rafine geçmişi) için yer tutucu — Step 8'de `[]`.
  * - `tiers` + reserve'ler: config'ten doğrulanmış değerler.
  * - `contextTier` / `outputReserveTokens`: istek başına açık override'lar
  *   (service ön-doğrulamıştır; assembler runtime'a karşı doğrular).
@@ -106,7 +113,9 @@ export interface ContextAssemblyInput {
   task: string;
   workspace: Workspace;
   readonlyPaths?: readonly string[];
-  rules?: string;
+  resolvedRules?: ResolvedRules;
+  /** Çözülmüş kuralların token soft bütçesi (pozitif tam sayı). */
+  rulesSoftBudget: number;
   history?: readonly WorkerHistoryMessage[];
   /** Doğrulanmış adaptif kademeler (64K/128K/192K altkümesi, artan). */
   tiers: readonly number[];
