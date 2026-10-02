@@ -87,9 +87,18 @@ export interface RulesResolverInput {
  * Exactly the three read operations rules discovery needs; the interface
  * itself is the boundary (no write/rename/unlink/member of any kind).
  * Production default: `node:fs/promises`. No mutable module-global seam.
+ *
+ * Step 9 hardening (spec 49): the production `readFile` member is the shared
+ * no-follow safe read (`workspace/SafeRepoReader.noFollowReadFile` —
+ * `open(O_RDONLY|O_NOFOLLOW)` → same-handle read), NOT a link-following read.
+ * The `lstat` → `readFile` call SEQUENCE is unchanged, so all Step 8 call
+ * counts / call-surface guards remain valid (spec 297); the race is closed
+ * because the content read itself is no-follow. Test seams implement `readFile`
+ * as scripted and model the race by making it fail with `ELOOP`.
  */
 export interface RulesFs {
   lstat(target: string): Promise<Stats>;
+  /** Safe content read — no-follow in production (spec 48/49). */
   readFile(target: string): Promise<Buffer>;
   realpath(target: string): Promise<string>;
 }

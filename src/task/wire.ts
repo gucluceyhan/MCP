@@ -23,10 +23,11 @@
 import { BackendError } from "../backend/errors.js";
 import { CoordinatorError } from "../backend/InferenceCoordinator.js";
 import { ContextAssemblyError } from "../context/types.js";
+import { SessionError } from "../session/types.js";
 import { RulesResolutionError } from "../rules/types.js";
 import { WorkspaceError } from "../workspace/Workspace.js";
 import { WorkerContractError, type CompactResult } from "../worker/result.js";
-import { SplashTaskError } from "./SplashTaskService.js";
+import { SplashTaskError } from "./errors.js";
 
 /** MCP tool hatası wire formu — güvenli metadata yalnız (spec 58). */
 export interface ToolErrorWire {
@@ -67,6 +68,11 @@ export function serializeToolError(err: unknown): ToolErrorWire {
     return { kind: err.kind, message: err.message };
   }
   if (err instanceof SplashTaskError) {
+    return { kind: err.kind, message: err.message };
+  }
+  // Step 9 oturum katmanı: 6 tip'li hata — hepsi SABİТ güvenli mesaj (spec 12);
+  // `cause` (teknik detay) ASLA yüzeye gitmez.
+  if (err instanceof SessionError) {
     return { kind: err.kind, message: err.message };
   }
   // Bilinmeyen istisna: mesaj/detay ASLA taşınmaz (spec 59).
@@ -132,8 +138,8 @@ export function serializeCompactResult(result: CompactResult): Record<string, un
     };
   }
   if (result.baseStatus === "stale") {
-    // Step 6 stale üretmez (stale denetimi Step 9'da); burada genel
-    // vocabulary korunur — `fresh`'te alan BİTTİ kalır.
+    // Step 9 stale-base denetimi üretir: kanonik, dedup'lu, sıralı yollar —
+    // kaynak içeriği/mod YOK (spec 37). `fresh`'te alan BİTTİ kalır (spec 55).
     wire.stale_files = [...result.staleFiles];
   }
   return wire;

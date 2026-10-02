@@ -3,15 +3,17 @@
  * üzerinden gerçek `McpServer` + `Client` konuşur.
  *
  * Gerçeklik karışımı: gerçek `createSplashRuntime` kompozisyonu (zod şema,
- * `splash_task`/`splash_ping`, runtime dispose) — backend SAHTE (model
- * çağrısı yok), coordinator GERÇEK (fake lock/scanner dikişleriyle).
+ * `splash_task`/`splash_refine`/`splash_ping`, runtime dispose) — backend
+ * SAHTE (model çağrısı yok), coordinator GERÇEK (fake lock/scanner
+ * dikişleriyle).
  *
  * Çiviler:
- * - 121: `splash_task` (zod şemalı) + geçici `splash_ping` kayıtlı; başlangıç
- *   TEBEL (HTTP/dizin yok).
+ * - 121: `splash_task` + `splash_refine` (zod şemalı) + geçici `splash_ping`
+ *   kayıtlı; başlangıç TEBEL (HTTP/dizin yok).
  * - 123/124: MCP yanıtı compact metadata — snake_case; source/diff/patch/
  *   context içeriği YOK; süreç-tek coordinator paylaşımlı.
- * - 125: güvenli hata serialization'ı + runtime dispose (shutdown davranışı).
+ * - 125: güvenli hata serialization'ı + Step 9 runtime dispose (kapatım
+ *   kalıcı oturumlara DOKUNULMAZ: worktree/sessions korunur).
  */
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -270,7 +272,20 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
   const session = await makeMcpSession(t, fixture);
   const tools = (await session.client.listTools()).tools;
   const names = tools.map((tool) => tool.name).sort();
-  assert.deepEqual(names, ["splash_ping", "splash_task"]);
+  // Step 9: `splash_refine` ikinci production aracı olarak kayıtlı.
+  assert.deepEqual(names, ["splash_ping", "splash_refine", "splash_task"]);
+
+  // `splash_refine` şeması (spec 19-20): `session_id` + `feedback` ZORUNLU;
+  // `files` (salt-okunur referans) İSTEKLİ.
+  const refineTool = tools.find((tool) => tool.name === "splash_refine");
+  assert.ok(refineTool !== undefined, "splash_refine kayıtlı olmalı");
+  const refineSchema = refineTool.inputSchema as {
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+  assert.ok(refineSchema.required?.includes("session_id"), "`session_id` zorunlu olmalı");
+  assert.ok(refineSchema.required?.includes("feedback"), "`feedback` zorunlu olmalı");
+  assert.ok(!refineSchema.required?.includes("files"), "`files` isteğe bağlı olmalı");
 
   const taskTool = tools.find((tool) => tool.name === "splash_task");
   assert.ok(taskTool !== undefined);
@@ -506,7 +521,7 @@ test("8: `files: []` (explicit empty array, create-only task) is still accepted"
   assert.equal(session.backend.runCalls.length, 1);
 });
 
-test("125: runtime.dispose() → session cleaned; subsequent task → shutting_down error result", async (t) => {
+test("125: runtime.dispose() → persistent session preserved (Step 9); subsequent task → shutting_down", async (t) => {
   const fixture = await makeMcpFixture(t);
   const session = await makeMcpSession(t, fixture);
   session.backend.runBehavior = async () => ({ content: workerOkJson(), usage: { inputTokens: 1, outputTokens: 1 } });
@@ -520,9 +535,15 @@ test("125: runtime.dispose() → session cleaned; subsequent task → shutting_d
   const sessionId = wire.session_id as string;
   assert.ok(await pathExists(path.join(fixture.sessionsDir, sessionId, "workspace")));
 
-  // Kapatım: kayıt defteri boşalır, worktree imha edilir, session dizini temiz.
+  // Kapatım (Step 9, spec 128-130): RAM kayıt defteri boşalır; KALICI
+  // OTURUMLARA DOKUNULMAZ — worktree imha EDİLMEZ, session dizini KALIR
+  // (süreç kapanışı implicit close DEĞİL; imha Step 10 `splash_close`).
   await session.runtime.dispose();
-  assert.ok(!(await pathExists(path.join(fixture.sessionsDir, sessionId))), "dispose session dizimini temizlemeli");
+  assert.ok(await pathExists(path.join(fixture.sessionsDir, sessionId)), "dispose session dizimini KORUMALI");
+  assert.ok(
+    await pathExists(path.join(fixture.sessionsDir, sessionId, "workspace")),
+    "dispose worktree'i KORUMALI (sonraki süreç reuse eder)",
+  );
 
   // Sonrası: yeni görev güvenle reddedilir (spec 69/71):
   const after = (await session.client.callTool({

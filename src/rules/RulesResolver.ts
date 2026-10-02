@@ -45,9 +45,11 @@
  * (spec 172/173).
  */
 
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import path from "node:path";
+
+import { noFollowReadFile } from "../workspace/SafeRepoReader.js";
 
 import {
   RULES_RESOLUTION_FAILED_MESSAGE,
@@ -64,7 +66,11 @@ const RULE_FILE_NAMES: readonly RuleDocumentSource[] = ["CLAUDE.md", "AGENTS.md"
 
 // ── Production filesystem (default seam) ────────────────────────────────────
 
-const realFs: RulesFs = { lstat, readFile, realpath };
+// `readFile` is the shared no-follow safe read (Step 9 spec 49): the
+// `lstat → readFile` sequence is unchanged, but the content read is
+// `open(O_NOFOLLOW)` + same-handle read, so a rule path swapped to a symlink
+// between the two cannot be followed. (see workspace/SafeRepoReader)
+const realFs: RulesFs = { lstat, readFile: noFollowReadFile, realpath };
 
 /** Resolver dependencies — `fs` is optional (default: `node:fs/promises`). */
 export interface RulesResolverDeps {
