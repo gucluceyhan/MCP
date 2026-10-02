@@ -7,6 +7,8 @@
 ## Durum
 - **Dal:** `feature/step9-session-manager` (= `origin/main` = `main` @ `e6593be`, Step 8/PR #30).
 - **Başlangıç başlık:** `e6593befc7521110e6ee21f8d988cb4bd13ee13f`.
+- **Step 9 commit:** `143e64a` — `Step 9: add persistent sessions and splash_refine`.
+- **PR:** https://github.com/gucluceyhan/MCP/pull/31 (draft; taban `main`).
 - **İş:** YALNIZ Step 9 — kalıcı SessionManager + `splash_refine` + stale-base +
   created-path çakışma + immutable yaşam döngüsü + tur geçmişi + exact küçültme +
   `max_rounds` + disk kalıcılığı + crash/restart kurtarma + eşzamanlı açık oturumlar.
@@ -137,10 +139,10 @@
    Step 8 TOCTOU notu handle-based no-follow çözümüne güncellendi; Step 6/7/8
    implementation notları Step 9'un disk kalıcılığı, history ve durable rules
    pin'i ile uyumlu hale getirildi; Step 9 implementation note eklendi.
-6. **Final kapanış** [remaining] — tek commit
-   `Step 9: add persistent sessions and splash_refine` (AI imzası YOK) →
-   draft PR (`## Merge Sırası: Bağımsız`, taban `main`) → 47-bölümlü final
-   rapor (spec 469).
+6. **Final kapanış** [nearly complete] — Step 9 commit `143e64a`
+   oluşturuldu, draft PR #31 açıldı (`## Merge Sırası: Bağımsız`, taban `main`).
+   Kalan: 47-bölümlü final rapor (spec 469) + PR #31'i sırası gelince
+   ready'ye alma.
 
 ## Kritik tasarım kararları (kayıtlı)
 - No-follow: `readFile` seam üyesi production'da no-follow; arayüz/imza değişmedi.
