@@ -125,6 +125,14 @@ function fakeWorkspace(
     exportPatch: async () => {
       throw new Error("fake workspace: no export in this test");
     },
+    snapshotRecoveryState: async () => {
+      throw new Error("fake workspace: no recovery in this test");
+    },
+    recoveryStateHash: async () => {
+      throw new Error("fake workspace: no recovery in this test");
+    },
+    currentCreatedPaths: () => [],
+    setReadonlyPaths: () => undefined,
     destroy: async () => undefined,
   };
 }

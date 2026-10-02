@@ -65,10 +65,12 @@ import {
   WorkspaceError,
   type Workspace,
   type WorkspaceCreateInput,
+  type WorkspaceRecoveryState,
 } from "../dist/workspace/Workspace.js";
 import {
   GitWorktreeWorkspace,
   createGitWorktreeWorkspace,
+  restoreGitWorktreeWorkspace,
   setWorkspaceFs,
   type WorkspaceFs,
 } from "../dist/workspace/GitWorktreeWorkspace.js";
@@ -2739,4 +2741,349 @@ test("readBaseEntry: exact immutable base view (file/binary/symlink/absent + all
     "no worktree may be left behind",
   );
   await rm(base, { recursive: true, force: true });
+});
+
+// ── Step 9: kurtarma (recovery) ─────────────────────────────────────────────
+//
+// Kontrol edilen senaryolar: CRLF (116), symlink (117), varlıksız (118),
+// yeniden-uygulama determinizmi + hash (119-121), main drift (124), drift
+// yok (125), hayatta BİREBİR worktree reuse (126), hayatta uyuşmayan
+// worktree yeniden kurma (127), base nesnesi pruned (case b, 111/112).
+//
+// Tüm testler GERÇEK git + izole tmp repo kullanır; her bir kendi alt dizinini
+// alır (`before`/`after` hook'ları `tmp`'yi temizler). Base'in BİREBİR
+// korunması — ana depodan ASLA yeniden yakalama YOK (spec 105/115/123).
+
+interface RecFixture {
+  repo: string;
+  out: string;
+}
+
+/**
+ * Kurtarma fixture'ı — spec 116/117/118/124/125 + case (b) için tam kontrol:
+ * - `src/crlf.ts`: committed, CRLF satır sonları (spec 116: normalizasyon YOK).
+ * - `src/plain.ts`: committed `v1\n` + unstaged `v2-UNSTAGED\n` (base'e ÖZEL
+ *   blob — case (b)'de blob rekonstrüksiyonu + main drift senaryosu).
+ * - `link`: committed sembolik bağlantı → `src/plain.ts` (spec 117).
+ * - `src/absent.ts`: seçili ama base'te yok (spec 118).
+ */
+async function buildRecFixture(name: string): Promise<RecFixture> {
+  const repo = path.join(tmp, name, "repo");
+  const out = path.join(tmp, name);
+  await mkdir(repo, { recursive: true });
+
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "Recovery User"]);
+  await gitOk(repo, ["config", "user.email", "recovery@local.invalid"]);
+  await mkdir(path.join(repo, "src"), { recursive: true });
+
+  await writeFile(path.join(repo, "src", "crlf.ts"), "line1\r\nline2\r\n");
+  await writeFile(path.join(repo, "src", "plain.ts"), "v1\n");
+  await symlink("src/plain.ts", path.join(repo, "link"));
+  await gitOk(repo, ["add", "src/crlf.ts", "src/plain.ts", "link"]);
+  await gitOk(repo, ["commit", "-m", "recovery init"]);
+
+  // unstaged değişiklik → base, main'den FARKLI bir ağaç/blob taşır (case b).
+  await writeFile(path.join(repo, "src", "plain.ts"), "v2-UNSTAGED\n");
+
+  return { repo, out };
+}
+
+function recInput(f: RecFixture, sessionId = "s-0001"): WorkspaceCreateInput {
+  return {
+    repoRoot: f.repo,
+    workspaceDir: path.join(f.out, "ws", sessionId),
+    sessionId,
+    editablePaths: ["src/crlf.ts", "src/plain.ts", "link", "src/absent.ts"],
+    readonlyPaths: [],
+  };
+}
+
+/** `git worktree remove` + dangling base object'ı tamamen prune eder (case b). */
+async function pruneBaseObject(fixture: RecFixture, baseCommit: string): Promise<void> {
+  await gitOk(fixture.repo, ["reflog", "expire", "--expire=now", "--all"]);
+  await gitOk(fixture.repo, ["prune", "--expire=now"]);
+  // doğrulama: base commit nesnesi artık YOK
+  let stillThere = true;
+  try {
+    await runGit(["cat-file", "-e", `${baseCommit}^{commit}`], {
+      cwd: fixture.repo,
+      config: ["core.hooksPath=/dev/null"],
+    });
+  } catch {
+    stillThere = false;
+  }
+  assert.equal(stillThere, false, "base commit object must be pruned for case (b)");
+}
+
+test("recovery: CRLF base preserved after missing-worktree restore (spec 116)", async () => {
+  const fixture = await buildRecFixture("rec-crlf");
+  const input = recInput(fixture, "s-crlf");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+    await ws.destroy();
+    assert.equal((await lstat(ws.workspaceDir).catch(() => null)), null, "worktree dir must be gone");
+
+    const ws2 = await restoreGitWorktreeWorkspace(state);
+    try {
+      const entry = ws2.readBaseEntry("src/crlf.ts");
+      assert.deepEqual(entry, {
+        exists: true,
+        type: "file",
+        mode: "100644",
+        content: Buffer.from("line1\r\nline2\r\n"),
+      });
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: symlink target + absent path restored without recapture (spec 117/118)", async () => {
+  const fixture = await buildRecFixture("rec-sym");
+  const input = recInput(fixture, "s-sym");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+
+    // spec 118: main'de base'te-olmayan yola YENİ dosya belirir — base'e girmez.
+    await writeFile(path.join(fixture.repo, "src", "absent.ts"), "newly appeared in main\n");
+
+    await ws.destroy();
+    const ws2 = await restoreGitWorktreeWorkspace(state);
+    try {
+      // spec 117: symlink hedef METNİ + 120000, dereferans YOK.
+      assert.deepEqual(ws2.readBaseEntry("link"), {
+        exists: true,
+        type: "symlink",
+        mode: "120000",
+        target: "src/plain.ts",
+      });
+      // spec 118: base'te asla var olmadığı için exists:false (main'deki yeni dosya YOK).
+      assert.deepEqual(ws2.readBaseEntry("src/absent.ts"), { exists: false });
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: reapply reproduces identical validation/created/hash (spec 119-121)", async () => {
+  const fixture = await buildRecFixture("rec-reapply");
+  const input = recInput(fixture, "s-reapply");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const edits: WorkerEdit[] = [
+      { kind: "modify", path: "src/plain.ts", operations: [{ search: "v2-UNSTAGED", replace: "v3" }] },
+      { kind: "create", path: "src/new.ts", content: "created\n" },
+    ];
+    const round1 = await ws.applyPatchSet(workerResult(edits));
+    assert.equal(round1.validation.editsApplied, 2);
+    assert.deepEqual(round1.createdPaths, ["src/new.ts"]);
+
+    const state = await ws.snapshotRecoveryState();
+    assert.deepEqual(state.currentCreatedPaths, ["src/new.ts"]);
+    await ws.destroy();
+
+    const ws2 = await restoreGitWorktreeWorkspace(state); // base'te (yeniden kuruldu)
+    try {
+      const round2 = await ws2.applyPatchSet(workerResult(edits)); // aynı tam patch
+      // spec 120: validation + filesChanged + diffStats + createdPaths birebir.
+      assert.deepEqual(round2.validation, round1.validation);
+      assert.deepEqual(round2.filesChanged, round1.filesChanged);
+      assert.deepEqual(round2.diffStats, round1.diffStats);
+      assert.deepEqual(round2.createdPaths, round1.createdPaths);
+      // spec 121: yeniden-uygulamadan sonra state hash == kalıcı hash.
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: immutable base survives main drift (spec 124)", async () => {
+  const fixture = await buildRecFixture("rec-drift");
+  const input = recInput(fixture, "s-drift");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+
+    // main drift: main working-tree plain.ts base'ten farklıya (v3) değişir.
+    await writeFile(path.join(fixture.repo, "src", "plain.ts"), "v3-DRIFT\n");
+
+    await ws.destroy();
+    const ws2 = await restoreGitWorktreeWorkspace(state);
+    try {
+      // base BİREBİR korunur (v2-UNSTAGED) — main'den (v3-DRIFT) ASLA değil.
+      const entry = ws2.readBaseEntry("src/plain.ts");
+      assert.deepEqual(entry, {
+        exists: true,
+        type: "file",
+        mode: "100644",
+        content: Buffer.from("v2-UNSTAGED\n"),
+      });
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: missing worktree, no main drift, reapply reconstructs (spec 125)", async () => {
+  const fixture = await buildRecFixture("rec-nodrift");
+  const input = recInput(fixture, "s-nodrift");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const edits: WorkerEdit[] = [
+      { kind: "modify", path: "src/plain.ts", operations: [{ search: "v2-UNSTAGED", replace: "v3" }] },
+    ];
+    const round1 = await ws.applyPatchSet(workerResult(edits));
+    assert.equal(round1.validation.editsApplied, 1);
+    const state = await ws.snapshotRecoveryState();
+
+    // main unchanged (v2-UNSTAGED); worktree yok edildi.
+    await ws.destroy();
+    const ws2 = await restoreGitWorktreeWorkspace(state);
+    try {
+      // reapply → önceki tam patch yeniden uygulanır; state hash eşleşir.
+      const round2 = await ws2.applyPatchSet(workerResult(edits));
+      assert.deepEqual(round2.diffStats, round1.diffStats);
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v3\n");
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: surviving worktree with matching identity+hash is reused (spec 126)", async () => {
+  const fixture = await buildRecFixture("rec-reuse");
+  const input = recInput(fixture, "s-reuse");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    await ws.applyPatchSet(workerResult([{ kind: "modify", path: "src/plain.ts", operations: [{ search: "v2-UNSTAGED", replace: "v3" }] }]));
+    const state = await ws.snapshotRecoveryState();
+
+    // worktree YIKILMADI — hayatta + kimlik + hash eşleşiyor.
+    const ws2 = await restoreGitWorktreeWorkspace(state);
+    try {
+      // reuse: worktree round-1 hâlinde (v3) KALIR; base'e SIFIRLANMAZ.
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v3\n");
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: surviving mismatched worktree is recreated from persisted state (spec 127)", async () => {
+  const fixture = await buildRecFixture("rec-mismatch");
+  const input = recInput(fixture, "s-mismatch");
+  const ws = await createGitWorktreeWorkspace(input);
+  const mainPlain = path.join(fixture.repo, "src", "plain.ts");
+  const mainPlainBefore = await readFile(mainPlain, "utf8");
+  try {
+    await ws.applyPatchSet(workerResult([{ kind: "modify", path: "src/plain.ts", operations: [{ search: "v2-UNSTAGED", replace: "v3" }] }]));
+    const state = await ws.snapshotRecoveryState();
+
+    // out-of-band mutasyon → state hash çelişki.
+    await writeFile(path.join(ws.workspaceDir, "src", "plain.ts"), "C-CORRUPT\n");
+
+    const ws2 = await restoreGitWorktreeWorkspace(state);
+    try {
+      // güvenilmez worktree → base'e (v2-UNSTAGED) yeniden kurulur; korozyon gider.
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v2-UNSTAGED\n");
+    } finally {
+      await ws2.destroy();
+    }
+    // ana depo ASLA dokunulmaz.
+    assert.equal(await readFile(mainPlain, "utf8"), mainPlainBefore);
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: base object pruned → full reconstruction via mktree/commit-tree (spec 111/112, case b)", async () => {
+  const fixture = await buildRecFixture("rec-pruned");
+  const input = recInput(fixture, "s-pruned");
+  const ws = await createGitWorktreeWorkspace(input);
+  const edits: WorkerEdit[] = [
+    { kind: "modify", path: "src/plain.ts", operations: [{ search: "v2-UNSTAGED", replace: "v3" }] },
+    { kind: "create", path: "src/new.ts", content: "created\n" },
+  ];
+  const round1 = await ws.applyPatchSet(workerResult(edits));
+  const state = await ws.snapshotRecoveryState();
+  const baseCommit = state.baseCommit;
+  try {
+    await ws.destroy();
+    await pruneBaseObject(fixture, baseCommit); // base commit + özel blob'ları yok et
+
+    const ws2 = await restoreGitWorktreeWorkspace(state); // case (b): yeniden kur
+    try {
+      // özel blob rekonstrüksiyon + snapshot: base BİREBİR (v2-UNSTAGED).
+      const entry = ws2.readBaseEntry("src/plain.ts");
+      assert.deepEqual(entry, {
+        exists: true,
+        type: "file",
+        mode: "100644",
+        content: Buffer.from("v2-UNSTAGED\n"),
+      });
+      // yeniden-uygulama: önceki tam patch + birebir sonuç + hash.
+      const round2 = await ws2.applyPatchSet(workerResult(edits));
+      assert.deepEqual(round2.diffStats, round1.diffStats);
+      assert.deepEqual(round2.createdPaths, round1.createdPaths);
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: snapshotRecoveryState is JSON-safe and content-free (spec 112/114)", async () => {
+  const fixture = await buildRecFixture("rec-shape");
+  const input = recInput(fixture, "s-shape");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+
+    assert.equal(state.schemaVersion, 1);
+    assert.equal(state.baseCommit, ws.baseCommit);
+    assert.equal(state.sessionId, "s-shape");
+    assert.equal(state.workspaceDir, ws.workspaceDir);
+    assert.ok(path.isAbsolute(state.repoRoot));
+
+    // 64-hex SHA-256 (kaynaksız).
+    assert.match(state.recoveryStateHash, /^[0-9a-f]{64}$/);
+
+    // JSON-güvenli: serialize/deserialize birebir.
+    const roundTripped: WorkspaceRecoveryState = JSON.parse(JSON.stringify(state));
+    assert.deepEqual(
+      [...roundTripped.editablePaths],
+      [...state.editablePaths],
+    );
+    assert.equal(roundTripped.baseCommitIdentity.tree, state.baseCommitIdentity.tree);
+    assert.ok(state.baseCommitIdentity.parents.every((p) => /^[0-9a-f]{40}$/.test(p) || p.length > 0));
+
+    // içerik ASLA düz bayt olarak değil — base64.
+    for (const [, value] of state.baseContents) {
+      assert.ok(
+        value.type === "absent" || (value.type === "file" && /^[A-Za-z0-9+/=\n]*$/.test(value.base64)) || value.type === "symlink",
+      );
+    }
+  } finally {
+    await ws.destroy();
+  }
 });

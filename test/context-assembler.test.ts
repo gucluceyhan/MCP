@@ -34,6 +34,8 @@ import {
   ABSENT_MARKER,
   BINARY_CONTENT_MARKER,
   CONTEXT_REDUCTION_WARNING,
+  HISTORY_REFINEMENT_REDUCTION_WARNING,
+  HISTORY_WORKER_REDUCTION_WARNING,
   NEEDS_SPLIT_WARNING,
   REDACTION_WARNING,
   SECRET_FILE_WARNING,
@@ -45,6 +47,7 @@ import {
   type AssembledContext,
   type ContextAssemblyInput,
   type ContextFs,
+  type ContextHistoryMessage,
   type ContextRuntime,
 } from "../dist/context/types.js";
 import { BackendError } from "../dist/backend/errors.js";
@@ -129,6 +132,14 @@ function fakeWorkspace(
     exportPatch: async () => {
       throw new Error("fake workspace: no export in this test");
     },
+    snapshotRecoveryState: async () => {
+      throw new Error("fake workspace: no recovery in this test");
+    },
+    recoveryStateHash: async () => {
+      throw new Error("fake workspace: no recovery in this test");
+    },
+    currentCreatedPaths: () => [],
+    setReadonlyPaths: () => undefined,
     destroy: async () => undefined,
   };
 }
@@ -161,6 +172,30 @@ function faultLayer(base: ContextFs, faults: Map<string, string>): ContextFs {
     readFile: wrap(base.readFile),
     readlink: wrap(base.readlink),
     realpath: base.realpath,
+  };
+}
+
+/**
+ * `readFile`-only fault layer (Step 9 race model, spec 195): faults ONLY the
+ * content read, leaving `lstat`/`readlink`/`realpath` real. This models the
+ * TOCTOU race — the path is a regular file during the `lstat` classification
+ * (real `lstat` → `isFile` true) but the no-follow content read fails with
+ * `ELOOP` (it became a symlink before the read). The outside target must never
+ * be read → `assembly_failed`.
+ */
+function readFileFaultLayer(base: ContextFs, faults: Map<string, string>): ContextFs {
+  const errno = (code: string) => Object.assign(new Error(`${code} (fault-injected)`), { code });
+  return {
+    lstat: base.lstat,
+    readlink: base.readlink,
+    realpath: base.realpath,
+    readFile: async (p: string): Promise<Buffer> => {
+      const code = faults.get(p);
+      if (code !== undefined) {
+        throw errno(code);
+      }
+      return base.readFile(p);
+    },
   };
 }
 
@@ -645,6 +680,27 @@ test("read-only path: content read; ENOENT → ABSENT; EACCES → fail-closed (n
   );
 });
 
+test("race (spec 195): read-only ref regular at lstat, ELOOP at the no-follow read → assembly_failed; outside target never read", async (t) => {
+  const h = await realFsHarness(t);
+  const repo = path.join(h.root, "repo");
+  await mkdir(path.join(repo, "refs"), { recursive: true });
+  await writeFile(path.join(repo, "refs", "doc.md"), "READ-ONLY-SECRET\n");
+  await chmodRepo(h.root);
+  const workspace = fakeWorkspace(repo, [], {});
+
+  // Real `lstat` (regular file) passes the classification; ONLY the content
+  // read is faulted to `ELOOP` (it became a symlink before the no-follow read).
+  const faults = new Map([[path.join(repo, "refs", "doc.md"), "ELOOP"]]);
+  const runtime = new FakeRuntime();
+  runtime.countFn = () => 100;
+  const failing = new ContextAssembler({ runtime, fs: readFileFaultLayer(h.fs, faults) });
+
+  await assert.rejects(
+    failing.assemble(baseInput({ workspace, readonlyPaths: ["refs/doc.md"] })),
+    (err: unknown) => err instanceof ContextAssemblyError && err.kind === "assembly_failed",
+  );
+});
+
 test("read-only path escape (../) → unsafe_path", async (t) => {
   const h = await realFsHarness(t);
   const repo = path.join(h.root, "repo");
@@ -1078,6 +1134,106 @@ test("BLOCKER 5: pressure ranking tokenizes the FULL formatted editable block", 
   assert.ok(call.includes("===== EDITABLE BASE: src/a.ts ====="), "tam block başlığı");
   assert.ok(call.includes("body"), "body içerikte");
   assert.ok(call.includes("===== END EDITABLE BASE: src/a.ts ====="), "tam block sonu");
+});
+
+// ── Step 9: rafine-geçmişi sınıflı azaltma (spec 87-92, 96-100) ─────────────
+
+function histMessage(
+  role: "user" | "assistant",
+  kind: "refinement" | "worker_response",
+  content: string,
+  protectedFlag: boolean,
+): ContextHistoryMessage {
+  return { role, kind, content, protected: protectedFlag };
+}
+
+/** History/readonly boş → sistem+user taban token'ı (senaryoda tavan buna göre ayarlanır). */
+async function baselineTokens(runtime: FakeRuntime, assembler: ContextAssembler): Promise<number> {
+  const result = await assembler.assemble(baseInput({ minOutputReserve: 10, preferredOutputReserve: 10, history: [] }));
+  assert.equal(result.status, "ready");
+  return result.status === "ready" ? result.inputTokens : -1;
+}
+
+test("Step 9: azaltma önce eski refinement'ı (en eskiden) atar, worker'a dokunmaz (spec 87)", async () => {
+  const runtime = new FakeRuntime();
+  const assembler = new ContextAssembler({ runtime });
+  const B = await baselineTokens(runtime, assembler);
+  runtime.maxTokens = B + 10 + 400; // geçmiş bütçesi ≈ 400 → yalnız eski ref atılır
+  const history = [
+    histMessage("user", "refinement", "a".repeat(200), false),
+    histMessage("user", "refinement", "b".repeat(200), false),
+    histMessage("assistant", "worker_response", "c".repeat(200), false),
+    histMessage("user", "refinement", "p".repeat(50), true),
+  ];
+  const result = await assembler.assemble(baseInput({ minOutputReserve: 10, preferredOutputReserve: 10, history }));
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  const contents = result.messages.map((m) => m.content);
+  assert.ok(contents.some((c) => c === "c".repeat(200)), "önceki worker korunur");
+  assert.ok(contents.some((c) => c === "p".repeat(50)), "korumalı korunur");
+  assert.ok(!contents.some((c) => c === "a".repeat(200)), "eski ref 1 atıldı");
+  assert.ok(!contents.some((c) => c === "b".repeat(200)), "eski ref 2 atıldı");
+  assert.ok(result.warnings.includes(HISTORY_REFINEMENT_REDUCTION_WARNING));
+  assert.ok(!result.warnings.includes(HISTORY_WORKER_REDUCTION_WARNING));
+  assert.equal(result.truncatedReadonlyContext, false); // yeni wire alanı yok (spec 100)
+});
+
+test("Step 9: sığmazsa önceki worker yanıtı da (en eskiden) atılır (spec 87)", async () => {
+  const runtime = new FakeRuntime();
+  const assembler = new ContextAssembler({ runtime });
+  const B = await baselineTokens(runtime, assembler);
+  runtime.maxTokens = B + 10 + 150; // bütçe ≈ 150 → refinement + worker atılır
+  const history = [
+    histMessage("user", "refinement", "a".repeat(200), false),
+    histMessage("user", "refinement", "b".repeat(200), false),
+    histMessage("assistant", "worker_response", "c".repeat(200), false),
+    histMessage("user", "refinement", "p".repeat(50), true),
+  ];
+  const result = await assembler.assemble(baseInput({ minOutputReserve: 10, preferredOutputReserve: 10, history }));
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  const contents = result.messages.map((m) => m.content);
+  assert.ok(contents.some((c) => c === "p".repeat(50)), "yalnız korumalı kalır");
+  assert.ok(!contents.some((c) => c === "c".repeat(200)), "önceki worker atıldı");
+  assert.ok(!contents.some((c) => c === "a".repeat(200)) && !contents.some((c) => c === "b".repeat(200)));
+  assert.ok(result.warnings.includes(HISTORY_REFINEMENT_REDUCTION_WARNING));
+  assert.ok(result.warnings.includes(HISTORY_WORKER_REDUCTION_WARNING));
+});
+
+test("Step 9: korumalı geçmiş bile sığmıyorsa → needs_split (spec 92)", async () => {
+  const runtime = new FakeRuntime();
+  const assembler = new ContextAssembler({ runtime });
+  const B = await baselineTokens(runtime, assembler);
+  runtime.maxTokens = B + 10 + 1_000; // korumalı (5000) sığmaz → needs_split
+  const history = [
+    histMessage("user", "refinement", "a".repeat(200), false), // isteğe bağlı (preflight'a girmez)
+    histMessage("assistant", "worker_response", "c".repeat(200), false),
+    histMessage("user", "refinement", "p".repeat(5_000), true), // korumalı — çok büyük
+  ];
+  const result = await assembler.assemble(baseInput({ minOutputReserve: 10, preferredOutputReserve: 10, history }));
+  assert.equal(result.status, "needs_split");
+  assert.ok(result.warnings.includes(NEEDS_SPLIT_WARNING));
+});
+
+test("Step 9: geçmiş içeriği dispatch'ten önce redakte edilir (spec 96-98)", async () => {
+  const runtime = new FakeRuntime();
+  runtime.maxTokens = 1_000_000; // azaltma tetiklenmez
+  const assembler = new ContextAssembler({ runtime });
+  const email = "alice@example.com";
+  const history = [histMessage("user", "refinement", `contact ${email} about it`, true)];
+  const result = await assembler.assemble(baseInput({ minOutputReserve: 10, preferredOutputReserve: 10, history }));
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  const joined = result.messages.map((m) => m.content).join("\n");
+  assert.ok(!joined.includes(email), "ham e-posta gitmez");
+  assert.ok(joined.includes("[REDACTED_EMAIL]"), "placeholder var");
+  assert.ok(result.warnings.includes(REDACTION_WARNING));
 });
 
 /** tmp yardımcıları ────────────────────────────────────────────────────────── */

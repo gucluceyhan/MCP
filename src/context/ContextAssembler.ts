@@ -55,12 +55,14 @@
  * türü bildirilir.
  */
 
-import { lstat, readFile, readlink, realpath } from "node:fs/promises";
+import { lstat, readlink, realpath } from "node:fs/promises";
 import type { Stats } from "node:fs";
+import { noFollowReadFile, StrictReadError } from "../workspace/SafeRepoReader.js";
+import { captureStrictLiveExistence, captureStrictLiveFingerprint } from "../workspace/fingerprint.js";
 import { BackendError } from "../backend/errors.js";
 import type { InferenceMessage, PromptRenderOptions, RuntimeInfo } from "../backend/InferenceBackend.js";
-import { buildWorkerMessages } from "../worker/WorkerContract.js";
-import { WorkspaceError, type WorkspaceBaseEntry } from "../workspace/Workspace.js";
+import { buildWorkerMessages, type WorkerHistoryMessage } from "../worker/WorkerContract.js";
+import { WorkspaceError, type PathFingerprint, type WorkspaceBaseEntry } from "../workspace/Workspace.js";
 import {
   hasSymlinkInPath,
   normalizeRepoPath,
@@ -79,7 +81,10 @@ import {
   type AssembledContext,
   type ContextAssemblyInput,
   type ContextFs,
+  type ContextHistoryMessage,
   type ContextRuntime,
+  type LiveBaseCaptureInput,
+  type LiveBaseState,
 } from "./types.js";
 import type { RuleDocument } from "../rules/types.js";
 import type { SelectedContextTier } from "../worker/result.js";
@@ -106,6 +111,11 @@ export const SECRET_FILE_WARNING = "Secret files were omitted from the context."
  */
 export const REDACTION_WARNING = "Sensitive values were redacted before local-model transfer.";
 export const CONTEXT_REDUCTION_WARNING = "Read-only reference context was reduced to fit the context budget.";
+/** Step 9: rafine-geçmişi azaltma uyarıları (spec 99) — içerik taşımaz. */
+export const HISTORY_REFINEMENT_REDUCTION_WARNING =
+  "Older refinement history was reduced to fit the context budget.";
+export const HISTORY_WORKER_REDUCTION_WARNING =
+  "Previous worker responses were reduced to fit the context budget.";
 export const NEEDS_SPLIT_WARNING =
   "The required context exceeds the context budget; split the task into smaller files.";
 
@@ -193,7 +203,11 @@ function automaticTierCandidates(tiers: readonly number[], runtimeMax: number): 
 
 // ── Production fs (varsayılan seam) ──────────────────────────────────────────
 
-const realFs: ContextFs = { lstat, readFile, readlink, realpath };
+// `readFile` is the shared no-follow safe read (Step 9 spec 50): a regular-file
+// read-only reference leaf is read via `open(O_NOFOLLOW)` + same-handle read,
+// so a reference path swapped to a symlink between the ancestor/`lstat` checks
+// and the content read cannot be followed (outside target never read).
+const realFs: ContextFs = { lstat, readFile: noFollowReadFile, readlink, realpath };
 
 /** Assembler bağımlılıkları — `fs` isteğe bağlı (varsayılan: node:fs/promises). */
 export interface ContextAssemblerDeps {
@@ -445,6 +459,24 @@ export class ContextAssembler {
       }
     }
 
+    // ── 7b) rafine-geçmişi redaksiyonu (Step 9, spec 96-98) ──────────────
+    // Geçmiş içeriği (geri bildirim + validation + önceki worker sonucu) yerel
+    // modele gitmeden AYNI deterministik redaktörden geçer. KAYITLI yetkili
+    // `WorkerResult` MÜDAHALE EDİLMEZ (spec 98): burada salt içerik stringi
+    // yeniden kurulur; taze kopya döner. Boş geçmiş → boşa küsur ölçümsüz no-op.
+    let historyRedacted = false;
+    const redactedHistory: ContextHistoryMessage[] = (input.history ?? []).map((message) => {
+      const content = redactText(message.content);
+      if (content !== message.content) {
+        historyRedacted = true;
+      }
+      return { ...message, content };
+    });
+    // Zorunlu (preflight) geçmiş = YALNIZ korumalı mesajlar (güncel geri
+    // bildirim + son validation; spec 92). İsteğe bağlı eski geçmiş preflight'a
+    // girmez — sığma denetimi onları içermez.
+    const protectedHistory: ContextHistoryMessage[] = redactedHistory.filter((m) => m.protected);
+
     // ── 8) mesaj inşası (WorkerContract — saf) ────────────────────────────
     const renderOptions: PromptRenderOptions = {};
     if (input.reasoningEffort !== undefined) {
@@ -463,26 +495,38 @@ export class ContextAssembler {
         throw new ContextAssemblyError("assembly_failed", "Measuring the prompt failed", { cause: err });
       }
     };
-    const build = (activeReserve: number, activeReadonly: readonly ContextBlock[]): InferenceMessage[] => {
+    const build = (
+      activeReserve: number,
+      activeReadonly: readonly ContextBlock[],
+      activeHistory: readonly ContextHistoryMessage[],
+    ): InferenceMessage[] => {
       const context = [...editableBlocks, ...activeReadonly].map(blockFor).join("\n\n");
       // Redakte + bütçelenmiş kurallar: worker'a byte-bayt aynen gider
-      // (boş string → WorkerContract PROJECT RULES bloğunu YOK sayar).
+      // (boş string → WorkerContract PROJECT RULES bloğunu YOK sayar). Geçmiş
+      // mesajları `kind`/`protected` taşır ama modele YALNIZ rol+içerik gider;
+      // redaksiyon yukarıda (7b) yapıldı, burada salt harita.
+      const workerHistory: WorkerHistoryMessage[] = activeHistory.map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
       return buildWorkerMessages({
         task: redactedTask,
         rules: rulesText,
         context,
-        history: input.history,
+        history: workerHistory,
         outputReserveTokens: activeReserve,
       });
     };
 
-    // ── 8) PREFLIGHT — zorunlu bağlam (görev + düzenlenebilir + KURALLAR;
-    //    salt-okunur YOK)
+    // ── 8) PREFLIGHT — zorunlu bağlam (görev + düzenlenebilir + KURALLAR +
+    //    KORUMALI rafine-geçmişi; salt-okunur YOK, isteğe bağlı eski geçmiş YOK)
     // Zorunlu bağlam + pay tavana sığmıyorsa görev TEMELDE çalışamaz →
     // needs_split. (BLOCKER 2: kade seçimi BURALARA AİT DEĞİLDİR — tam bağlam
     // karar verir; zorunlu bağlam yalnız "görev çalışabilir mi?" sorusunu
-    // cevaplar ve tier'ı kalıcı olarak seçmez.)
-    const requiredMessages = build(reserve, []);
+    // cevaplar ve tier'ı kalıcı olarak seçmez.) Step 9 (spec 92): korumalı
+    // geçmiş (güncel geri bildirim + son validation) ZORUNLUDUR; eski geçmiş ve
+    // salt-okunur preflight'a girmez.
+    const requiredMessages = build(reserve, [], protectedHistory);
     const requiredCount = await measure(requiredMessages);
     if (requiredCount + reserve > effectiveMax) {
       // needs_split: BİLEŞTİRİLMEZ, KISILMAZ, inference'a inmez.
@@ -512,32 +556,63 @@ export class ContextAssembler {
       };
     }
 
-    // ── 9) TAM bağlam + adaptif tier (BLOCKER 2) ──────────────────────────
+    // ── 9) TAM bağlam + adaptif tier (BLOCKER 2) + rafine-geçmişi azaltması ──
     // KADE, zorunlu bağlamdan DEĞİL; TAM bağlamdan (görev + düzenlenebilir +
-    // TÜM salt-okunur) seçilir — en küçük sığan kade. Açık override → tek
-    // aday (asla üzerine KALKMAZ). Sığmıyorsa lexicographic SON TAM salt-
-    // okunur dosya atılır + yeniden TAM ölçülür; ilk sığana kadar. Düzenle-
-    // nebilir kod ASLA kıpırdamaz.
+    // TÜM salt-okunur + rafine-geçmişi) seçilir — en küçük sığan kade. Açık
+    // override → tek aday (asla üzerine KALKMAZ).
+    //
+    // Sığmıyorsa AZALTMA SIRASI (spec 87):
+    //   1. eski refinement mesajları (korumasız), ESKİDEN İTİBAREN
+    //   2. önceki worker yanıtları (assistant), ESKİDEN İTİBAREN
+    //   3. salt-okunur referans, lexicographic SON TAM dosya
+    //   4. hâlâ sığmıyorsa → needs_split
+    // Düzenlenebilir kaynak, pin'li kurallar, GÜNCEL geri bildirim ve SON
+    // validation (korumalı) ASLA kıpırdamaz (spec 87/92). Tercih payı için
+    // geçmiş YALNIZCA kırpılmaz (spec 88) — azaltma min/explicit pay'a sığmak
+    // içindir. Her adımda TAM yeniden ölçü (spec 89); tek `refreshRuntimeInfo`
+    // + tek `assemble` çağrısı içinde (spec 90).
     const candidates =
       explicitCandidate !== null
         ? [explicitCandidate]
         : automaticTierCandidates(input.tiers, runtimeMax);
     let activeReadonly = [...readonlyBlocks];
-    let minMessages = build(reserve, activeReadonly);
+    let activeHistory = [...redactedHistory];
+    let historyReducedRefinement = false;
+    let historyReducedWorker = false;
+    let truncatedReadonly = false;
+    let minMessages = build(reserve, activeReadonly, activeHistory);
     let minCount = await measure(minMessages);
     let selectedCandidate = findSmallestFittingTier({ inputTokens: minCount, reserve, candidates });
-    let truncatedReadonly = false;
     while (selectedCandidate === null) {
-      if (activeReadonly.length === 0) {
-        // Preflight tavana sığılmıştı; yapısal olarak ulaşılmaz. Fail-closed.
+      let reducedSomething = false;
+      // (1) en eski korumasız refinement; (2) en eski önceki worker;
+      // (3) salt-okunur; (4) korumalı + zorunlu tek başına → needs_split.
+      const oldRefinementIndex = activeHistory.findIndex(
+        (m) => m.kind === "refinement" && !m.protected,
+      );
+      const previousWorkerIndex = activeHistory.findIndex((m) => m.kind === "worker_response");
+      if (oldRefinementIndex !== -1) {
+        activeHistory = activeHistory.filter((_, idx) => idx !== oldRefinementIndex);
+        historyReducedRefinement = true;
+        reducedSomething = true;
+      } else if (previousWorkerIndex !== -1) {
+        activeHistory = activeHistory.filter((_, idx) => idx !== previousWorkerIndex);
+        historyReducedWorker = true;
+        reducedSomething = true;
+      } else if (activeReadonly.length > 0) {
+        activeReadonly = activeReadonly.slice(0, -1); // lexicographic SON tam dosya
+        truncatedReadonly = true;
+        reducedSomething = true;
+      }
+      if (!reducedSomething) {
+        // Sadece korumalı geçmiş + zorunlu bağlam kaldı, yine sığmıyor.
+        // Preflight bu kümeyle kontrol etti → yapısal olarak ulaşılmaz; fail-closed.
         throw new ContextAssemblyError(
           "assembly_failed",
           "The assembled context exceeds the context budget",
         );
       }
-      activeReadonly = activeReadonly.slice(0, -1); // lexicographic SON tam dosya
-      truncatedReadonly = true;
-      minMessages = build(reserve, activeReadonly);
+      minMessages = build(reserve, activeReadonly, activeHistory);
       minCount = await measure(minMessages);
       selectedCandidate = findSmallestFittingTier({ inputTokens: minCount, reserve, candidates });
     }
@@ -557,7 +632,7 @@ export class ContextAssembler {
       finalMessages = minMessages;
       finalCount = minCount;
     } else {
-      const preferredMessages = build(input.preferredOutputReserve, activeReadonly);
+      const preferredMessages = build(input.preferredOutputReserve, activeReadonly, activeHistory);
       const preferredCount = await measure(preferredMessages);
       if (preferredCount + input.preferredOutputReserve <= selectedCandidate.tokens) {
         finalReserve = input.preferredOutputReserve;
@@ -584,7 +659,7 @@ export class ContextAssembler {
     if (secretFileSeen) {
       warnings.push(SECRET_FILE_WARNING);
     }
-    if (contentRedacted || taskRedacted || rulesRedacted) {
+    if (contentRedacted || taskRedacted || rulesRedacted || historyRedacted) {
       warnings.push(REDACTION_WARNING);
     }
     if (rulesCompacted) {
@@ -592,6 +667,12 @@ export class ContextAssembler {
     }
     if (rulesOverBudget) {
       warnings.push(RULES_OVER_BUDGET_WARNING);
+    }
+    if (historyReducedRefinement) {
+      warnings.push(HISTORY_REFINEMENT_REDUCTION_WARNING);
+    }
+    if (historyReducedWorker) {
+      warnings.push(HISTORY_WORKER_REDUCTION_WARNING);
     }
     if (truncatedReadonly) {
       warnings.push(CONTEXT_REDUCTION_WARNING);
@@ -610,7 +691,104 @@ export class ContextAssembler {
     };
   }
 
+  /**
+   * Immutable tabanın CANLI ana-working-tree ölçümü (Step 9 stale-check'inin
+   * salt-okunur yarısı — spec 53: "Do NOT put arbitrary raw filesystem reads
+   * directly throughout SessionManager"). SessionManager bu yöntemi çağırır;
+   * ham fs okumaları BU modüldedir. Karşılaştırma/MANTIK YAPMAZ (saf karar
+   * `session/stale.ts`'tadır) — yalnız güvenli strict yakalamayı taşır.
+   *
+   * Yol güvenliği zinciri (salt-okunur okumalarla BİREBİR — spec 50/52):
+   * `normalizeRepoPath` (`.git`/`..`/mutlak/backslash/NUL → `unsafe_path`) →
+   * `resolveContained` (containment) → atal symlink taramı (fail-closed:
+   * I/O → `assembly_failed`; symlink → `unsafe_path`).
+   *
+   * Yakalama (spec 45-52, strict):
+   * - `basePaths`: `captureStrictLiveFingerprint` — varlık/tip/mod/içerik
+   *   SHA-256 (düzenli dosya no-follow okuma; link → hedef metni; dereferans
+   *   YOK). `ENOENT` → `exists:false`; her başka I/O → `assembly_failed`
+   *   (fail-closed; "yok" sayılmaz — spec 47/48/51).
+   * - `createdPaths`: `captureStrictLiveExistence` — YALNIZ `lstat` varlık
+   *   (içerik ASLA okunmaz — spec 171/266: worker-oluşturulan yolun main'de
+   *   var olması yeter); aynı fail-closed hata sözleşmesi.
+   *
+   * git YOK (spec 265), saat YOK, yazma YOK, backend çağrısı YOK.
+   */
+  async captureLiveBase(input: LiveBaseCaptureInput): Promise<LiveBaseState> {
+    const baseFingerprints = new Map<string, PathFingerprint>();
+    for (const raw of input.basePaths) {
+      const canonical = await this.#safeCanonical(input.repoRoot, raw);
+      const fingerprint = await this.#strictCapture(canonical);
+      baseFingerprints.set(canonical, fingerprint);
+    }
+    const createdExists = new Map<string, boolean>();
+    for (const raw of input.createdPaths) {
+      const canonical = await this.#safeCanonical(input.repoRoot, raw);
+      const exists = await this.#strictExistence(canonical);
+      createdExists.set(canonical, exists);
+    }
+    return { baseFingerprints, createdExists };
+  }
+
   // ── iç yardımcılar ───────────────────────────────────────────────────────
+
+  /**
+   * Bir seçili yolun güvenli kanonik mutlak formu (yol zincisi —
+   * `#readReadonlyBody` ile aynı): normalize → containment → atal symlink
+   * (fail-closed). Güvenli değilse / belirsizse tip'li `ContextAssemblyError`
+   * (`unsafe_path` / `assembly_failed`).
+   */
+  async #safeCanonical(root: string, raw: string): Promise<string> {
+    const canonical = normalizeRepoPath(raw);
+    if (canonical === null) {
+      throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
+    }
+    const abs = resolveContained(root, canonical);
+    if (abs === null) {
+      throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
+    }
+    try {
+      if (
+        await hasSymlinkInPath(abs, root, { includeTarget: false, lstatFn: this.#fs.lstat, failClosed: true })
+      ) {
+        throw new ContextAssemblyError("unsafe_path", "A selected path is an unsafe symlink");
+      }
+    } catch (err) {
+      if (err instanceof ContextAssemblyError) {
+        throw err;
+      }
+      throw new ContextAssemblyError("assembly_failed", "Reading the live base failed", { cause: err });
+    }
+    return abs;
+  }
+
+  /** Strict canlı parmak izi (spec 45-52); `StrictReadError` → `assembly_failed`. */
+  async #strictCapture(absolutePath: string): Promise<PathFingerprint> {
+    try {
+      return await captureStrictLiveFingerprint(absolutePath, {
+        lstat: this.#fs.lstat,
+        readlink: this.#fs.readlink,
+        readFile: this.#fs.readFile,
+      });
+    } catch (err) {
+      if (err instanceof StrictReadError) {
+        throw new ContextAssemblyError("assembly_failed", "Reading the live base failed", { cause: err });
+      }
+      throw err;
+    }
+  }
+
+  /** Strict canlı varlık (spec 171/266); `StrictReadError` → `assembly_failed`. */
+  async #strictExistence(absolutePath: string): Promise<boolean> {
+    try {
+      return await captureStrictLiveExistence(absolutePath, { lstat: this.#fs.lstat });
+    } catch (err) {
+      if (err instanceof StrictReadError) {
+        throw new ContextAssemblyError("assembly_failed", "Reading the live base failed", { cause: err });
+      }
+      throw err;
+    }
+  }
 
   /**
    * Kuralların TAM token ölçümü (Step 8 soft bütçe). İptal/backend hatası

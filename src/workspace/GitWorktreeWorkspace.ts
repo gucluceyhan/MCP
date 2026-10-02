@@ -86,10 +86,14 @@ import {
   writeFile,
 } from "node:fs/promises";
 import type { Stats } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { DiffStats, WorkerResult } from "../worker/result.js";
 import type {
+  BaseCommitIdentity,
+  BaseContentValue,
+  BaseTreeEntry,
   PathFingerprint,
   Workspace,
   WorkspaceApplyResult,
@@ -97,6 +101,7 @@ import type {
   WorkspaceBaseInfo,
   WorkspaceCreateInput,
   WorkspaceDiffOptions,
+  WorkspaceRecoveryState,
 } from "./Workspace.js";
 import { WorkspaceError } from "./Workspace.js";
 import {
@@ -251,6 +256,12 @@ export class GitWorktreeWorkspace implements Workspace {
     editablePaths: readonly string[],
     base: WorkspaceBaseInfo,
     validationBase: WorkspaceBase,
+    /**
+     * Bilinen worker-oluşturulan yol başlangıç kümesi (Step 9 kurtarma).
+     * `createGitWorktreeWorkspace` YOK sayar (taze base → boş);
+     * `restoreGitWorktreeWorkspace` kalıcı `currentCreatedPaths`'i verir.
+     */
+    initialCreatedPaths: readonly string[] = [],
   ) {
     this.repoRoot = repoRoot;
     this.workspaceDir = workspaceDir;
@@ -259,6 +270,7 @@ export class GitWorktreeWorkspace implements Workspace {
     this.editablePaths = editablePaths;
     this.base = base;
     this.validationBase = validationBase;
+    this.workerCreatedPaths = new Set<string>(initialCreatedPaths);
   }
 
   // ── iç git yardımcıları ───────────────────────────────────────────────────
@@ -362,6 +374,263 @@ export class GitWorktreeWorkspace implements Workspace {
       return { exists: true, type: "symlink", mode: "120000", target: bytes.toString("utf8") };
     }
     return { exists: true, type: fingerprint.type, mode: fingerprint.mode };
+  }
+
+  /** Son başarılı turda worker-oluşturulan yollar (Step 9; spec 59). */
+  currentCreatedPaths(): readonly string[] {
+    this.assertUsable();
+    return [...this.workerCreatedPaths];
+  }
+
+  /**
+   * Salt-okunur bağlam yol setini günceller (Step 9, spec 24-28/166-168):
+   * refine'in BİRİKEN salt-okunur kümesi doğrulamaya taşınır — modify/delete
+   * bu yollara `readOnlyPath` ile reddedilir. Düzenlenebilir allow-list +
+   * immutable base snapshot'ı ASLA değişmez. Saf bellek mutasyonu (git/I/O
+   * YOK). İmha → red.
+   */
+  setReadonlyPaths(paths: readonly string[]): void {
+    this.assertUsable();
+    this.validationBase = {
+      ...this.validationBase,
+      readonly: new Set(paths),
+    };
+  }
+
+  /**
+   * Güncel base-göreceli TAM state'in içeriksiz parmak izi (Step 9 spec
+   * 107/108): `git diff --binary --full-index <base>` (Step 5 fail-closed
+   * filter re-check SONRASI) SHA-256'sı. Worker-oluşturulan dosyaları
+   * (intent-to-add) içerir; kaynak/diff içeriği ASLA dönmEZ. İmha → red.
+   */
+  async recoveryStateHash(): Promise<string> {
+    this.assertUsable();
+    // filter re-check (PR #24 audit F-6): diff, içerik değiştirmiş tracked
+    // dosyaları worktree attribute yüzeyiyle okur → içerikten ÖNCE.
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    const result = await this.git([
+      "diff",
+      "--binary",
+      "--full-index",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      this.baseCommit,
+    ]);
+    return createHash("sha256").update(result.stdout).digest("hex");
+  }
+
+  /**
+   * Bu workspace'in BİREBİR yeniden kurulabilmesi için immutable kurtarma
+   * durumunu yakalar (Step 9 spec 112-115). Saf-okunur: base'in bellekteki
+   * immutable snapshot'ı (`validationBase`/`base`) + salt-okunur git sorguları
+   * (`ls-tree`, `cat-file`, `diff`). Worker'ın MUTABLE yazıları kurtarma
+   * durumuna girmEZ (base içeriği + state hash ölçülür; spec 105: main'den
+   * yeniden yakalama YOK). Ürün JSON-güvenli (Buffer'lar base64) + içerik
+   * ASLA MCP/model yüzeyine taşınmaz (spec 114). İmha → red.
+   */
+  async snapshotRecoveryState(): Promise<WorkspaceRecoveryState> {
+    this.assertUsable();
+
+    const baseFingerprints: Array<readonly [string, PathFingerprint]> =
+      [...this.base.fingerprints.entries()].map(([k, v]) => [k, v] as const);
+    const basePaths: Array<readonly [string, string]> =
+      [...this.base.basePaths.entries()].map(([k, v]) => [k, v] as const);
+
+    // Düzenlenebilir yolların base içeriği (JSON-güvenli) — `readBaseEntry`'nin
+    // yeniden kurulması (spec 115/116/117/118) + (varsa) blob rekonstrüksiyonu.
+    const baseContents: Array<readonly [string, BaseContentValue]> = [];
+    for (const canonical of this.editablePaths) {
+      const fingerprint = this.validationBase.editable.get(canonical);
+      let value: BaseContentValue;
+      if (fingerprint === undefined || !fingerprint.exists) {
+        value = { type: "absent" };
+      } else if (fingerprint.type === "symlink") {
+        const bytes = this.validationBase.editableContent.get(canonical);
+        if (bytes === undefined) {
+          throw new WorkspaceError(
+            "workspace_operation_failed",
+            "The captured editable base could not be represented safely",
+          );
+        }
+        value = { type: "symlink", target: bytes.toString("utf8") };
+      } else if (fingerprint.type === "file") {
+        const bytes = this.validationBase.editableContent.get(canonical);
+        if (bytes === undefined) {
+          throw new WorkspaceError(
+            "workspace_operation_failed",
+            "The captured editable base could not be represented safely",
+          );
+        }
+        value = { type: "file", base64: bytes.toString("base64") };
+      } else {
+        // directory/other: içerik temsil edilemez — parmak izi tip+modu taşır.
+        value = { type: "absent" };
+      }
+      baseContents.push([canonical, value]);
+    }
+
+    const immutableBaseEntries = await this.captureBaseTree();
+    const baseCommitIdentity = await this.captureBaseCommitIdentity();
+    const recoveryStateHash = await this.recoveryStateHash();
+
+    return {
+      schemaVersion: 1,
+      repoRoot: this.repoRoot,
+      workspaceDir: this.workspaceDir,
+      sessionId: this.sessionId,
+      baseCommit: this.baseCommit,
+      editablePaths: [...this.editablePaths],
+      readonlyPaths: [...this.validationBase.readonly],
+      baseFingerprints,
+      basePaths,
+      immutableBaseEntries,
+      baseCommitIdentity,
+      baseContents,
+      currentCreatedPaths: [...this.workerCreatedPaths],
+      recoveryStateHash,
+    };
+  }
+
+  // ── recovery yakalama yardımcıları (salt-okunur) ──────────────────────────
+
+  /**
+   * Base commit'in TAM ağacını alttan-üst yakalar (spec 112): kök `ls-tree`'den
+   * başlayıp her alt-ağacı özyinelemeli `ls-tree -z <tree>` ile açar. `git`'in
+   * KENDİ sırası korunur — böylece `mktree` BİREBİR (aynı `tree` SHA'sı) ağacı
+   * yeniden kurar. İçerik YOK (yalnız mode/oid/path metadata).
+   */
+  private async captureBaseTree(): Promise<BaseTreeEntry[]> {
+    let rootTree: string;
+    try {
+      const result = await this.git(["rev-parse", `${this.baseCommit}^{tree}`]);
+      rootTree = result.stdout.toString("utf8").trim();
+    } catch (err) {
+      throw new WorkspaceError("git_operation_failed", "Reading the base state failed", { cause: err });
+    }
+    if (rootTree === "") {
+      throw new WorkspaceError("git_operation_failed", "Reading the base state failed");
+    }
+    return this.captureTreeEntries(rootTree);
+  }
+
+  private async captureTreeEntries(treeOid: string): Promise<BaseTreeEntry[]> {
+    let data: Buffer;
+    try {
+      const result = await this.git(["ls-tree", "-z", treeOid]);
+      data = result.stdout;
+    } catch (err) {
+      throw new WorkspaceError("git_operation_failed", "Reading the base state failed", { cause: err });
+    }
+    const entries: BaseTreeEntry[] = [];
+    for (const record of splitNul(data)) {
+      if (record === "") {
+        continue;
+      }
+      const tab = record.indexOf("\t");
+      if (tab === -1) {
+        continue; // bozuk kayıt — atla (asla dışarı sızdırılmaz)
+      }
+      const parts = record.slice(0, tab).split(" ");
+      const mode = parts[0];
+      const type = parts[1];
+      const oid = parts[2];
+      if (mode === undefined || type === undefined || oid === undefined) {
+        continue;
+      }
+      const entry: BaseTreeEntry = { mode, oid, path: record.slice(tab + 1) };
+      if (type === "tree" || mode === "040000") {
+        entry.children = await this.captureTreeEntries(oid);
+      }
+      entries.push(entry);
+    }
+    return entries;
+  }
+
+  /**
+   * Base commit'in kimlik alanlarını ham `git cat-file commit <sha>`'ten çözümler
+   * (spec 112/122): `commit-tree`'e aynen verilecek tree/parent/author/committer/
+   * message. `authorDate`/`committerDate` git'in ham tarih dizgisidir (`"<unix> <tz>"`).
+   */
+  private async captureBaseCommitIdentity(): Promise<BaseCommitIdentity> {
+    let text: string;
+    try {
+      const result = await this.git(["cat-file", "commit", this.baseCommit]);
+      text = result.stdout.toString("utf8");
+    } catch (err) {
+      throw new WorkspaceError("git_operation_failed", "Reading the base commit failed", { cause: err });
+    }
+
+    const lines = text.split("\n");
+    let index = 0;
+    let tree = "";
+    const parents: string[] = [];
+    let authorName = "";
+    let authorEmail = "";
+    let authorDate = "";
+    let committerName = "";
+    let committerEmail = "";
+    let committerDate = "";
+
+    for (;;) {
+      const line = lines[index];
+      if (line === undefined) {
+        break; // header bitti (boş satır yok — anormalsiz)
+      }
+      if (line === "") {
+        index += 1; // header'dan message'ı ayıran boş satır
+        break;
+      }
+      if (line.startsWith("tree ")) {
+        tree = line.slice(5).trim();
+      } else if (line.startsWith("parent ")) {
+        parents.push(line.slice(7).trim());
+      } else {
+        const author = /^author\s+(.*)\s+<(.*)>\s+(.*)$/.exec(line);
+        const committer = /^committer\s+(.*)\s+<(.*)>\s+(.*)$/.exec(line);
+        if (author !== null) {
+          authorName = author[1] ?? "";
+          authorEmail = author[2] ?? "";
+          authorDate = author[3] ?? "";
+        } else if (committer !== null) {
+          committerName = committer[1] ?? "";
+          committerEmail = committer[2] ?? "";
+          committerDate = committer[3] ?? "";
+        }
+        // beklenmeyen header alanı — aynen atla (aşağıda zorunlu alanlar doğrulanır)
+      }
+      index += 1;
+    }
+    const message = lines.slice(index).join("\n");
+
+    // Fail-closed: zorunlu alan eksik = base güvenli temsil edilemez.
+    if (tree === "") {
+      throw new WorkspaceError("git_operation_failed", "Reading the base commit failed", {
+        cause: "malformed commit object: missing tree",
+      });
+    }
+    if (authorName === "" || authorEmail === "" || authorDate === "") {
+      throw new WorkspaceError("git_operation_failed", "Reading the base commit failed", {
+        cause: "malformed commit object: missing author",
+      });
+    }
+    if (committerName === "" || committerEmail === "" || committerDate === "") {
+      throw new WorkspaceError("git_operation_failed", "Reading the base commit failed", {
+        cause: "malformed commit object: missing committer",
+      });
+    }
+
+    return {
+      tree,
+      parents,
+      authorName,
+      authorEmail,
+      authorDate,
+      committerName,
+      committerEmail,
+      committerDate,
+      message,
+    };
   }
 
   // ── public API ────────────────────────────────────────────────────────────
@@ -650,7 +919,9 @@ export class GitWorktreeWorkspace implements Workspace {
     // (7) Sonuçlar git'ten — worker beyanına değil (spec 62).
     const filesChanged = await this.changedPaths();
     const diffStats = await this.statInternal();
-    return { validation: validation.result, filesChanged, diffStats };
+    // (8) Bilinen worker-oluşturulan küme (spec 59) — Step 9 kalıcılık +
+    // kurtarma yeniden-uygulaması + kapsamlı sıfırlama için döndürülür.
+    return { validation: validation.result, filesChanged, diffStats, createdPaths: [...this.workerCreatedPaths] };
   }
 
   /**
@@ -1861,6 +2132,315 @@ async function captureBase(
     },
     publicBase: { fingerprints, basePaths },
   };
+}
+
+// ── Kurtarma (Step 9) ───────────────────────────────────────────────────────
+
+/**
+ * Kalıcı bir `WorkspaceRecoveryState`'ten worktree'yi BİREBİR yeniden kurar
+ * (Step 9 spec 103-127) ve yeniden kurulmuş `GitWorktreeWorkspace`'i döndürür.
+ *
+ * Disiplin (spec 105/115/123): immutable base ASLA mevcut main içeriğinden
+ * yeniden yakalanmaz — `readBaseEntry` snapshot'ı + base ağacı + kimlik,
+ * PERSISTED state'ten BİREBİR yeniden kurulur. SessionManager bu API'nin
+ * git iç mantığını bilmez (spec 113); yalnız state'i verir/geri alır.
+ *
+ * Maddelendirme (spec 109-111, 126, 127):
+ * - worktree HAYATTA + kimlik (HEAD==base) + state hash == kalıcı hash →
+ *   REUSE (imha/yeniden kurma YOK — spec 126).
+ * - worktree HAYATTA ama kimlik uyuşmaz VEYA state hash çelişki → güvenilmez:
+ *   güvenli imha + yeniden kur (spec 110/127); ana depoya dokunulmaz.
+ * - worktree YOK (restart) → PERSISTED state'ten yeniden kur (spec 111):
+ *   - base commit nesnesi object DB'de → `worktree add --detach` (byte-birebir);
+ *   - nesne yok → `mktree`+`commit-tree` (aynı tree/commit SHA) + `worktree add`;
+ *   - eksik blob/nesne → fail-closed `workspace_operation_failed` (kısmi
+ *     rekonstrüksiyon YOK, spec 275).
+ *
+ * Dönen workspace: yeniden kurulduysa immutable base'tedir; hayatta reuse'ta
+ * kalıcının kendisidir. SessionManager `recoveryStateHash()`'ı kalıcı hash'le
+ * karşılaştırıp (spec 120/121) gerekirse son worker sonucunu yeniden uygular.
+ */
+export async function restoreGitWorktreeWorkspace(state: WorkspaceRecoveryState): Promise<GitWorktreeWorkspace> {
+  // ── kimlik + yol güvenliği (spec 106/190) ─────────────────────────────────
+  if (state.schemaVersion !== 1) {
+    throw new WorkspaceError("invalid_input", "The recovery state has an unsupported schema version");
+  }
+  if (typeof state.repoRoot !== "string" || !path.isAbsolute(state.repoRoot)) {
+    throw new WorkspaceError("invalid_input", "The repository root must be an absolute path");
+  }
+  if (typeof state.workspaceDir !== "string" || !path.isAbsolute(state.workspaceDir)) {
+    throw new WorkspaceError("invalid_input", "The workspace directory must be an absolute path");
+  }
+  if (!isSafeSessionId(state.sessionId)) {
+    throw new WorkspaceError("invalid_input", "The session id is not a safe identifier");
+  }
+  const repoRoot = path.resolve(state.repoRoot);
+  const workspaceDir = await canonicalizeOutside(path.resolve(state.workspaceDir), repoRoot);
+  if (workspaceDir === null) {
+    throw new WorkspaceError("unsafe_path", "The workspace directory must be outside the repository");
+  }
+
+  // ── immutable snapshot yeniden kurulumu (spec 105/115: main'den YOK) ──────
+  const baseFingerprints = new Map<string, PathFingerprint>(state.baseFingerprints);
+  const basePathsMap = new Map<string, string>(state.basePaths);
+  const baseContentsMap = new Map<string, BaseContentValue>(state.baseContents);
+
+  const editableFingerprints = new Map<string, PathFingerprint>();
+  const editableContent = new Map<string, Buffer>();
+  for (const canonical of state.editablePaths) {
+    const fingerprint = baseFingerprints.get(canonical);
+    if (fingerprint === undefined) {
+      // Her editable yol parmak izi taşır; yoksa base güvenli temsil edilemez.
+      throw new WorkspaceError(
+        "workspace_operation_failed",
+        "The captured editable base could not be represented safely",
+      );
+    }
+    editableFingerprints.set(canonical, fingerprint);
+    if (fingerprint.exists && fingerprint.type === "file") {
+      const value = baseContentsMap.get(canonical);
+      if (value === undefined || value.type !== "file") {
+        throw new WorkspaceError(
+          "workspace_operation_failed",
+          "The captured editable base could not be represented safely",
+        );
+      }
+      editableContent.set(canonical, Buffer.from(value.base64, "base64"));
+    } else if (fingerprint.exists && fingerprint.type === "symlink") {
+      const value = baseContentsMap.get(canonical);
+      if (value === undefined || value.type !== "symlink") {
+        throw new WorkspaceError(
+          "workspace_operation_failed",
+          "The captured editable base could not be represented safely",
+        );
+      }
+      editableContent.set(canonical, Buffer.from(value.target, "utf8"));
+    }
+    // absent / directory / other → içerik yok (fingerprint tip+modu yeterli).
+  }
+
+  const validationBase: WorkspaceBase = {
+    editable: editableFingerprints,
+    editableContent,
+    readonly: new Set(state.readonlyPaths),
+    basePaths: basePathsMap,
+  };
+  const publicBase: WorkspaceBaseInfo = { fingerprints: baseFingerprints, basePaths: basePathsMap };
+
+  const workspace = new GitWorktreeWorkspace(
+    repoRoot,
+    workspaceDir,
+    state.baseCommit,
+    state.sessionId,
+    state.editablePaths,
+    publicBase,
+    validationBase,
+    state.currentCreatedPaths,
+  );
+
+  await materializeWorkspace(workspace, state, repoRoot, workspaceDir);
+  return workspace;
+}
+
+/**
+ * Worktree'yi kalıcı state'e göre maddelendirir (spec 109-111/126/127).
+ * Ana depoya ASLA yazmaz; yalnız `git worktree add/remove` (paylaşılan
+ * `.git/worktrees/` yönetim alanı) + izolö worktree dizini.
+ */
+async function materializeWorkspace(
+  workspace: GitWorktreeWorkspace,
+  state: WorkspaceRecoveryState,
+  repoRoot: string,
+  workspaceDir: string,
+): Promise<void> {
+  const dirStat = await lstat(workspaceDir).catch(() => null);
+  const dirExists = dirStat !== null && dirStat.isDirectory();
+
+  if (dirExists) {
+    // Hayatta worktree: kimlik (HEAD==base + toplevel) + state hash.
+    if (await worktreeIdentityMatches(workspaceDir, state.baseCommit)) {
+      const hash = await workspace.recoveryStateHash().catch(() => null);
+      if (hash !== null && hash === state.recoveryStateHash) {
+        // spec 109/126: BİREBİR eşleşme → REUSE (imha/yeniden kurma YOK).
+        return;
+      }
+    }
+    // Kimlik uyuşmaz VEYA state hash çelişki (spec 110/127) → güvenilmez.
+    await destroyWorktreeSafely(repoRoot, workspaceDir);
+  }
+
+  // Yok (restart) VEYA uyuşmaz → PERSISTED state'ten yeniden kur (spec 111).
+  await recreateWorktree(state, repoRoot, workspaceDir);
+}
+
+/** Worktree'nin bu base'e ait, sağlam bir worktree olduğunu doğrular. */
+async function worktreeIdentityMatches(workspaceDir: string, baseCommit: string): Promise<boolean> {
+  try {
+    const head = await runGit(["rev-parse", "HEAD"], { cwd: workspaceDir, config: [HOOKS_DISABLED_CONFIG] });
+    if (head.stdout.toString("utf8").trim() !== baseCommit) {
+      return false;
+    }
+    const top = await runGit(["rev-parse", "--show-toplevel"], { cwd: workspaceDir, config: [HOOKS_DISABLED_CONFIG] });
+    return path.resolve(top.stdout.toString("utf8").trim()) === path.resolve(workspaceDir);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Güvenli imha (spec 192): `git worktree remove --force` + (başarısızsa)
+ * `git worktree prune` + kalan izolö dizini `rm`. Bu, SPLASH'ın kendi
+ * repo-DIŞI worktree dizinidir — kullanıcı verisi DEĞİLDİR.
+ */
+async function destroyWorktreeSafely(repoRoot: string, workspaceDir: string): Promise<void> {
+  await runGit(["worktree", "remove", "--force", workspaceDir], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] }).catch(
+    () => undefined,
+  );
+  await runGit(["worktree", "prune"], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] }).catch(() => undefined);
+  await rm(workspaceDir, { recursive: true, force: true }).catch(() => undefined);
+}
+
+/**
+ * Worktree'yi PERSISTED state'ten yeniden kurar (spec 111): hedef dizini
+ * temizler, sonra base commit'i maddelendirir. Base nesnesi object DB'de
+ * değilse `mktree`+`commit-tree` ile BİREBİR yeniden kurar (aynı SHA);
+ * tamamlanamazsa fail-closed (kısmi rekonstrüksiyon YOK, spec 275).
+ */
+async function recreateWorktree(state: WorkspaceRecoveryState, repoRoot: string, workspaceDir: string): Promise<void> {
+  // `git worktree add` hedef dizinin yok/boş olmasını şart koşar.
+  await rm(workspaceDir, { recursive: true, force: true }).catch(() => undefined);
+
+  if (await baseObjectPresent(repoRoot, state.baseCommit)) {
+    // case (a): base commit object DB'de → doğrudan checkout (byte-birebir).
+    try {
+      await runGit(["worktree", "add", "--detach", workspaceDir, state.baseCommit], {
+        cwd: repoRoot,
+        config: [HOOKS_DISABLED_CONFIG],
+      });
+    } catch (err) {
+      throw new WorkspaceError("workspace_operation_failed", "Workspace recovery failed", { cause: err });
+    }
+    return;
+  }
+
+  // case (b): base nesnesi yok → PERSISTED state'ten BİREBİR yeniden kur.
+  try {
+    await recreateBaseBlobs(repoRoot, state);
+    const treeOid = await mktreeFromEntries(repoRoot, state.immutableBaseEntries);
+    if (treeOid !== state.baseCommitIdentity.tree) {
+      throw new Error("reconstructed tree sha mismatch");
+    }
+    const commitOid = await commitTreeRebuild(repoRoot, state.baseCommitIdentity, treeOid);
+    if (commitOid !== state.baseCommit) {
+      throw new Error("reconstructed commit sha mismatch");
+    }
+    await runGit(["worktree", "add", "--detach", workspaceDir, state.baseCommit], {
+      cwd: repoRoot,
+      config: [HOOKS_DISABLED_CONFIG],
+    });
+  } catch (err) {
+    if (err instanceof WorkspaceError) {
+      throw err;
+    }
+    // eksik blob/nesne veya SHA çelişki → fail-closed (ana depoya dokunulmaz).
+    throw new WorkspaceError("workspace_operation_failed", "Workspace recovery failed", { cause: err });
+  }
+}
+
+/** Base commit nesnesi object DB'de var mı? (`git cat-file -e <sha>^{commit}`) */
+async function baseObjectPresent(repoRoot: string, sha: string): Promise<boolean> {
+  try {
+    await runGit(["cat-file", "-e", `${sha}^{commit}`], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Seçili yolların base içerik blob'larını object DB'ye geri yazar
+ * (`git hash-object -w --stdin`). `mktree` blob'ların VAR olmasını gerektirmez
+ * (yalnız oid referansı); ancak `worktree add` checkout'u blob'ları gerektirir.
+ * `absent` yol için yazılacak şey yok.
+ */
+async function recreateBaseBlobs(repoRoot: string, state: WorkspaceRecoveryState): Promise<void> {
+  for (const [, value] of state.baseContents) {
+    if (value.type === "absent") {
+      continue;
+    }
+    const bytes = value.type === "file" ? Buffer.from(value.base64, "base64") : Buffer.from(value.target, "utf8");
+    await runGit(["hash-object", "-w", "--stdin"], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG], stdin: bytes });
+  }
+}
+
+/**
+ * Kalıcı base ağacını alttan-üst `git mktree` ile yeniden kurar ve üretic
+ * `tree` SHA'sını döndürür. Alt-ağaçlar ÖNCE kurulur (orijinal oid ile aynı
+ * olmalı — değilse fail-closed); `-z` NUL-bölümlü girdi yol güvenliğini korur.
+ * Girdi sırası `git ls-tree` (kanonik) sırasındadır → aynı `tree` SHA'sı.
+ */
+async function mktreeFromEntries(repoRoot: string, entries: BaseTreeEntry[]): Promise<string> {
+  const parts: string[] = [];
+  for (const entry of entries) {
+    let oid = entry.oid;
+    if (entry.children !== undefined) {
+      const built = await mktreeFromEntries(repoRoot, entry.children);
+      if (built !== entry.oid) {
+        throw new Error("subtree sha mismatch during recovery");
+      }
+      oid = built;
+    }
+    // `git mktree -z` girdi biçimi (ölçüldü, Apple Git 2.50):
+    // `<mode> <type> <oid>\t<path>\0` — meta TAB ile, path YALNIZ NUL ile.
+    parts.push(`${entry.mode} ${treeEntryType(entry.mode)} ${oid}\t${entry.path}\u0000`);
+  }
+  const result = await runGit(["mktree", "-z"], {
+    cwd: repoRoot,
+    config: [HOOKS_DISABLED_CONFIG],
+    stdin: Buffer.from(parts.join(""), "utf8"),
+  });
+  return result.stdout.toString("utf8").trim();
+}
+
+/** git dosya modundan `mktree` için nesne tipi. */
+function treeEntryType(mode: string): string {
+  if (mode === "100644" || mode === "100755" || mode === "120000") {
+    return "blob";
+  }
+  if (mode === "160000") {
+    return "commit";
+  }
+  if (mode === "040000") {
+    return "tree";
+  }
+  return "blob";
+}
+
+/**
+ * Kalıcı kimlik alanlarıyla `git commit-tree` → (birebir eşleşmede) AYNI commit
+ * SHA'sı. Author/committer tarihleri + kimlik + message aynen verilir
+ * (spec 122: tree/fingerprint/birebir aynı; yeni SHA ancak metadata kaybında,
+ * o durumda çağrı tarafı fail-closed yapar).
+ */
+async function commitTreeRebuild(repoRoot: string, identity: BaseCommitIdentity, treeOid: string): Promise<string> {
+  const args: string[] = ["commit-tree", treeOid];
+  for (const parent of identity.parents) {
+    args.push("-p", parent);
+  }
+  const result = await runGit(args, {
+    cwd: repoRoot,
+    config: [HOOKS_DISABLED_CONFIG, "commit.gpgsign=false"],
+    env: {
+      GIT_AUTHOR_NAME: identity.authorName,
+      GIT_AUTHOR_EMAIL: identity.authorEmail,
+      GIT_AUTHOR_DATE: identity.authorDate,
+      GIT_COMMITTER_NAME: identity.committerName,
+      GIT_COMMITTER_EMAIL: identity.committerEmail,
+      GIT_COMMITTER_DATE: identity.committerDate,
+    },
+    stdin: Buffer.from(identity.message, "utf8"),
+  });
+  return result.stdout.toString("utf8").trim();
 }
 
 /**

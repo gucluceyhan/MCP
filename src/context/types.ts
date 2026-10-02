@@ -31,8 +31,7 @@ import type {
 } from "../backend/InferenceBackend.js";
 import type { ResolvedRules } from "../rules/types.js";
 import type { SelectedContextTier } from "../worker/result.js";
-import type { WorkerHistoryMessage } from "../worker/WorkerContract.js";
-import type { Workspace } from "../workspace/Workspace.js";
+import type { PathFingerprint, Workspace } from "../workspace/Workspace.js";
 
 // ── Enjekte yüzeyler ─────────────────────────────────────────────────────────
 
@@ -41,9 +40,16 @@ import type { Workspace } from "../workspace/Workspace.js";
  * (yazma/yeniden adlandırma/silme üyesi YOK; arayüz yapısı kendisi sınırı
  * tanımlar). Varsayılan `node:fs/promises`'tir; test seam'i bu arayüzün
  * kendisidir (birebir aynı imzalar).
+ *
+ * Step 9 hardening (spec 50): the production `readFile` member is the shared
+ * no-follow safe read (`workspace/SafeRepoReader.noFollowReadFile`). The
+ * ancestor/`lstat`/`readlink` checks are unchanged (spec 50: "Do not weaken
+ * ancestor path checks"); the race is closed because the regular-file content
+ * read itself is no-follow (`open(O_RDONLY|O_NOFOLLOW)` + same-handle read).
  */
 export interface ContextFs {
   lstat(target: string): Promise<Stats>;
+  /** Safe content read — no-follow in production (spec 48/50). */
   readFile(target: string): Promise<Buffer>;
   readlink(target: string): Promise<string>;
   realpath(target: string): Promise<string>;
@@ -58,6 +64,36 @@ export interface ContextRuntime {
   refreshRuntimeInfo(signal?: AbortSignal): Promise<RuntimeInfo>;
   tokenize(content: string, options?: TokenizeOptions): Promise<TokenizeResult>;
   countPromptTokens(messages: InferenceMessage[], options?: PromptRenderOptions): Promise<number>;
+}
+
+// ── Salt-okunur canlı taban yakalama (Step 9 stale-check, spec 53) ──────────
+
+/**
+ * `captureLiveBase` girdisi — tüm değerler caller tarafından hazırdır
+ * (kanonik, repository-göreceli):
+ * - `repoRoot`: ana repository'nin KANONİK mutlak kökü (stale karşılaştırma
+ *   CANLI ana working-tree'yi okur — spec 172/265: git YOK, fs yalnız).
+ * - `basePaths`: oturumun BİTMEZ (immutable) düzenlenebilir taban yolları —
+ *   ana ağaçta strict canlı parmak izi yakalanır (varlık/tip/mod/içerik).
+ * - `createdPaths`: worker'ın oluşturduğu yollar — ana ağaçta yalnız VARLIK
+ *   sorulur (içerik okunmaz — spec 171/266).
+ */
+export interface LiveBaseCaptureInput {
+  repoRoot: string;
+  basePaths: readonly string[];
+  createdPaths: readonly string[];
+}
+
+/**
+ * `captureLiveBase` sonucu — oturumun immutable tabanına karşı stale
+ * KARARINI veren saf karşılaştırıcının girdisi (karşılaştırma YAPMAZ;
+ * yalnız güvenli canlı ölçümü taşır, spec 53):
+ * - `baseFingerprints`: kanonik yol → strict canlı parmak izi.
+ * - `createdExists`: kanonik yol → ana ağaçta var mı (içeriksiz).
+ */
+export interface LiveBaseState {
+  readonly baseFingerprints: ReadonlyMap<string, PathFingerprint>;
+  readonly createdExists: ReadonlyMap<string, boolean>;
 }
 
 // ── Tip'li hata ──────────────────────────────────────────────────────────────
@@ -86,6 +122,28 @@ export class ContextAssemblyError extends Error {
   }
 }
 
+/**
+ * Sınıflandırılmış rafine-geçmişi mesajı (Step 9, spec 141-151).
+ *
+ * `kind` + `protected`, assembler'ın EXACT azaltma sırasını belirler
+ * (spec 145-146): korumalı olmayan `refinement` grupları (önceki geri bildirim
+ * + doğrulama) → korumalı olmayan `worker_response` (önceki worker yanıtı) →
+ * salt-okunur referans. Korumalı mesaj (güncel rafine: güncel geri bildirim +
+ * son doğrulama; spec 147-148) ASLA düşürülmez — sığmazsa `needs_split`.
+ *
+ * Roller prompt'taki `user`/`assistant`'tır (spec 141: assistant = worker
+ * yanıtı; user = geri bildirim + doğrulama). `content` içerik taşır (yerel
+ * model bağlamı) — compact MCP çıktısına ASLA gitmez (spec 144).
+ */
+export interface ContextHistoryMessage {
+  readonly role: "user" | "assistant";
+  /** Azaltma kategorisi. */
+  readonly kind: "refinement" | "worker_response";
+  readonly content: string;
+  /** Bütçe baskısı altında asla düşürülmez (güncel rafine koruması). */
+  readonly protected: boolean;
+}
+
 // ── Girdi / sonuç ────────────────────────────────────────────────────────────
 
 /**
@@ -103,9 +161,12 @@ export class ContextAssemblyError extends Error {
  *   kompaksiyon'dan geçirip worker prompt'una sabitler; `source`
  *   (`rules_source`) content'siz olarak compact result'a gider.
  * - `rulesSoftBudget`: config'ten doğrulanmış kurallar soft bütçesi
- *   (token; `SPLASH_CONTEXT_RULES_SOFT_BUDGET`).
- * - `history`: Step 9 (rafine geçmişi) için yer tutucu — Step 8'de `[]`.
- * - `tiers` + reserve'ler: config'ten doğrulanmış değerler.
+  *   (token; `SPLASH_CONTEXT_RULES_SOFT_BUDGET`).
+  * - `history`: Step 9 rafine geçmişi — sınıflandırılmış mesajlar
+  *   (`ContextHistoryMessage`). Step 8'de `[]`. Assembler bütçe baskısı altında
+  *   korumalı olmayan grupları (önce eski rafine, sonra eski worker yanıtı,
+  *   sonra salt-okunur) tam-remeasure ile azaltır (spec 145-151).
+  * - `tiers` + reserve'ler: config'ten doğrulanmış değerler.
  * - `contextTier` / `outputReserveTokens`: istek başına açık override'lar
  *   (service ön-doğrulamıştır; assembler runtime'a karşı doğrular).
  */
@@ -116,7 +177,8 @@ export interface ContextAssemblyInput {
   resolvedRules?: ResolvedRules;
   /** Çözülmüş kuralların token soft bütçesi (pozitif tam sayı). */
   rulesSoftBudget: number;
-  history?: readonly WorkerHistoryMessage[];
+  /** Step 9 rafine geçmişi — sınıflandırılmış mesajlar (azaltma için). */
+  history?: readonly ContextHistoryMessage[];
   /** Doğrulanmış adaptif kademeler (64K/128K/192K altkümesi, artan). */
   tiers: readonly number[];
   /** Minimum çıkış payı (token). */
