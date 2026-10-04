@@ -8,6 +8,11 @@
  *
  * Ortam güvenliği (spec 6): her çağrıya deterministik, etkileşimsiz ortam
  * verilir (`GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`) — git asla prompt açmaz.
+ * Miras alınan repo-yerel değişkenler (`GIT_DIR`, `GIT_WORK_TREE`,
+ * `GIT_INDEX_FILE`, … — `--local-env-vars`) süzülür; tembel promisor çekme
+ * kapalıdır (`GIT_NO_LAZY_FETCH=1`; bunu denetlemeyen git sürümünde —
+ * `partialCloneUnsupported` tablosu — promisor'lı repo oluşturma/kurtarmada
+ * `assertPartialCloneSupported` ile reddedilir).
  * Hook çalıştırabilecek her komuta `-c core.hooksPath=<devnull>` verilir;
  * repo-tanımı hook'lar ve kullanıcı shell komutları asla çalıştırılmaz.
  * `core.fsmonitor` da her çağrıya merkezi olarak devre dışı verilir
@@ -60,6 +65,235 @@ export function literalPathspec(p: string): string {
   return `:(literal)${p}`;
 }
 
+/**
+ * Miras alınan ortamdan süzülen repo-yerel değişkenler — `git rev-parse
+ * --local-env-vars` listesi (ölçüldü, Apple Git 2.50.1). `GIT_CONFIG_GLOBAL`
+ * / `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM` listede DEĞİL ve korunur
+ * (kullanıcı/sistem-düzeyi config). Komut kapsamı config
+ * (`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` — `safe.directory` dahil)
+ * ortamdan VERİLEMEZ: `core.worktree` gibi bir ayar çalışma ağacını
+ * yönlendirebilir; global/sistem config kullanılmalı.
+ */
+const REPO_LOCAL_ENV_VARS: ReadonlySet<string> = new Set([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_GRAFT_FILE",
+  "GIT_INDEX_FILE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
+  "GIT_COMMON_DIR",
+]);
+
+/** `GIT_CONFIG_COUNT`'un eşlikçileri (`GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`). */
+const GIT_CONFIG_PAIR_ENV = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/;
+
+/** `buildGitEnv`'in EN SON yazdığı güvenlik sabitleri (`extra` gölgeleyemez). */
+const GIT_SAFETY_ENV: Readonly<Record<string, string>> = {
+  // Etkileşimsiz + deterministik (spec 6): asla prompt, asla yerel format.
+  GIT_TERMINAL_PROMPT: "0",
+  LC_ALL: "C",
+  // Partial clone'da eksik nesne promisor remote'tan TEMBEL çekilmez
+  // (inceleme W-M2): okuma komutu ağa/transport'a (repo config'indeki
+  // `remote.*.uploadpack`/`core.sshCommand` vb.) çıkamaz; repo config'i
+  // bunu ezemez. YALNIZ bunu tembel çekme geçidinde denetleyen git
+  // sürümünde etkilidir (2.45.1+ ya da yamalı bakım sürümü — tablo:
+  // `partialCloneUnsupported`); diğerleri sessizce yok sayar, o durum
+  // `assertPartialCloneSupported` ile kapatılır. BEDELİ: yerelde olmayan
+  // bir nesneye ihtiyaç duyan komut (örn. `worktree add` checkout'u)
+  // fail-closed hata verir.
+  GIT_NO_LAZY_FETCH: "1",
+};
+
+/**
+ * Git çocuk süreç ortamını kurar (SAF — inceleme W-H1/W-M2/LOW-3): `base`
+ * kopyalanır (DEĞİŞTİRİLMEZ), repo-yerel miras değişkenleri silinir, sonra
+ * `extra` (çağrı noktası) ve EN SON güvenlik sabitleri yazılır — `extra`
+ * sabitleri gölgeleyemez.
+ *
+ * Süzme gerekçesi: MCP süreci mutlak `GIT_DIR`/`GIT_WORK_TREE` (vb.) ile
+ * başlatılmışsa worktree komutları (`add -A`, `commit`, `reset --hard`)
+ * `cwd`'yi yok sayıp ANA repoya giderdi (ölçüldü: ana dala commit + index
+ * kirlenmesi). Repo her zaman `cwd`'den keşfedilir.
+ *
+ * Harf duyarsızlık (inceleme P1): Windows'ta ortam anahtarları büyük/küçük
+ * harf duyarsızdır (Node `child_process` belgesi) — miras `Git_Dir` git'e
+ * `GIT_DIR` olarak ulaşır. Eşleştirme bu yüzden `toUpperCase()` üzerinden
+ * yapılır; platform dalı YOK (POSIX'te git yalnız büyük harfi okur,
+ * karışık harfli kopyayı silmek zararsız). Aynı sebeple güvenlik
+ * sabitlerinin karışık harfli kopyaları da silinir: `Git_No_Lazy_Fetch=0`
+ * ile `GIT_NO_LAZY_FETCH=1` yan yana kalırsa Windows'ta hangisinin
+ * kazanacağı belirsizdir — sabit TEK kopya olmalı.
+ */
+export function buildGitEnv(base: NodeJS.ProcessEnv, extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const key of Object.keys(env)) {
+    const name = key.toUpperCase();
+    if (REPO_LOCAL_ENV_VARS.has(name) || GIT_CONFIG_PAIR_ENV.test(name)) {
+      delete env[key];
+    }
+  }
+  Object.assign(env, extra);
+  for (const key of Object.keys(env)) {
+    if (Object.hasOwn(GIT_SAFETY_ENV, key.toUpperCase())) {
+      delete env[key];
+    }
+  }
+  return Object.assign(env, GIT_SAFETY_ENV);
+}
+
+/** `git --version` çıktısından `[major, minor, patch]`; ayrıştırılamazsa `null`. */
+export function parseGitVersion(output: string): readonly [number, number, number] | null {
+  const match = /^git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(output.trim());
+  if (match === null) {
+    return null;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? "0")];
+}
+
+/**
+ * `GIT_NO_LAZY_FETCH`'i tembel çekmenin ortak geçidinde (`promisor-remote.c`
+ * `fetch_objects()`) denetleyen bakım serileri: 2.<minor> → korumayı taşıyan
+ * EN KÜÇÜK patch. 2.46+ hep korumalı; 2.39 öncesi hiç. Kaynak:
+ * github.com/git/git etiketleri (ölçüldü 2026-10-05): v2.38.5, v2.39.3,
+ * v2.40.1, v2.41.0, v2.42.1, v2.43.3, v2.44.0, v2.45.0 → YOK; tablodaki
+ * patch'ler ile v2.46.0/v2.50.0 → VAR. v2.45.0 değişkeni yalnız nesne-okuma
+ * yolunda okur (`environment.c` → `fetch_if_missing`); `diff` ön-çekmesi
+ * (`promisor_remote_get_direct`) yine ağa çıkar → güvensiz sayılır.
+ */
+const NO_LAZY_FETCH_MIN_PATCH: ReadonlyMap<number, number> = new Map([
+  [39, 4],
+  [40, 2],
+  [41, 1],
+  [42, 2],
+  [43, 4],
+  [44, 1],
+  [45, 1],
+]);
+
+/**
+ * SAF karar (inceleme MEDIUM-1): bu git + bu repo için tembel promisor
+ * çekme KAPATILAMIYOR mu? `true` → oluşturma/kurtarma reddedilir.
+ * - promisor yok → `false` (çekilecek remote yok);
+ * - promisor var + git 3+ / 2.46+ / tablodaki yamalı patch ve sonrası →
+ *   `false` (`GIT_NO_LAZY_FETCH` etkili);
+ * - promisor var + diğer her sürüm ya da sürüm AYRIŞTIRILAMADI → `true`
+ *   (güvenli taraf: korumasız say).
+ */
+export function partialCloneUnsupported(gitVersionOutput: string, promisorConfigured: boolean): boolean {
+  if (!promisorConfigured) {
+    return false;
+  }
+  const version = parseGitVersion(gitVersionOutput);
+  if (version === null) {
+    return true;
+  }
+  const [major, minor, patch] = version;
+  if (major !== 2) {
+    return major < 2;
+  }
+  if (minor >= 46) {
+    return false;
+  }
+  const minPatch = NO_LAZY_FETCH_MIN_PATCH.get(minor);
+  return minPatch === undefined || patch < minPatch;
+}
+
+/**
+ * `git --version` önbelleği — anahtar `PATH`: `spawn("git")` ikiliyi ortamın
+ * `PATH`'iyle çözer; farklı `PATH` farklı git olabilir. Yalnız BAŞARILI
+ * okumalar önbelleğe girer (hata → boş metin → ayrıştırılamaz → eski say).
+ */
+const gitVersionCache = new Map<string, string>();
+
+async function readGitVersion(): Promise<string> {
+  const key = process.env.PATH ?? "";
+  const cached = gitVersionCache.get(key);
+  if (cached !== undefined) {
+    return cached;
+  }
+  try {
+    // `--version` repo gerektirmez; `cwd` repo yolundan bağımsız (var olmayan
+    // bir kurtarma kökü sürüm okumasını bozmasın).
+    const text = (await runGit(["--version"], { cwd: os.tmpdir() })).stdout.toString("utf8").trim();
+    gitVersionCache.set(key, text);
+    return text;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Salt-okunur `git config` okuması (ana repoda): çıkış 1 = anahtar yok →
+ * `null`; başka her hata ATILIR (çağıran güvenli tarafa düşer).
+ */
+async function readRepoConfig(repoRoot: string, args: readonly string[]): Promise<string | null> {
+  try {
+    return (await runGit(["config", ...args], { cwd: repoRoot })).stdout.toString("utf8");
+  } catch (err) {
+    if (err instanceof WorkspaceError && (err.cause as { exitCode?: unknown } | undefined)?.exitCode === 1) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Repo bir promisor remote taşıyor mu? Üç sinyalden biri yeter:
+ * - `extensions.partialClone` (eski biçim) — anahtarın VARLIĞI yeter; boş
+ *   değer de (`""`) promisor'dır (ölçüldü, Git 2.50.1: boş ad → `fetch ''`);
+ * - herhangi bir `remote.<ad>.promisor=true` (ölçüldü, Git 2.50.1
+ *   `--filter=blob:none` klonu yalnız bunu yazar);
+ * - herhangi bir `remote.<ad>.partialCloneFilter` — DEĞERİNDEN bağımsız,
+ *   boş değer dahil; anahtarın varlığı yeter (git `promisor-remote.c`
+ *   `promisor_remote_config()` bu anahtarı görünce `promisor_remote_new()`
+ *   çağırır; ölçüldü v2.44.0, v2.50.0).
+ * İki seviyeli `remote.promisor` / `remote.partialCloneFilter` (alt bölümsüz)
+ * da sayılır: `parse_config_key` sonrası `name == NULL` koruması yok (v2.44.0
+ * kaynağı) → boş adlı promisor üretilir (ölçüldü, Git 2.50.1: `fetch ''`) —
+ * regex'ler bu yüzden `remote\.(.*\.)?` ile başlar.
+ * Okunamazsa → `true` (güvenli taraf; yalnız korumasız git'te redde dönüşür).
+ */
+async function promisorConfigured(repoRoot: string): Promise<boolean> {
+  try {
+    if ((await readRepoConfig(repoRoot, ["--get", "extensions.partialclone"])) !== null) {
+      return true;
+    }
+    const remotes = await readRepoConfig(repoRoot, ["--bool", "--get-regexp", "^remote\\.(.*\\.)?promisor$"]);
+    if (remotes !== null && remotes.split("\n").some((line) => line.trimEnd().endsWith(" true"))) {
+      return true;
+    }
+    return (await readRepoConfig(repoRoot, ["--get-regexp", "^remote\\.(.*\\.)?partialclonefilter$"])) !== null;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Oluşturma + kurtarma kapısı (inceleme MEDIUM-1): `GIT_NO_LAZY_FETCH`'i
+ * tembel çekme geçidinde denetlemeyen git (`partialCloneUnsupported`
+ * tablosu) onu sessizce yok sayar → promisor'lı bir repoda eksik nesne
+ * okuması repo config'indeki transport programlarını (`remote.*.uploadpack`,
+ * `core.sshCommand`) host'ta çalıştırabilir. Böyle bir repo SABİT güvenli
+ * mesajla reddedilir (yol/ortam değeri İÇERMEZ); korumalı git → davranış
+ * değişmez.
+ */
+export async function assertPartialCloneSupported(repoRoot: string): Promise<void> {
+  if (partialCloneUnsupported(await readGitVersion(), await promisorConfigured(repoRoot))) {
+    throw new WorkspaceError(
+      "invalid_repository",
+      "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+    );
+  }
+}
+
 /** Varsayılan git çağrı zaman aşımı (büyük repo diff'leri için cömert). */
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -76,7 +310,7 @@ export interface GitRunOptions {
   config?: readonly string[];
   /** Stdin yükü (örn. `git apply` için patch baytları) — shell pipeline YOK. */
   stdin?: Buffer | string;
-  /** `process.env` üzerine merge edilen ek ortam değişkenleri. */
+  /** `process.env` (repo-yerel değişkenleri süzülmüş) üzerine merge edilen ek ortam değişkenleri. */
   env?: NodeJS.ProcessEnv;
   /** ms; aşılırsa çocuk süreç öldürülür. Varsayılan 5 dk. */
   timeoutMs?: number;
@@ -119,13 +353,8 @@ export function runGit(args: readonly string[], options: GitRunOptions): Promise
   gitArgs.push("-c", HOOKS_DISABLED_CONFIG, "-c", FSMONITOR_DISABLED_CONFIG);
   gitArgs.push(...args);
 
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...options.env,
-    // Etkileşimsiz + deterministik (spec 6): asla prompt, asla yerel format.
-    GIT_TERMINAL_PROMPT: "0",
-    LC_ALL: "C",
-  };
+  // Repo-yerel miras değişkenleri süzülür + güvenlik sabitleri (buildGitEnv).
+  const env = buildGitEnv(process.env, options.env);
 
   return new Promise<GitRunResult>((resolve, reject) => {
     const child = spawn("git", gitArgs, {

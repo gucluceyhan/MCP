@@ -20,7 +20,15 @@ import {
   WorkspaceError,
   type WorkspaceErrorKind,
 } from "../dist/workspace/Workspace.js";
-import { computeRepoId, discoverRepoRoot, parseCatFileBatch, runGit } from "../dist/workspace/git.js";
+import {
+  buildGitEnv,
+  computeRepoId,
+  discoverRepoRoot,
+  parseCatFileBatch,
+  parseGitVersion,
+  partialCloneUnsupported,
+  runGit,
+} from "../dist/workspace/git.js";
 
 let tmp: string;
 let emptyConfigFile: string;
@@ -238,4 +246,236 @@ test("parseCatFileBatch: real git cat-file --batch round-trip", async () => {
   const res = await runGit(["cat-file", "--batch"], { cwd: repo, stdin: `${oid}\n` });
   const map = parseCatFileBatch(res.stdout);
   assert.deepEqual(map.get(oid), Buffer.from("hello\n"), "blob bytes round-trip exactly");
+});
+
+// ── runGit: ortam yalıtımı (inceleme W-H1 / W-M2) ──────────────────────────
+
+test("runGit: inherited repo-local GIT_* variables never redirect a command to another repository; GIT_CONFIG_GLOBAL is kept (W-H1)", async () => {
+  const target = await makeRepo("env-target");
+  const other = await makeRepo("env-other");
+  await runGit(["config", "user.name", "Other User"], { cwd: other });
+  const globalFile = path.join(tmp, "env-global-gitconfig");
+  await writeFile(globalFile, "[splash]\n\tprobe = kept\n");
+  // MCP sürecinin miras alabileceği repo-konumlandırıcı/config değişkenleri
+  // (`git rev-parse --local-env-vars` ailesi): hepsi BAŞKA bir repoyu işaret eder.
+  const injected: Record<string, string> = {
+    GIT_DIR: path.join(other, ".git"),
+    GIT_WORK_TREE: other,
+    GIT_COMMON_DIR: path.join(other, ".git"),
+    GIT_INDEX_FILE: path.join(tmp, "env-no-such-index"),
+    GIT_OBJECT_DIRECTORY: path.join(other, ".git", "objects"),
+    GIT_CONFIG_PARAMETERS: "'user.name'='Injected Parameters'",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "user.name",
+    GIT_CONFIG_VALUE_0: "Injected Count",
+  };
+  const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+  let top: string;
+  let files: string;
+  let userName: string;
+  let probe: string;
+  try {
+    Object.assign(process.env, injected);
+    process.env.GIT_CONFIG_GLOBAL = globalFile;
+    top = (await runGit(["rev-parse", "--show-toplevel"], { cwd: target })).stdout.toString("utf8").trim();
+    files = (await runGit(["ls-files", "-z"], { cwd: target })).stdout.toString("utf8");
+    userName = (await runGit(["config", "--get", "user.name"], { cwd: target })).stdout.toString("utf8").trim();
+    probe = (await runGit(["config", "--get", "splash.probe"], { cwd: target })).stdout.toString("utf8").trim();
+  } finally {
+    for (const key of Object.keys(injected)) {
+      delete process.env[key];
+    }
+    process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+  }
+  const { realpath } = await import("node:fs/promises");
+  assert.equal(await realpath(top), await realpath(target), "discovery follows cwd, not an inherited GIT_DIR/GIT_WORK_TREE");
+  assert.equal(files, "f.txt\0", "the repository's own index is read (GIT_INDEX_FILE ignored)");
+  assert.equal(userName, "Test User", "inherited GIT_CONFIG_PARAMETERS / GIT_CONFIG_COUNT never inject config");
+  assert.equal(probe, "kept", "GIT_CONFIG_GLOBAL stays in effect (hermetic test setups rely on it)");
+});
+
+test("runGit: a partial clone never lazy-fetches a missing object from its promisor remote (W-M2)", async (t) => {
+  // `GIT_NO_LAZY_FETCH` yalnız onu denetleyen git'te etkili (2.45.1+ ya da
+  // yamalı bakım sürümü) — korumasız git'te koruma oluşturma/kurtarma
+  // reddidir (MEDIUM-1), bu test o sürümde anlamsız.
+  const versionText = (await runGit(["--version"], { cwd: tmp })).stdout.toString("utf8");
+  if (partialCloneUnsupported(versionText, true)) {
+    t.skip("this git does not honor GIT_NO_LAZY_FETCH");
+    return;
+  }
+  const src = await makeRepo("lazy-src");
+  await runGit(["config", "uploadpack.allowFilter", "true"], { cwd: src });
+  const dst = path.join(tmp, "lazy-dst");
+  await runGit(["clone", "-q", "--filter=blob:none", "--no-checkout", `file://${src}`, dst], { cwd: tmp });
+  // Ağaç yerel (blob:none yalnız blob'ları dışarıda bırakır) — blob'un kendisi YOK.
+  const oid = (await runGit(["rev-parse", "HEAD:f.txt"], { cwd: dst })).stdout.toString("utf8").trim();
+  assert.match(oid, /^[0-9a-f]{40}$/);
+  const missingBefore = (await runGit(["rev-list", "--objects", "--all", "--missing=print"], { cwd: dst })).stdout.toString("utf8");
+  assert.ok(missingBefore.split("\n").includes(`?${oid}`), "fixture: the clone is really partial (blob missing before the read)");
+  // Eksik nesne okuması promisor remote'tan TEMBEL çekme YAPMAZ → güvenli hata.
+  await expectWorkspaceError("git_operation_failed", () => runGit(["cat-file", "-e", oid], { cwd: dst }));
+  // Nesne hâlâ eksik (`--missing=print` kendisi çekme yapmaz) — ağ/transport çağrısı olmadı.
+  const listing = (await runGit(["rev-list", "--objects", "--all", "--missing=print"], { cwd: dst })).stdout.toString("utf8");
+  assert.ok(listing.split("\n").includes(`?${oid}`), "the blob must still be missing (no lazy fetch happened)");
+});
+
+// ── buildGitEnv / partialCloneUnsupported (inceleme LOW-3 / MEDIUM-1) ─────────
+
+/** `git rev-parse --local-env-vars` (Git 2.50.1) — süzülmesi gereken 15 değişken. */
+const LOCAL_ENV_VARS = [
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_GRAFT_FILE",
+  "GIT_INDEX_FILE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
+  "GIT_COMMON_DIR",
+];
+
+test("buildGitEnv: strips the repo-local variables + GIT_CONFIG_KEY_n/VALUE_n, keeps user/system config, fixed safety values beat extra; base is not mutated (LOW-3)", () => {
+  const base: NodeJS.ProcessEnv = {
+    PATH: "/usr/bin",
+    HOME: "/home/u",
+    GIT_CONFIG_GLOBAL: "/g/config",
+    GIT_CONFIG_SYSTEM: "/s/config",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "Kept Author",
+    GIT_CONFIG_KEY_3: "core.worktree",
+    GIT_CONFIG_VALUE_3: "/elsewhere",
+  };
+  for (const name of LOCAL_ENV_VARS) {
+    base[name] = "x";
+  }
+  const env = buildGitEnv(base, {
+    GIT_COMMITTER_NAME: "Splash",
+    GIT_TERMINAL_PROMPT: "1",
+    GIT_NO_LAZY_FETCH: "0",
+    LC_ALL: "tr_TR.UTF-8",
+  });
+  for (const name of [...LOCAL_ENV_VARS, "GIT_CONFIG_KEY_3", "GIT_CONFIG_VALUE_3"]) {
+    assert.equal(name in env, false, `${name} must be stripped`);
+  }
+  for (const name of ["PATH", "HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME"]) {
+    assert.equal(env[name], base[name], `${name} must be kept`);
+  }
+  assert.equal(env.GIT_COMMITTER_NAME, "Splash", "call-site extra is applied");
+  assert.equal(env.GIT_TERMINAL_PROMPT, "0", "fixed value beats extra");
+  assert.equal(env.GIT_NO_LAZY_FETCH, "1", "fixed value beats extra");
+  assert.equal(env.LC_ALL, "C", "fixed value beats extra");
+  assert.equal(base.GIT_DIR, "x", "base must not be mutated");
+});
+
+test("buildGitEnv: every variable the live `git rev-parse --local-env-vars` reports is stripped (LOW-3)", async () => {
+  const names = (await runGit(["rev-parse", "--local-env-vars"], { cwd: tmp })).stdout
+    .toString("utf8")
+    .split("\n")
+    .filter((name) => name !== "");
+  assert.ok(names.includes("GIT_DIR") && names.includes("GIT_WORK_TREE"), "fixture: live list read");
+  const env = buildGitEnv(Object.fromEntries(names.map((name) => [name, "x"])));
+  for (const name of names) {
+    assert.equal(name in env, false, `${name} must be stripped`);
+  }
+});
+
+test("buildGitEnv: mixed-case repo-local / GIT_CONFIG_KEY_n names are stripped and every safety value is a single upper-case copy (Windows env names are case-insensitive, P1)", () => {
+  // Windows'ta `Git_Dir` = `GIT_DIR` (Node child_process belgesi): her harf
+  // varyantı süzülmeli; güvenlik sabitlerinin varyantı (base ya da extra'dan)
+  // yan yana kalırsa hangisinin kazanacağı belirsiz → sabit TEK kopya olmalı.
+  const base: NodeJS.ProcessEnv = {
+    PATH: "/usr/bin",
+    Git_Dir: "/other/.git",
+    git_work_tree: "/other",
+    Git_Index_File: "/tmp/no-such-index",
+    git_config_count: "1",
+    Git_Config_Key_0: "core.worktree",
+    git_config_value_0: "/elsewhere",
+    Git_Config_Parameters: "'user.name'='Injected'",
+    Git_No_Lazy_Fetch: "0",
+    git_terminal_prompt: "1",
+    Lc_All: "tr_TR.UTF-8",
+    Git_Config_Global: "/g/config",
+  };
+  const env = buildGitEnv(base, {
+    git_no_lazy_fetch: "0",
+    LC_all: "tr_TR.UTF-8",
+    Git_Terminal_Prompt: "1",
+    Git_Committer_Name: "Splash",
+  });
+  const upper = Object.keys(env).map((key) => key.toUpperCase());
+  for (const name of LOCAL_ENV_VARS) {
+    assert.equal(upper.includes(name), false, `no case variant of ${name} survives`);
+  }
+  assert.equal(
+    upper.some((name) => /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(name)),
+    false,
+    "no case variant of GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n survives",
+  );
+  for (const [name, value] of [
+    ["GIT_TERMINAL_PROMPT", "0"],
+    ["LC_ALL", "C"],
+    ["GIT_NO_LAZY_FETCH", "1"],
+  ] as const) {
+    assert.deepEqual(
+      Object.keys(env).filter((key) => key.toUpperCase() === name),
+      [name],
+      `${name}: exactly one (upper-case) copy`,
+    );
+    assert.equal(env[name], value, `${name}: fixed value`);
+  }
+  assert.equal(env.Git_Config_Global, "/g/config", "a mixed-case name that is not repo-local is kept as-is");
+  assert.equal(env.Git_Committer_Name, "Splash", "call-site extra is applied");
+  assert.equal(base.Git_Dir, "/other/.git", "base must not be mutated");
+});
+
+test("partialCloneUnsupported: only Git releases whose lazy-fetch path checks GIT_NO_LAZY_FETCH (2.45.1+, patched maintenance releases) allow a promisor repo; unparseable → reject; no promisor → allow (MEDIUM-1, P1)", () => {
+  // Sınırlar git etiketlerinden ölçüldü (`promisor-remote.c` `fetch_objects()`):
+  // her bakım serisinde ilk yamalı patch kabul, bir öncesi red.
+  const cases: Array<readonly [string, boolean, boolean]> = [
+    ["git version 1.9.5", true, true],
+    ["git version 2.20.1", true, true],
+    ["git version 2.38.5", true, true],
+    ["git version 2.39.3", true, true],
+    ["git version 2.39.4", true, false],
+    ["git version 2.39.5 (Apple Git-154)", true, false],
+    ["git version 2.40.1", true, true],
+    ["git version 2.40.2", true, false],
+    ["git version 2.41.0", true, true],
+    ["git version 2.41.1", true, false],
+    ["git version 2.42.1", true, true],
+    ["git version 2.42.2", true, false],
+    ["git version 2.43.0", true, true],
+    ["git version 2.43.3", true, true],
+    ["git version 2.43.4", true, false],
+    ["git version 2.44", true, true],
+    ["git version 2.44.0", true, true],
+    ["git version 2.44.0.windows.1", true, true],
+    ["git version 2.44.1", true, false],
+    ["git version 2.45.0", true, true],
+    ["git version 2.45.1", true, false],
+    ["git version 2.45.1.windows.1", true, false],
+    ["git version 2.46.0", true, false],
+    ["git version 2.50.1 (Apple Git-155)", true, false],
+    ["git version 3.0.0", true, false],
+    ["", true, true],
+    ["not git at all", true, true],
+    ["git version 2.38.5", false, false],
+    ["git version 2.45.0", false, false],
+    ["", false, false],
+    ["git version 2.50.1", false, false],
+  ];
+  for (const [version, promisor, expected] of cases) {
+    assert.equal(partialCloneUnsupported(version, promisor), expected, `${JSON.stringify(version)} promisor=${promisor}`);
+  }
+  // Apple Git ön eki: sayısal sürüm parantez öncesinden okunur.
+  assert.deepEqual(parseGitVersion("git version 2.39.5 (Apple Git-154)"), [2, 39, 5]);
+  assert.deepEqual(parseGitVersion("git version 2.44"), [2, 44, 0]);
+  assert.equal(parseGitVersion("not git at all"), null);
 });
