@@ -1177,6 +1177,15 @@ export class SessionStore {
    * Başarısızlıkta geçici iz silinir ve `session_persistence_failed` yayılır;
    * yarıda kalmış bir yetkili `session.json` BIRAKILMAZ. İzin (spec 7):
    * dizinler 0700, dosya 0600.
+   *
+   * COMMIT NOKTASI = `rename` (İz 4 S#6): rename başarılıysa disk yeni
+   * durumdadır; sonrasındaki adımlar (dizin fsync) en iyi çabadır ve ASLA
+   * hataya dönüşmez — aksi halde çağıran RAM/workspace'i eski tura geri
+   * alırken disk yeni turda kalırdı. Rename sonrası `lstat` denetimi
+   * kaldırıldı: rename hedef girdiyi (symlink dahil) kendi düz dosyamızla
+   * atomik değiştirir; eşzamanlı aynı-kullanıcı takası Threat Model A
+   * kapsamındadır ve `load` zaten no-follow + düz-dosya denetimiyle
+   * fail-closed'dır.
    */
   async save(session: PersistedSession): Promise<void> {
     const fs = this.#fs;
@@ -1203,28 +1212,23 @@ export class SessionStore {
       } finally {
         await handle.close();
       }
-      await fs.rename(tmp, file);
-
-      const fileStat = await fs.lstat(file);
-      if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
-        throw sessionError("session_persistence_failed", "session file is not a regular file");
-      }
-
-      // Dizin fsync'i — "where supported": desteklemeyen dosya sistemlerinde
-      // (ör. bazı ağ/paylaşımlı FS'ler) sessizce geçilir; dosya fsync'i +
-      // rename zaten yetkili içeriği sağlamıştır.
-      let dirHandle: SessionDirHandle | undefined;
-      try {
-        dirHandle = await fs.openDir(dir);
-        await dirHandle.sync();
-      } catch {
-        // Dizin fsync'i desteklenmiyor/açılamadı — en iyi çaba; yutulur.
-      } finally {
-        await dirHandle?.close().catch(() => undefined);
-      }
+      await fs.rename(tmp, file); // ← commit noktası
     } catch (err) {
       await removeStaleTmpNoFollow(fs, tmp).catch(() => undefined);
       throw sessionError("session_persistence_failed", err);
+    }
+
+    // Dizin fsync'i — "where supported": desteklemeyen dosya sistemlerinde
+    // (ör. bazı ağ/paylaşımlı FS'ler) sessizce geçilir; dosya fsync'i +
+    // rename zaten yetkili içeriği sağlamıştır.
+    let dirHandle: SessionDirHandle | undefined;
+    try {
+      dirHandle = await fs.openDir(dir);
+      await dirHandle.sync();
+    } catch {
+      // Dizin fsync'i desteklenmiyor/açılamadı — en iyi çaba; yutulur.
+    } finally {
+      await dirHandle?.close().catch(() => undefined);
     }
   }
 

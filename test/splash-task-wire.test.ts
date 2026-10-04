@@ -222,6 +222,39 @@ test("107: applied result serializes to DESIGN §3 snake_case vocabulary — no 
   assert.ok(!text.includes('"sessionId"'));
 });
 
+test("S#11: validation.rejected[].file wire'da sınırlı + redakte; sözlük/alanlar aynen; iç sonuç DOKUNULMAZ", () => {
+  const secretPath = "src/sk-abcdefghijklmnopqrstuvwx.ts";
+  const atLimit = `${"a".repeat(1020)}.tsx`; // tam 1024 karakter
+  const overLimit = `${"a/".repeat(2_000)}x.ts`;
+  const result = appliedResult();
+  result.validation = {
+    editsRequested: 5,
+    editsApplied: 0,
+    rejected: [
+      { file: secretPath, edit: 0, reason: "target missing" },
+      { file: atLimit, edit: 1, reason: "target missing" },
+      { file: overLimit, edit: 2, reason: "target missing" },
+      { file: "src/c.ts", edit: 3, reason: "search text not found at operation 0" },
+      { file: "<invalid-path>", edit: 4, reason: "unsafe path" },
+    ],
+  };
+  const wire = serializeCompactResult(result);
+  const rejected = (wire.validation as { rejected: Array<Record<string, unknown>> }).rejected;
+  assert.deepEqual(rejected, [
+    { file: "src/[REDACTED_SECRET].ts", edit: 0, reason: "target missing" },
+    { file: atLimit, edit: 1, reason: "target missing" },
+    { file: "<invalid-path>", edit: 2, reason: "target missing" },
+    { file: "src/c.ts", edit: 3, reason: "search text not found at operation 0" },
+    { file: "<invalid-path>", edit: 4, reason: "unsafe path" },
+  ]);
+  const text = JSON.stringify(wire);
+  assert.ok(!text.includes("sk-abcdefghijklmnop"), "secret wire'a sızmadı");
+  assert.ok(text.length < 4_000, "sınırsız worker yolu wire'ı şişirmez");
+  // İç (kalıcı) sonuç ham kalır — kurtarma determinizmi etkilenmez.
+  assert.equal(result.validation.rejected[0]?.file, secretPath);
+  assert.equal(result.validation.rejected[2]?.file, overLimit);
+});
+
 // ── 108: koşullu alanlar ─────────────────────────────────────────────────────
 
 test("108: applied → conditional fields ABSENT (no inference, no split_hint, no stale_files, no null)", () => {

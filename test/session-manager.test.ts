@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
-import { InferenceCoordinator, type RuntimeLockLike } from "../dist/backend/InferenceCoordinator.js";
+import { CoordinatorError, InferenceCoordinator, type RuntimeLockLike } from "../dist/backend/InferenceCoordinator.js";
 import type { LockAcquireResult } from "../dist/backend/RuntimeLock.js";
 import {
   type InferenceBackend,
@@ -2514,4 +2514,102 @@ test("E7: diff yolunda doğrulama başarısız → session_recovery_failed; RAM 
   assert.equal(fault.tamperNextApply, false, "sapma doğrulamanın yeniden-uygulamasında üretildi");
   assert.equal(h.manager.activeSessions().length, 0, "RAM girdisi düşer");
   assert.ok((await readFile(sessionFile)).equals(before), "session.json bayt-eşit");
+});
+
+// ── İz 4 (S#7/S#8): dispose sonrası kuyruk, iptal edilmiş istek, idempotent dispose ──
+
+/** Kapıdan geçince 2. turu (taban 1 → 3) üreten backend davranışı. */
+function gatedRound2(h: ManagerHarness, gate: Promise<void>): void {
+  h.backend.runBehavior = async () => {
+    await gate;
+    return {
+      content: modifyWorkerJson("const value = 1;", "const value = 3;", "Changed value to 3."),
+      usage: { inputTokens: 20, outputTokens: 10 },
+    };
+  };
+}
+
+test("S#7a: dispose — başlamış refine tamamlanır; kuyruktaki (başlamamış) refine/diff/close shutting_down; inference/export YOK; oturum diskte KALIR", async (t) => {
+  const h = await makeManagerHarness(t);
+  const first = await taskRound1(h);
+  const gate = deferred();
+  gatedRound2(h, gate.promise);
+  // Sayaç tabanı: başlamamış gövdelerin HİÇ çalışmadığının kanıtı (aşağıdaki farklar).
+  const liveBaseBefore = h.liveBaseGate.calls;
+  const savesBefore = h.store.saves.length;
+  const restoresBefore = h.restoreCalls.count;
+  const inflight = h.manager.refine({ sessionId: first.sessionId, feedback: "started", files: [] });
+  let queuedRefine!: ReturnType<SessionManager["refine"]>;
+  let queuedDiff!: ReturnType<SessionManager["diff"]>;
+  let queuedClose!: ReturnType<SessionManager["close"]>;
+  let disposePromise!: Promise<void>;
+  try {
+    await waitFor(() => h.backend.runCalls.length >= 2); // refine dispatch'te (başlamış)
+    queuedRefine = h.manager.refine({ sessionId: first.sessionId, feedback: "queued", files: [] });
+    queuedDiff = h.manager.diff({ sessionId: first.sessionId });
+    queuedClose = h.manager.close({ sessionId: first.sessionId });
+    disposePromise = h.manager.dispose();
+  } finally {
+    gate.resolve();
+  }
+  const done = await inflight;
+  assert.equal(done.status, "applied", "dispose'dan önce başlamış iş güvenli terminale ulaşır");
+  assert.equal(done.round, 2);
+  const shuttingDown = (e: unknown) => e instanceof SplashTaskError && e.kind === "shutting_down";
+  await assert.rejects(queuedRefine, shuttingDown);
+  await assert.rejects(queuedDiff, shuttingDown);
+  await assert.rejects(queuedClose, shuttingDown);
+  await disposePromise; // shutting_down güvenli sınıf — dispose REDDETMEZ
+  assert.equal(h.backend.runCalls.length, 2, "kuyruktaki refine inference'a BAŞLAMADI");
+  assert.equal(h.liveBaseGate.calls - liveBaseBefore, 1, "stale ölçümü yalnız başlamış refine'da (kuyruktaki refine/close YOK)");
+  assert.equal(h.store.saves.length - savesBefore, 1, "yalnız başlamış refine'ın tur kalıcılığı");
+  assert.equal(h.restoreCalls.count - restoresBefore, 0, "kuyruktaki iş kurtarma/yükleme YAPMADI");
+  assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).round, 2);
+  assert.ok(await pathExists(path.join(h.sessionsDir, first.sessionId, "workspace")), "oturum dayanıklı kalır");
+  assert.ok(!(await pathExists(path.join(h.fixture.outputRoot, "patches"))), "kuyruktaki close export ETMEDİ");
+});
+
+test("S#7b: iptal edilmiş istek max_rounds onayını TÜKETMEZ — ack yazılmaz; sonraki çağrı yine guard görür", async (t) => {
+  const h = await makeManagerHarness(t, { config: { maxRounds: 1 } });
+  const first = await taskRound1(h); // round 1 == maxRounds
+  const savesBefore = h.store.saves.length;
+  const runsBefore = h.backend.runCalls.length;
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(
+    h.manager.refine({ sessionId: first.sessionId, feedback: "cancelled", files: [], signal: cancelled.signal }),
+    (e: unknown) => e instanceof CoordinatorError && e.kind === "aborted",
+  );
+  assert.equal(h.store.saves.length, savesBefore, "iptal edilmiş istekte ack kalıcılığı YOK");
+  assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).maxRoundsAcknowledged, false);
+
+  const guard = await h.manager.refine({ sessionId: first.sessionId, feedback: "explicit", files: [] });
+  assert.equal(guard.status, "max_rounds", "guard tüketilmedi — orkestratör uyarıyı görür");
+  assert.equal(h.backend.runCalls.length, runsBefore, "inference YOK");
+  assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).maxRoundsAcknowledged, true);
+});
+
+test("S#8: ikinci dispose() AYNI kapanışı döner — in-flight bitmeden çözülmez; kalıcılık hatası iki çağrıya da yayılır", async (t) => {
+  // Kalıcılık: 1) tur 0, 2) round 1, 3) refine round 2 → ÜÇÜNCÜSÜ fail.
+  const h = await makeManagerHarness(t, { failSaveAt: 3 });
+  const first = await taskRound1(h);
+  const gate = deferred();
+  gatedRound2(h, gate.promise);
+  const refinePromise = h.manager.refine({ sessionId: first.sessionId, feedback: "in-flight", files: [] });
+  let firstDispose!: Promise<void>;
+  let secondDispose!: Promise<void>;
+  try {
+    await waitFor(() => h.backend.runCalls.length >= 2);
+    firstDispose = h.manager.dispose();
+    secondDispose = h.manager.dispose();
+    const secondSettled = trackSettled(secondDispose);
+    await sleep(50);
+    assert.equal(secondSettled(), false, "ikinci dispose in-flight işi BEKLER (erken dönmez)");
+  } finally {
+    gate.resolve();
+  }
+  await assert.rejects(refinePromise, (e: unknown) => e instanceof SessionError && e.kind === "session_persistence_failed");
+  const cleanupFailed = (e: unknown) => e instanceof SplashTaskError && e.kind === "task_cleanup_failed";
+  await assert.rejects(firstDispose, cleanupFailed);
+  await assert.rejects(secondDispose, cleanupFailed, "ikinci çağrı hatayı YUTMAZ");
 });

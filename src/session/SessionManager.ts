@@ -329,6 +329,8 @@ export class SessionManager {
   #inFlight = new Set<Promise<unknown>>();
   /** `dispose()` sonrası yeni task/refine/diff/close kabul edilmez (spec 128/131). */
   #disposed = false;
+  /** Tek kapanış sözü — tekrarlanan `dispose()` çağrıları bunu paylaşır (S#8). */
+  #disposePromise: Promise<void> | undefined;
 
   constructor(deps: SessionManagerDeps) {
     this.#config = deps.config;
@@ -656,6 +658,12 @@ export class SessionManager {
 
     // ── max-round guard — stale SONRASI (spec 60-65: stale öncelikli) ───────
     if (session.round >= this.#config.maxRounds && !session.maxRoundsAcknowledged) {
+      // İz 4 S#7: iptal edilmiş isteğin yanıtı orkestratöre ULAŞMAZ (SDK
+      // düşürür) — ack yazılsaydı guard sessizce tüketilirdi. Ack YAZILMAZ;
+      // iptal edilmiş normal refine ile aynı tip'li `aborted` hatası.
+      if (request.signal?.aborted === true) {
+        throw new CoordinatorError("aborted", "Inference request was aborted before it started");
+      }
       const result = this.#maxRoundsResult(session);
       // Acknowledgement kalıcılaşır — restart unutmaz (spec 61/62/210).
       const candidate: PersistedSession = { ...session, maxRoundsAcknowledged: true };
@@ -966,10 +974,22 @@ export class SessionManager {
    * (spec 319/320). Kilit + in-flight kaydı ilk `await`'ten ÖNCE senkron
    * kurulur — kuyruktaki (başlamamış) iş de `dispose` tarafından beklenir
    * (spec 131). refine / diff / close bu TEK yardımcıyı kullanır.
+   *
+   * İz 4 S#7: sırası geldiğinde `dispose` başlamışsa gövde HİÇ çalışmaz →
+   * `shutting_down` (inference / export / imha / kalıcılık YOK; oturum diskte
+   * dayanıklı kalır). Kapanış istendikten sonra yeni iş başlatılmaz; dispose
+   * bu hızlı reddi de bekler. Başlamış iş etkilenmez (güvenli terminaline
+   * ulaşır).
    */
   async #runExclusive<T>(sessionId: string, body: () => Promise<T>): Promise<T> {
     const previous = this.#locks.get(sessionId) ?? Promise.resolve();
-    const execution = previous.then(body, body);
+    const start = (): Promise<T> => {
+      if (this.#disposed) {
+        return Promise.reject(new SplashTaskError("shutting_down", "Splash is shutting down"));
+      }
+      return body();
+    };
+    const execution = previous.then(start, start);
     const tail = execution.then(
       () => undefined,
       () => undefined,
@@ -1078,10 +1098,17 @@ export class SessionManager {
    *      oturum kapalı kalır; export'u başarısız close'un oturumu diskte
    *      dayanıklı kalır (Step 10 spec 25).
    */
-  async dispose(): Promise<void> {
-    if (this.#disposed) {
-      return;
+  dispose(): Promise<void> {
+    // İz 4 S#8: idempotent — her çağrı AYNI kapanış sözünü alır (ikinci çağrı
+    // in-flight işi beklemeden erken dönmez, hatayı da yutmaz).
+    if (this.#disposePromise === undefined) {
+      this.#disposePromise = this.#runDispose();
     }
+    return this.#disposePromise;
+  }
+
+  /** `dispose` gövdesi — yalnız bir kez çalışır (`#disposePromise`). */
+  async #runDispose(): Promise<void> {
     // 1) Herhangi bir await'ten ÖNCE: artık yeni iş başlatılamaz.
     this.#disposed = true;
     // 2) In-flight settlement'lar SINIFLANDIRILIR (fail-closed).
