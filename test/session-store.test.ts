@@ -480,6 +480,31 @@ test("write failure: save reds with session_persistence_failed, no partial sessi
   assert.equal(mem.files.has(path.join(dir, "session.json.tmp")), false);
 });
 
+test("S#6: commit noktası rename — rename SONRASI lstat hatası yazılmış durumu 'yazılmadı' raporlamaz (fake fs)", async () => {
+  // Rename'den sonra `session.json` lstat'ı EIO verir (rename zaten oldu).
+  class PostRenameLstatFault extends MemFs {
+    armed = false;
+    renamed = false;
+    override async rename(from: string, to: string): Promise<void> {
+      await super.rename(from, to);
+      if (this.armed) this.renamed = true;
+    }
+    override async lstat(p: string) {
+      if (this.renamed && path.basename(p) === "session.json") throw err("EIO", `lstat ${p}`);
+      return super.lstat(p);
+    }
+  }
+  const mem = new PostRenameLstatFault();
+  const store = storeWith(mem);
+  await store.create(SESSION_ID);
+  await store.save(makeSession({ task: "first version" }));
+  mem.armed = true;
+  // Disk yeni durumdadır → save BAŞARILI dönmeli (aksi: RAM eski, disk yeni).
+  await store.save(makeSession({ task: "second version" }));
+  assert.equal(mem.renamed, true, "rename gerçekleşti");
+  assert.equal((await store.load(SESSION_ID)).task, "second version");
+});
+
 // ── Bulunamayan oturum (spec 337) ────────────────────────────────────────────
 
 test("not found: loading an absent session reds with session_not_found (fake fs)", async () => {

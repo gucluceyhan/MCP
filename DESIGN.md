@@ -448,7 +448,9 @@ the orchestrator asks for it.
   unique search-match + overlap rejection). No test/lint execution in v1 — the workspace is a *real,
   valid checkout*, which makes a future `splash_verify` (or the orchestrator
   running tests in the workspace dir with its own tools) a natural extension,
-  not a redesign.
+  not a redesign. `rejected[].file` is worker-chosen text: on the wire it is
+  redacted and bounded (longer than 1024 characters → `<invalid-path>`); the
+  persisted result keeps the raw value.
 - **Accept flow (mandatory order):** `splash_close` *first* — it exports
   the final patch to disk (fresh or stale; a **stale base never blocks the
   close** — only an operational export failure can fail it, and that
@@ -644,7 +646,9 @@ already *has* its rules; returning them would burn tokens for nothing).
   version.
 - **If Git repository discovery fails** (no `repo_root` override, or the
   override is not a valid Git repository), `splash_task` returns a **clear
-  project/configuration error** — nothing is created (Section 2).
+  project/configuration error** — nothing is created (Section 2). A
+  non-existent (or inaccessible) override is such an error; an existing
+  override is resolved by Git's own upward discovery.
 - **External Git filters are not supported in v1 (fail-closed).** If any
   tracked or selected path requires an *external* filter
   (`filter.<driver>.clean` / `.smudge` / `.process` — e.g. Git LFS),
@@ -1251,6 +1255,15 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
     patch, check the base before every refine, accumulate read-only references,
     reduce history by the fixed priority, and keep `max_rounds`
     acknowledgement durable. `dispose()` preserves durable sessions.
+    **Review fixes (2026-10-04):** the `session.json` commit point is the
+    `rename` — later steps are best-effort and never report a committed write
+    as failed; `dispose()` is idempotent (every call returns the same shutdown
+    promise); same-session work still queued when `dispose()` begins settles
+    with `shutting_down` (nothing started after shutdown — no inference,
+    export, or destroy; the session stays durable); a request already
+    cancelled when the guard is reached does not persist the `max_rounds`
+    acknowledgement (it fails `aborted`); the
+    feedback that produced round 1 of a round-0 session is replayed in history.
     **Security-audit fixes (2026-10-03):** the persisted `workspaceRecovery`
     has **two trust domains**. Self-captured tree data — `basePaths` (the
     full `git ls-tree -r -z` map) and the `path` fields of

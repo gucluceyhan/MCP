@@ -30,13 +30,37 @@
 
 import { BackendError } from "../backend/errors.js";
 import { CoordinatorError } from "../backend/InferenceCoordinator.js";
+import { redactText } from "../context/redact.js";
 import { ContextAssemblyError } from "../context/types.js";
 import { SessionError } from "../session/types.js";
 import type { SplashCloseResult, SplashDiffResult } from "../session/SessionManager.js";
 import { RulesResolutionError } from "../rules/types.js";
 import { WorkspaceError } from "../workspace/Workspace.js";
+import { INVALID_PATH_PLACEHOLDER } from "../workspace/validate.js";
 import { WorkerContractError, type CompactResult } from "../worker/result.js";
 import { SplashTaskError } from "./errors.js";
+
+/**
+ * Wire'daki `rejected[].file` üst sınırı: 1024 UTF-16 kod birimi (karakter;
+ * `String.length`). UTF-8 bayt sayısı kod birimi sayısından az olamadığından
+ * bu sınırı aşan yol macOS `PATH_MAX`'ı (1024 bayt) da aşar — gerçek bir
+ * dosya olamaz; worker'ın seçtiği sınırsız metin compact sonucu şişiremez.
+ */
+const MAX_WIRE_REJECTED_FILE_LENGTH = 1024;
+
+/**
+ * İz 4 S#11: `rejected[].file` worker'ın seçtiği metindir (path-güvenliğinden
+ * geçse bile keyfi). Wire'a çıkmadan sınırlanır + redakte edilir; sınırı aşan
+ * → sabit `<invalid-path>` (regex çalışmadan — DoS yüzeyi yok). Yalnız wire
+ * dönüşümüdür: kalıcı/iç sonuç ham kalır (kurtarma determinizmi etkilenmez).
+ */
+function wireRejectedFile(file: string): string {
+  if (file.length > MAX_WIRE_REJECTED_FILE_LENGTH) {
+    return INVALID_PATH_PLACEHOLDER;
+  }
+  const redacted = redactText(file);
+  return redacted.length > MAX_WIRE_REJECTED_FILE_LENGTH ? INVALID_PATH_PLACEHOLDER : redacted;
+}
 
 /** MCP tool hatası wire formu — güvenli metadata yalnız (spec 58). */
 export interface ToolErrorWire {
@@ -120,7 +144,7 @@ export function serializeCompactResult(result: CompactResult): Record<string, un
       edits_requested: result.validation.editsRequested,
       edits_applied: result.validation.editsApplied,
       rejected: result.validation.rejected.map((rejection) => ({
-        file: rejection.file,
+        file: wireRejectedFile(rejection.file),
         edit: rejection.edit,
         reason: rejection.reason,
       })),
