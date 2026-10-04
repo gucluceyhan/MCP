@@ -907,3 +907,68 @@ test("dispatch: an empty ownerId rejects with a typed CoordinatorError and is ne
   assert.equal(h.coordinator.queueDepth, 0);
   assert.equal(await lockDirExists(h.runtimeDir), false);
 });
+
+// ── İz 2 / M4: ölçüm trafiği ÖNCESİ kilit ALMAYAN ön-kapı (probe) ────────
+
+test("M4 probe: a foreign LIVE lock owner → inference_busy/splash; no refresh, no scan, nothing acquired or touched", async (t) => {
+  const FOREIGN = 999_701;
+  const h = await makeHarness(t, { liveness: (pid) => (pid === FOREIGN ? "alive" : "unknown") });
+  await plantForeignLock(h, FOREIGN, "foreign-token", "other-session");
+
+  const result = await h.coordinator.probe();
+
+  assert.deepEqual(result, { status: "inference_busy", conflict: "splash" });
+  assert.equal(h.backend.refreshCalls, 0);
+  assert.equal(h.scannerCounts.count, 0);
+  const raw = await readFile(path.join(h.runtimeDir, INFERENCE_LOCK_DIR, OWNER_FILE_NAME), "utf8");
+  assert.ok(raw.includes("foreign-token"), "the foreign lock must survive");
+});
+
+test("M4 probe: an unverifiable lock owner → inference_busy/unknown (fail closed, like dispatch)", async (t) => {
+  const MYSTERY = 999_702;
+  const h = await makeHarness(t, { liveness: (pid) => (pid === MYSTERY ? "unknown" : "alive") });
+  await plantForeignLock(h, MYSTERY, "mystery-token", "mystery");
+  assert.deepEqual(await h.coordinator.probe(), { status: "inference_busy", conflict: "unknown" });
+  assert.equal(h.backend.refreshCalls, 0);
+});
+
+test("M4 probe: a clean host → clear; the probe never creates the lock (no acquire, no runtime dir writes)", async (t) => {
+  const h = await makeHarness(t);
+  assert.deepEqual(await h.coordinator.probe(), { status: "clear" });
+  assert.equal(h.backend.refreshCalls, 1, "the configured runtime identity is refreshed (never cached)");
+  assert.equal(h.scannerCounts.count, 1);
+  assert.equal(await lockDirExists(h.runtimeDir), false);
+  assert.equal(h.backend.runStartOrder.length, 0);
+});
+
+test("M4 probe: host conflicts and a missing identity map exactly like dispatch (mlx / unknown); a refresh failure propagates typed", async (t) => {
+  const mlx = await makeHarness(t, {
+    scanner: () => Promise.resolve([...CONFIGURED_TREE, { pid: 700, ppid: 1, command: "python3 -m mlx_lm.server" }]),
+  });
+  assert.deepEqual(await mlx.coordinator.probe(), { status: "inference_busy", conflict: "mlx" });
+
+  const failing = await makeHarness(t, { scanner: () => Promise.reject(new Error("ps unavailable")) });
+  assert.deepEqual(await failing.coordinator.probe(), { status: "inference_busy", conflict: "unknown" });
+
+  const anonymous = await makeHarness(t);
+  anonymous.backend.setInfo({ ready: true, maximumContextTokens: 1000, servedModel: "test/model" });
+  assert.deepEqual(await anonymous.coordinator.probe(), { status: "inference_busy", conflict: "unknown" });
+
+  const down = await makeHarness(t);
+  down.backend.refreshFailure = new BackendError("network", "Could not reach the inference runtime (/status)");
+  await assert.rejects(down.coordinator.probe(), (err: unknown) => err instanceof BackendError && err.kind === "network");
+  assert.equal(down.scannerCounts.count, 0);
+});
+
+test("M4 probe: this process's OWN in-flight dispatch is not a conflict (same-process FIFO wait ≠ inference_busy)", async (t) => {
+  const h = await makeHarness(t);
+  const pending = h.coordinator.dispatch(request("A"));
+  await waitFor(() => h.backend.runStartOrder.includes("A"), "A to start generating");
+  assert.equal(await lockDirExists(h.runtimeDir), true, "our own lock is held");
+
+  assert.deepEqual(await h.coordinator.probe(), { status: "clear" });
+
+  h.backend.releaseRun("A");
+  assert.equal((await pending).status, "completed");
+  await waitForIdle(h);
+});

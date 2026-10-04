@@ -4,7 +4,9 @@
  * `splash_task` (1. tur) ve `splash_refine` (N. tur) AYNI üretim pipeline'ını
  * yürütür — iki ayrı kopya YOK (spec 284: "One common round pipeline"):
  *
- *   ContextAssembler.assemble
+ *   InferenceCoordinator.probe (kilit ALMAYAN ön-kapı — İz 2 / M4)
+ *   → [inference_busy?] → sonuç (ÖLÇÜM YAPILMADAN)
+ *   → ContextAssembler.assemble
  *   → [needs_split?] → sonuç
  *   → InferenceCoordinator.dispatch (süreç-tek; ≤ 1 çağrı, spec 136)
  *   → [inference_busy?] → sonuç
@@ -27,6 +29,7 @@ import type {
   CoordinatedInferenceRequest,
   CoordinatedInferenceResult,
   InferenceConflict,
+  InferenceProbeResult,
 } from "../backend/InferenceCoordinator.js";
 import type { InferenceRunOptions, InferenceUsage, ReasoningEffort } from "../backend/InferenceBackend.js";
 import type { WorkerResult } from "../worker/result.js";
@@ -48,6 +51,11 @@ import type { Workspace, WorkspaceApplyResult } from "../workspace/Workspace.js"
  */
 export interface RoundCoordinator {
   dispatch(request: CoordinatedInferenceRequest): Promise<CoordinatedInferenceResult>;
+  /**
+   * İsteğe bağlı ön-kapı (İz 2 / M4): ölçüm trafiği ÖNCESİ, kilit almadan
+   * meşguliyet yoklaması. Süreç-tek `InferenceCoordinator` sağlar.
+   */
+  probe?(signal?: AbortSignal): Promise<InferenceProbeResult>;
 }
 
 /**
@@ -105,7 +113,11 @@ export type RoundOutcome =
   | {
       kind: "inference_busy";
       conflict: InferenceConflict;
-      assembly: Extract<AssembledContext, { status: "ready" }>;
+      /**
+       * Dispatch'te yakalandıysa ölçülmüş bağlam; ön-kapıda (probe)
+       * yakalandıysa `null` — ölçüm YAPILMADI, telemetri icat edilmez.
+       */
+      assembly: Extract<AssembledContext, { status: "ready" }> | null;
       rulesSource: RulesSource;
     }
   | {
@@ -143,6 +155,22 @@ export class DefaultRoundRunner implements RoundRunner {
   }
 
   async run(input: RoundInput): Promise<RoundOutcome> {
+    // ── ön-kapı (İz 2 / M4): meşgulse ÖLÇMEDEN inference_busy ──────────────
+    // Assembler'ın runtime ölçümleri FIFO'dan geçmez; kilit almayan yoklama
+    // başka bir Splash sahibini / dış runtime'ı ölçümden ÖNCE yakalar.
+    // Danışma niteliğinde: dispatch her şeyi yeniden denetler.
+    if (this.#coordinator.probe !== undefined) {
+      const gate = await this.#coordinator.probe(input.signal);
+      if (gate.status === "inference_busy") {
+        return {
+          kind: "inference_busy",
+          conflict: gate.conflict,
+          assembly: null,
+          rulesSource: input.resolvedRules.source,
+        };
+      }
+    }
+
     // ── bağlam (assembler: redaksiyon + tam ölçü + adaptif bütçe + azaltma) ──
     const assembly = await this.#contextAssembler.assemble({
       task: input.task,

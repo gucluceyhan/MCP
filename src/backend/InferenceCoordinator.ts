@@ -121,7 +121,21 @@ export class CoordinatorError extends Error {
 export interface RuntimeLockLike {
   acquire(ownerId: string): Promise<LockAcquireResult>;
   release(token: string): Promise<void>;
+  /**
+   * İsteğe bağlı salt-okunur yoklama (İz 2 / M4 ön-kapısı) — `RuntimeLock`
+   * sağlar. Yoksa ön-kapı kilit adımını atlar (dispatch yine yetkilidir).
+   */
+  peek?(): Promise<"free" | "busy" | "uncertain">;
 }
+
+/**
+ * `probe` sonucu: `clear` — ölçüm trafiği başlayabilir (dispatch yine her
+ * şeyi YENİDEN denetler); `inference_busy` — dispatch'in vereceği aynı
+ * kapalı sözlükle meşgul.
+ */
+export type InferenceProbeResult =
+  | { status: "clear" }
+  | { status: "inference_busy"; conflict: InferenceConflict };
 
 /**
  * Injeksiyon dikişleri — üretimde yalnızca `runtimeDir` + `backend`
@@ -251,6 +265,52 @@ export class InferenceCoordinator {
 
     this.#pump();
     return promise;
+  }
+
+  /**
+   * Ölçüm trafiği ÖNCESİ kilit ALMAYAN ön-kapı (İz 2 / M4; DESIGN.md 2.5:
+   * adaptör yalnız koordinatör üzerinden). Context Assembler'ın runtime
+   * ölçümleri (`/status`, `/v1/models`, `/apply-template`, `/tokenize`)
+   * FIFO'dan geçmez; bu yoklama, meşgul bir host'ta ölçüm yapılmadan
+   * `inference_busy` dönülmesini sağlar. Danışma niteliğindedir (TOCTOU):
+   * `dispatch` kilidi alıp her şeyi yeniden denetler.
+   *
+   * Sıra (dispatch'in haritasıyla birebir):
+   *  1. bu süreçte dispatch yoksa kilit yoklaması: canlı sahip → `splash`,
+   *     doğrulanamıyor → `unknown` (runtime'a hiç gidilmez). Bu süreçte
+   *     aktif bir dispatch varsa kilit BİZİMDİR — aynı süreç FIFO beklemesi
+   *     çakışma DEĞİLDİR, adım atlanır;
+   *  2. runtime kimliği YENİLENİR (asla önbellek — yeniden başlamış
+   *     runtime'ın PID'i); hata tip'li olarak AYNEN yayılır;
+   *  3. kimlik yok → `unknown`; tarama hatası → `unknown`; çakışma → tür.
+   * Hiçbir kilit alınmaz, hiçbir dosya yazılmaz, jenerasyon yapılmaz.
+   */
+  async probe(signal?: AbortSignal): Promise<InferenceProbeResult> {
+    if (this.#active === null && this.#lock.peek !== undefined) {
+      let state: "free" | "busy" | "uncertain";
+      try {
+        state = await this.#lock.peek();
+      } catch {
+        state = "uncertain";
+      }
+      if (state === "busy") {
+        return { status: "inference_busy", conflict: "splash" };
+      }
+      if (state === "uncertain") {
+        return { status: "inference_busy", conflict: "unknown" };
+      }
+    }
+    const info = await this.#backend.refreshRuntimeInfo(signal);
+    if (info.runtimeProcessId === undefined) {
+      return { status: "inference_busy", conflict: "unknown" };
+    }
+    let conflict: ConflictKind;
+    try {
+      conflict = await this.#detector.detect(info.runtimeProcessId);
+    } catch {
+      return { status: "inference_busy", conflict: "unknown" };
+    }
+    return conflict === "none" ? { status: "clear" } : { status: "inference_busy", conflict };
   }
 
   /** Aktif işin opak `ownerId`'si; hiçbir iş dispatch'de değilse `null`. */

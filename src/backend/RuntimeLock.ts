@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -21,6 +21,13 @@ import path from "node:path";
  *   durum, okunamayan kayıt) FAIL CLOSED — belirsiz kilit ASLA silinmez.
  *   Yeni oluşturulmuş (grace dönemi içinde) eksik/kayıtsız kilit de
  *   "meşgul" sayılır; yalnızca yaşlı olanlar kurtarılır.
+ * - Kurtarma KİMLİĞE BAĞLIDIR (İz 2 / M1): incelemede yakalanan dizin
+ *   `ino`'su; kurtarma `inference.lock.reclaim` koruma dizini (atomik mkdir)
+ *   altında, karar YENİDEN verilip `ino` aynıysa rename eder — iki süreç
+ *   aynı bayat kilidi "kurtarıp" birinin yeni kilidini diğerinin silmesi
+ *   (çift sahiplik) imkânsızdır. İnceleme sırasında kaybolan kilit
+ *   ("vanished") ASLA kurtarılmaz — yalnız yeniden denenir. Sahip kaydı
+ *   `wx` (münhasır) yazılır; hata yolunda yalnız KENDİ `ino`'lu dizin silinir.
  * - Kilit durumu `<outputRoot>/runtime/` altındadır — asla bir proje
  *   deposunun içinde değil. Dizini bu sınıf KURULUMDA oluşturmaz; yalnızca
  *   ilk `acquire`'da açar (başlangıç kilitsizdir).
@@ -95,6 +102,21 @@ export const STALE_LOCK_GRACE_MS = 5_000;
 
 /** Bayat kilit kurtarışından sonra sınırı deneme sayısı. */
 const MAX_ACQUIRE_ATTEMPTS = 3;
+
+/**
+ * Kurtarma koruma dizininin adı: `<runtimeDir>/inference.lock.reclaim`.
+ * Kontrol + rename yalnız bu dizini atomik `mkdir` ile alan süreçte
+ * yürür. Grace'i aşmış koruma (kurtarma ortasında çökmüş süreç) terk
+ * edilmiş sayılır ve kaldırılır — kalıcı kilitlenme olmaz.
+ */
+export const RECLAIM_GUARD_DIR = `${INFERENCE_LOCK_DIR}.reclaim`;
+
+/** İnceleme kararı + (dizin varsa) incelenen örneğin `ino`'su. */
+type Inspection =
+  | { verdict: "busy" }
+  | { verdict: "uncertain" }
+  | { verdict: "vanished" }
+  | { verdict: "stale"; ino: number };
 
 /**
  * Üretim PID canlılık denetçisi: `process.kill(pid, 0)` hiçbir sinyal
@@ -174,17 +196,32 @@ export class RuntimeLock {
           // Gerçek bir fs hatası (izin, eksik üst dizin, ...): fail closed.
           return { acquired: false, reason: "uncertain" };
         }
-        const verdict = await this.#inspectExistingLock();
-        if (verdict === "busy" || verdict === "uncertain") {
-          return { acquired: false, reason: verdict };
+        const inspection = await this.#inspectExistingLock();
+        if (inspection.verdict === "busy" || inspection.verdict === "uncertain") {
+          return { acquired: false, reason: inspection.verdict };
         }
-        // `stale`: sahibi kesin ölü (ya da yaşlı eksik kayıt) —
-        // güvenle kurtar ve yeniden dene.
-        await this.#reclaimStaleLock();
+        if (inspection.verdict === "vanished") {
+          // EEXIST ile inceleme arasında kilit kalktı: kurtarılacak bir
+          // şey YOK — körü körüne rename, o arada alınmış canlı bir kilidi
+          // taşıyabilirdi. Yalnız yeniden dene.
+          continue;
+        }
+        // `stale`: sahibi kesin ölü (ya da yaşlı eksik kayıt) — incelenen
+        // ÖRNEĞE (ino) bağlı, korumalı kurtarma; sonra yeniden dene.
+        await this.#reclaimStaleLock(inspection.ino);
         continue;
       }
 
-      // mkdir başarılı — dizin BİZİM. Sahiplik kaydını yayımla.
+      // mkdir başarılı — dizin BİZİM. Hata yolunda yalnız bu örneği
+      // silebilmek için kimliğini (ino) hemen yakala.
+      let ownIno: number | null = null;
+      try {
+        ownIno = (await stat(this.#lockDir)).ino;
+      } catch {
+        ownIno = null;
+      }
+
+      // Sahiplik kaydını yayımla.
       const owner: RuntimeLockOwner = {
         schema_version: 1,
         pid: process.pid,
@@ -193,14 +230,25 @@ export class RuntimeLock {
         acquired_at: new Date(this.#now()).toISOString(),
       };
       try {
+        // `wx`: kayıt ZATEN varsa (dizin el değiştirmiş) asla üzerine yazma.
         await writeFile(this.#ownerFile, `${JSON.stringify(owner, null, 2)}\n`, {
           mode: 0o600,
+          flag: "wx",
         });
       } catch {
-        // Yalnızca BİZ oluşturduğumuz dizin bu noktada eksik kayda
-        // sahiptir (token henüz yayımlanmadı — hiç kimse sahipliği
-        // doğrulayamaz). Kendi yarım kalıntımızı temizle; fail closed.
-        await bestEffortRm(this.#lockDir);
+        // Kendi yarım kalıntımızı temizle — YALNIZ yol hâlâ bizim
+        // oluşturduğumuz örnekse (ino aynı). Kimlik bilinmiyor ya da
+        // değişmişse dokunulmaz (başkasının kilidi olabilir); eksik kayıtlı
+        // bir kalıntı grace'ten sonra bayat sayılır. Fail closed.
+        if (ownIno !== null) {
+          try {
+            if ((await stat(this.#lockDir)).ino === ownIno) {
+              await bestEffortRm(this.#lockDir);
+            }
+          } catch {
+            // Dizin yok / okunamıyor: silinecek bir şey yok ya da bilinmiyor.
+          }
+        }
         return { acquired: false, reason: "uncertain" };
       }
       // Modları kesinleştir (umask'e rağmen); pratik olmadığında hata
@@ -282,6 +330,23 @@ export class RuntimeLock {
     }
   }
 
+  /**
+   * Kilidi ALMADAN salt-okunur yoklama (İz 2 / M4 ön-kapısı): hiçbir şey
+   * yazmaz, silmez, kurtarmaz.
+   *  - `free` — kilit dizini yok, inceleme sırasında kalktı ya da bayat
+   *    (bir sonraki `acquire` kurtarır);
+   *  - `busy` — canlı sahip ya da grace içindeki eksik/bozuk kayıt;
+   *  - `uncertain` — durum doğrulanamıyor (fail closed).
+   * Kendi sürecinin tuttuğu kilit de `busy` döner — ayrımı çağıran yapar.
+   */
+  async peek(): Promise<"free" | "busy" | "uncertain"> {
+    const inspection = await this.#inspectExistingLock();
+    if (inspection.verdict === "busy" || inspection.verdict === "uncertain") {
+      return inspection.verdict;
+    }
+    return "free";
+  }
+
   // ── iç yardımcılar ─────────────────────────────────────────────────────
 
   /** Runtime kök dizinini oluşturmaya çalışır; hata kilidi fail-closed yapar. */
@@ -303,22 +368,25 @@ export class RuntimeLock {
    *  - `uncertain` — durum güvenle kurulamıyor (okunamayan kayıt,
    *    doğrulanamayan canlılık): fail closed.
    *  - `stale` — sahip KESİN ölü, ya da grace dönemini aşmış eksik/bozuk
-   *    kayıt: güvenle kurtarılabilir.
+   *    kayıt: güvenle kurtarılabilir (incelenen örneğin `ino`'su ile).
+   *  - `vanished` — dizin inceleme anında yok: kurtarılacak bir şey yok.
    */
-  async #inspectExistingLock(): Promise<"busy" | "uncertain" | "stale"> {
+  async #inspectExistingLock(): Promise<Inspection> {
     let info;
     try {
       info = await stat(this.#lockDir);
     } catch (err) {
-      // Yarış sırasında kurtarılmış olabilir: yeniden mkdir dene.
+      // Yarış sırasında bırakılmış/kurtarılmış: "vanished" — ASLA
+      // kurtarılmaz (İz 2 / M1); çağıran yalnız yeniden dener.
       if (isErrno(err, "ENOENT")) {
-        return "stale";
+        return { verdict: "vanished" };
       }
-      return "uncertain";
+      return { verdict: "uncertain" };
     }
     if (!info.isDirectory()) {
-      return "uncertain";
+      return { verdict: "uncertain" };
     }
+    const ino = info.ino;
 
     // Yaş yalnızca EKSİK/BOZUK kayıt için anlamlıdır (canlılık
     // doğrulanamayan sahiplik belirsizliğine tolerans penceresi koyar).
@@ -331,53 +399,91 @@ export class RuntimeLock {
     } catch (err) {
       if (!isErrno(err, "ENOENT")) {
         // Okunamayan kayıt (izin, ...): fail closed.
-        return "uncertain";
+        return { verdict: "uncertain" };
       }
       // Eksik kayıt (mkdir ile kayıt yazımı arasında çöküş):
       // yeni → meşgul say; yaşlı → bayat.
-      return withinGrace ? "busy" : "stale";
+      return withinGrace ? { verdict: "busy" } : { verdict: "stale", ino };
     }
 
     const stored = tryParseStoredOwner(raw);
     if (stored === null) {
       // Bozuk kayıt: eksik kayıtla aynı yaş kuralı.
-      return withinGrace ? "busy" : "stale";
+      return withinGrace ? { verdict: "busy" } : { verdict: "stale", ino };
     }
 
     const verdict = this.#liveness(stored.pid);
     if (verdict === "alive") {
-      return "busy";
+      return { verdict: "busy" };
     }
     if (verdict === "dead") {
-      return "stale";
+      return { verdict: "stale", ino };
     }
     // Doğrulanamayan canlılık: fail closed — silinmez.
-    return "uncertain";
+    return { verdict: "uncertain" };
   }
 
   /**
-   * Bayat kilidi güvenle kurtarır: kilit dizinini benzersiz bir
-   * mezar taşına (`inference.lock.stale.<uuid>`) ATOMİK rename eder,
-   * mezar taşı yalnızca rename eden süreç tarafından kaldırılır.
-   * Yarışı başka süreç kazandıysa rename hata verir; o durumda kurtarma
-   * yapılmaz ve `acquire` normal yoldan yeniden dener.
+   * Bayat kilidi güvenle kurtarır (İz 2 / M1):
+   *  1. koruma dizinini (`inference.lock.reclaim`) atomik `mkdir` ile al —
+   *     alınamazsa (başka süreç kurtarıyor) hiçbir şey yapma; koruma
+   *     grace'i aşmışsa (çökmüş kurtarıcı) kaldır ve dön (sonraki deneme);
+   *  2. koruma altında kararı YENİDEN ver: hâlâ `stale` VE `ino` incelenen
+   *     örnekle aynıysa kilit dizinini benzersiz mezar taşına
+   *     (`inference.lock.stale.<uuid>`) ATOMİK rename et — aksi hâlde
+   *     (yeni sahip, kaybolmuş, değişmiş) DOKUNMA;
+   *  3. korumayı bırak; mezar taşını (en iyi çaba) sil.
+   * `acquire` her durumda normal yoldan yeniden dener.
    */
-  async #reclaimStaleLock(): Promise<void> {
-    const tombstone = path.join(
-      this.#runtimeDir,
-      `${INFERENCE_LOCK_DIR}.stale.${randomUUID()}`,
-    );
-    let renamed = false;
+  async #reclaimStaleLock(inspectedIno: number): Promise<void> {
+    const guard = path.join(this.#runtimeDir, RECLAIM_GUARD_DIR);
     try {
-      await rename(this.#lockDir, tombstone);
-      renamed = true;
-    } catch {
-      renamed = false; // Dizin yok ya da başka süreç kaptı.
+      await mkdir(guard, { mode: 0o700 });
+    } catch (err) {
+      if (isErrno(err, "EEXIST")) {
+        await this.#clearAbandonedGuard(guard);
+      }
+      return;
     }
-    if (renamed) {
+    let tombstone: string | null = null;
+    try {
+      const recheck = await this.#inspectExistingLock();
+      if (recheck.verdict === "stale" && recheck.ino === inspectedIno) {
+        const target = path.join(this.#runtimeDir, `${INFERENCE_LOCK_DIR}.stale.${randomUUID()}`);
+        try {
+          await rename(this.#lockDir, target);
+          tombstone = target;
+        } catch {
+          tombstone = null; // Dizin yok ya da taşınamadı: kurtarma yok.
+        }
+      }
+    } finally {
+      try {
+        await rmdir(guard);
+      } catch {
+        // Koruma kaldırılamadı: grace sonrası terk edilmiş sayılır.
+      }
+    }
+    if (tombstone !== null) {
       // Mezar taşı kilit YOLU değil — inaktif bir kalıntıdır.
       // Kaldırılamazsa (fs pahası) sistem etkilenmez; en iyi çaba.
       await bestEffortRm(tombstone);
+    }
+  }
+
+  /**
+   * Terk edilmiş koruma: yaşı grace'i aşmışsa (kurtarma kritik bölgesi
+   * milisaniyeler sürer; o kadar eski koruma çökmüş bir süreçtendir) boş
+   * dizin `rmdir` ile kaldırılır. Taze koruma ASLA kaldırılmaz.
+   */
+  async #clearAbandonedGuard(guard: string): Promise<void> {
+    try {
+      const info = await stat(guard);
+      if (this.#now() - info.mtimeMs >= STALE_LOCK_GRACE_MS) {
+        await rmdir(guard);
+      }
+    } catch {
+      // Zaten kalkmış ya da okunamıyor: dokunma.
     }
   }
 }

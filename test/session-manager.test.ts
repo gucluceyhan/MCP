@@ -206,6 +206,8 @@ class FakeLock implements RuntimeLockLike {
   releaseCount = 0;
   /** `true` ise başka bir süreç kilidi tutuyormuş gibi davran. */
   busy = false;
+  /** İz 2 / M4: `true` ise kilit ALMAYAN ön-kapı (peek) canlı yabancı sahip görür. */
+  peekBusy = false;
   async acquire(ownerId: string): Promise<LockAcquireResult> {
     this.acquireCount++;
     if (this.busy) {
@@ -215,6 +217,9 @@ class FakeLock implements RuntimeLockLike {
   }
   async release(_token: string): Promise<void> {
     this.releaseCount++;
+  }
+  async peek(): Promise<"free" | "busy" | "uncertain"> {
+    return this.peekBusy ? "busy" : "free";
   }
 }
 
@@ -2246,5 +2251,29 @@ test("S2c: üretilmemiş refine turları (needs_split / inference_busy) aday sal
   const busy = await h.manager.refine({ sessionId: first.sessionId, feedback: "y", files: ["src/b.ts"] });
   assert.equal(busy.status, "inference_busy");
   assert.deepEqual(readonlyCalls.at(-1), [], "busy sonrası commit edilmiş küme");
+  assert.deepEqual((await readSessionJson(first.sessionId, h.sessionsDir)).readonlyPaths, []);
+});
+
+test("M4: refine whose pre-measurement probe is busy → inference_busy with the LAST KNOWN context (input 0); no measurement, no dispatch, state unchanged", async (t) => {
+  const h = await makeManagerHarness(t);
+  const first = await taskRound1(h);
+  assert.equal(first.status, "applied");
+  let measured = 0;
+  h.backend.countBehavior = () => {
+    measured++;
+    return 1_000;
+  };
+  const acquiresBefore = h.lock.acquireCount;
+  h.lock.peekBusy = true;
+
+  const busy = await h.manager.refine({ sessionId: first.sessionId, feedback: "again", files: ["src/b.ts"] });
+
+  assert.equal(busy.status, "inference_busy");
+  assert.equal(busy.inference?.conflict, "splash");
+  assert.equal(measured, 0, "no measurement traffic behind a busy probe");
+  assert.equal(h.lock.acquireCount, acquiresBefore, "dispatch is never reached");
+  assert.deepEqual(busy.context, { ...first.context, inputTokens: 0 });
+  assert.deepEqual(busy.filesChanged, first.filesChanged);
+  assert.deepEqual(busy.warnings, []);
   assert.deepEqual((await readSessionJson(first.sessionId, h.sessionsDir)).readonlyPaths, []);
 });

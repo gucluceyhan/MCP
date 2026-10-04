@@ -694,22 +694,76 @@ test("36/66: external runtime (mlx) → inference_busy; workspace retained; back
   assert.equal(result.inference?.conflict, "mlx");
   assert.equal(result.baseStatus, "fresh");
   assert.deepEqual(result.usage, { in: 0, out: 0 });
-  // Bağlam telemetrisi dispatch ÖNCESİ (assembler) tamamlandı — bütçe seçimi
-  // busy sonuçta da raporlanır (spec 37):
-  assert.equal(result.context.runtimeMaxTokens, 128_000);
-  assert.equal(result.context.inputTokens, 0); // model çağrılmadı
-  assert.equal(result.context.outputReserveTokens, 32_768);
-  assert.equal(result.context.selectedContextTier, "64k");
+  // İz 2 / M4: çakışma ölçüm trafiği ÖNCESİ (kilit almayan ön-kapı) yakalanır —
+  // ölçüm YAPILMADI, bağlam telemetrisi icat edilmez (1. tur → sıfır metadata).
+  assert.equal(h.backend.countCalls.length, 0, "no measurement traffic under a host conflict");
+  assert.equal(h.backend.refreshCount, 1, "only the probe's identity refresh");
+  assert.deepEqual(result.context, {
+    runtimeMaxTokens: 0,
+    inputTokens: 0,
+    outputReserveTokens: 0,
+    selectedContextTier: "runtime_max",
+    truncatedReadonlyContext: false,
+  });
   assert.deepEqual(result.filesChanged, []);
   assert.equal(result.validation.editsRequested, 0);
   assert.ok(result.summary.length > 0);
   // Workspace KORUNDU (refine/close Step 9'da kullanacak) — spec 66:
   assert.equal(h.service.activeTasks().length, 1);
   assert.ok(await pathExists(path.join(h.sessionsDir, result.sessionId, "workspace")));
-  // Gerçek generation YOK:
+  // Gerçek generation YOK; ön-kapı kilidi ALMAZ (dispatch'e hiç inilmedi):
   assert.equal(h.backend.runCalls.length, 0);
-  assert.equal(h.lock.acquireCount, 1);
-  assert.equal(h.lock.releaseCount, 1); // busy yolunda da kilit bırakıldı
+  assert.equal(h.lock.acquireCount, 0);
+  assert.equal(h.lock.releaseCount, 0);
+});
+
+test("M4: a foreign LIVE Splash lock → inference_busy/splash BEFORE any measurement traffic; the foreign lock is untouched", async (t) => {
+  const fixture = await makeFixture(t);
+  const FOREIGN = 999_801;
+  const backend = new FakeBackend();
+  backend.runBehavior = async () => {
+    throw new Error("backend.run must NOT be called behind a foreign lock");
+  };
+  const runtimeDir = path.join(fixture.outputRoot, "runtime");
+  const coordinator = new InferenceCoordinator({
+    backend,
+    runtimeDir,
+    scanner: cleanScanner(),
+    liveness: (pid) => (pid === FOREIGN ? "alive" : "unknown"),
+  });
+  const service = new SplashTaskService({
+    config: fixture.config,
+    coordinator,
+    contextAssembler: new ContextAssembler({ runtime: backend }),
+    workerContract: new WorkerContract(),
+    createWorkspace: (input) => createGitWorktreeWorkspace(input),
+    newSessionId: randomUUID,
+    processCwd: () => fixture.repoRoot,
+  });
+  t.after(async () => {
+    await service.dispose().catch(() => undefined);
+  });
+  const lockDir = path.join(runtimeDir, "inference.lock");
+  await mkdir(lockDir, { recursive: true });
+  await writeFile(
+    path.join(lockDir, "owner.json"),
+    JSON.stringify({ schema_version: 1, pid: FOREIGN, token: "foreign-token", owner_id: "other", acquired_at: "2026-01-01T00:00:00.000Z" }),
+  );
+
+  const result = await service.executeTask({ task: "Anything", files: ["src/a.ts"] });
+
+  assert.equal(result.status, "inference_busy");
+  assert.equal(result.inference?.conflict, "splash");
+  // Ölçüm trafiği YOK: ne runtime yenilemesi (/status, /v1/models) ne
+  // tokenizer/şablon çağrısı ne jenerasyon.
+  assert.equal(backend.refreshCount, 0);
+  assert.equal(backend.countCalls.length, 0);
+  assert.equal(backend.runCalls.length, 0);
+  assert.equal(result.context.runtimeMaxTokens, 0);
+  assert.deepEqual(result.warnings, []);
+  // Oturum korunur (sonra yeniden denenebilir); yabancı kilit dokunulmaz.
+  assert.equal(service.activeTasks().length, 1);
+  assert.ok((await readFile(path.join(lockDir, "owner.json"), "utf8")).includes("foreign-token"));
 });
 
 test("36: another Splash process holds the lock → inference_busy/splash", async (t) => {

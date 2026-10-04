@@ -148,7 +148,11 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
     });
   const workerContract = options.workerContract ?? new WorkerContract();
   // SÜREÇ TEK (spec 4): assembler, coordinator ile AYNI backend instance'ını
-  // paylaşır — ölçüm (assembler) ve jenerasyon (coordinator) tek seri kaynaktan.
+  // paylaşır. Yalnız JENERASYON coordinator'ın FIFO'sundan (tek seri kaynak)
+  // geçer; assembler'ın ölçüm trafiği (/status, /v1/models, /apply-template,
+  // /tokenize) FIFO'ya GİRMEZ — her turda ölçümden ÖNCE coordinator'ın kilit
+  // almayan ön-kapısı (`probe`, İz 2 / M4) meşguliyeti yoklar; meşgulse ölçüm
+  // yapılmadan `inference_busy` döner.
   const contextAssembler = options.contextAssembler ?? new ContextAssembler({ runtime: backend });
   // SÜREÇ TEK (Step 8): stateless resolver — tek instance tüm çağrılar için.
   // Konstrüksiyon tembel: filesystem'e hiçbir şey dokunmaz.
