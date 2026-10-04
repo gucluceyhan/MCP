@@ -796,15 +796,25 @@ inherited repository-local variables removed (the
 `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`, …), so the repository is always
 discovered from the command's working directory — a Splash process started
 with an absolute `GIT_DIR`/`GIT_WORK_TREE` can never stage, commit, or reset
-in the main checkout. User/system-level config (`GIT_CONFIG_GLOBAL`,
+in the main checkout. Names are matched case-insensitively, because
+environment names are case-insensitive on Windows (`Git_Dir` is
+`GIT_DIR`), and the three safety values (`GIT_TERMINAL_PROMPT=0`,
+`LC_ALL=C`, `GIT_NO_LAZY_FETCH=1`) are always written as a single
+upper-case copy. User/system-level config (`GIT_CONFIG_GLOBAL`,
 `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`) is kept; command-scope config
 (incl. `safe.directory`) cannot be supplied through the environment — use
 global/system config. Lazy promisor fetches are disabled
 (`GIT_NO_LAZY_FETCH=1`): in a partial clone, a command that needs an object
 that is not present locally fails closed (creation/recovery error) instead
-of contacting the remote. The variable only takes effect on git ≥ 2.44; on
-older git (or an unparseable `git --version`) a repository with a promisor
-remote (`extensions.partialClone` or any `remote.*.promisor=true`) is
+of contacting the remote. The variable only takes effect on a Git release
+whose lazy-fetch path checks it: 2.45.1 and later, or a patched maintenance
+release (2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1 and later patches
+of those series); 2.44.0 and 2.45.0 are not protected. On any other git
+(or an unparseable `git --version`) a repository with a promisor remote
+(`extensions.partialClone` or any `remote.*.partialCloneFilter` — the key's
+presence is enough, an empty value counts — or any `remote.*.promisor=true`;
+the two-level `remote.promisor` / `remote.partialCloneFilter` forms count
+too, because git turns them into a promisor with an empty name) is
 rejected at workspace creation and recovery (`invalid_repository`), because
 a lazy fetch could run repository-configured transport programs on the
 host. The tracked delta (`git diff <sha> … --`) is captured against the

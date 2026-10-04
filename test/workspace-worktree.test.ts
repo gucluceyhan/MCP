@@ -43,6 +43,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
+  appendFile,
   chmod,
   lstat,
   mkdir,
@@ -4306,7 +4307,7 @@ async function settle<T>(fn: () => Promise<T>): Promise<{ value: T | null; error
   }
 }
 
-test("git < 2.44 + partial clone (promisor remote): creation and recovery reject with a fixed invalid_repository; a non-promisor repo and git >= 2.44 are unaffected (MEDIUM-1)", async () => {
+test("git without GIT_NO_LAZY_FETCH + partial clone (promisor remote): creation and recovery reject with a fixed invalid_repository; a non-promisor repo and a protected git (2.45.1) are unaffected (MEDIUM-1)", async () => {
   const source = await buildPlainRepo("m1-src");
   await gitOk(source.repo, ["config", "uploadpack.allowFilter", "true"]);
   const out = path.join(tmp, "m1-clone");
@@ -4315,6 +4316,9 @@ test("git < 2.44 + partial clone (promisor remote): creation and recovery reject
   // Checkout'lu partial clone doğrudan git ile kurulur: runGit'in
   // GIT_NO_LAZY_FETCH'i checkout'un blob çekmesini (doğru biçimde) engellerdi.
   await promisify(execFile)("git", ["clone", "-q", "--filter=blob:none", `file://${source.repo}`, clone]);
+  // Not: `clone --filter` fikstürü `remote.origin.partialclonefilter`'ı da
+  // yazar — bu test 3 seviyeli promisor sorgusunu ve `--bool`'u TEK BAŞINA
+  // ayırt etmez; onlar biçim tablosu testinde (aşağıda) sabitlenir.
   assert.equal(await gitText(clone, ["config", "--get", "remote.origin.promisor"]), "true", "fixture: promisor remote");
   const plain = await buildPlainRepo("m1-plain");
   const cloneInput = (sessionId: string): WorkspaceCreateInput => ({
@@ -4325,11 +4329,11 @@ test("git < 2.44 + partial clone (promisor remote): creation and recovery reject
     readonlyPaths: [],
   });
 
-  // git >= 2.44 (sahte 2.44.0; kurulu git sürümünden bağımsız): promisor'lı
+  // Korumalı git (sahte 2.45.1; kurulu git sürümünden bağımsız): promisor'lı
   // repo da oluşturulur — mevcut davranış. Ayrı dizin ŞART: sürüm önbelleği
   // `PATH` anahtarlı; aşağıdaki 2.43.0 bloğuyla aynı `out` → aynı PATH →
-  // önbellekteki 2.44.0 okunur ve eski dal reddetmez (ölçüldü).
-  const state = await withFakeGitVersion(path.join(out, "v2.44"), "git version 2.44.0", async () => {
+  // önbellekteki 2.45.1 okunur ve eski dal reddetmez (ölçüldü).
+  const state = await withFakeGitVersion(path.join(out, "v2.45.1"), "git version 2.45.1", async () => {
     const modern = await createGitWorktreeWorkspace(cloneInput("s-m1-modern"));
     const snapshot = await modern.snapshotRecoveryState();
     await modern.destroy();
@@ -4359,7 +4363,7 @@ test("git < 2.44 + partial clone (promisor remote): creation and recovery reject
     for (const [label, result] of [["create", outcome.create], ["recover", outcome.recover]] as const) {
       assert.ok(result.error instanceof WorkspaceError, `${label}: expected WorkspaceError, got ${String(result.error)}`);
       assert.equal(result.error.kind, "invalid_repository", label);
-      assert.equal(result.error.message, "Partial clone repositories require Git 2.44 or newer", label);
+      assert.equal(result.error.message, "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)", label);
     }
     assert.equal(await lstat(path.join(out, "ws", "s-m1-old")).catch(() => null), null, "no worktree is created");
     assert.equal(await lstat(state.workspaceDir).catch(() => null), null, "no worktree is recovered");
@@ -4368,5 +4372,121 @@ test("git < 2.44 + partial clone (promisor remote): creation and recovery reject
     for (const ws of created) {
       await ws.destroy().catch(() => undefined);
     }
+  }
+});
+
+test("a repository whose only promisor signal is remote.<name>.partialCloneFilter is gated like any promisor remote: an unprotected git rejects creation and recovery, a protected git creates (MEDIUM-1, P1)", async () => {
+  // git `promisor_remote_config()`: `remote.<ad>.partialclonefilter` anahtarı
+  // TEK BAŞINA remote'u promisor yapar (değerinden bağımsız).
+  const fixture = await buildPlainRepo("p1c-filter-only");
+  await gitOk(fixture.repo, ["config", "remote.origin.partialclonefilter", "blob:none"]);
+  const local = await gitText(fixture.repo, ["config", "--local", "--list"]);
+  assert.ok(local.split("\n").includes("remote.origin.partialclonefilter=blob:none"), "fixture: filter key set");
+  assert.ok(!/promisor|extensions\.partialclone/i.test(local), "fixture: no promisor key, no extensions.partialClone");
+  const input = (sessionId: string): WorkspaceCreateInput => ({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", sessionId),
+    sessionId,
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  });
+
+  // Ayrı dizinler ŞART: sürüm önbelleği `PATH` anahtarlı.
+  const old = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () =>
+    settle(() => createGitWorktreeWorkspace(input("s-p1c-old"))),
+  );
+  if (old.value !== null) {
+    await old.value.destroy().catch(() => undefined);
+  }
+  assert.ok(old.error instanceof WorkspaceError, `expected WorkspaceError, got ${String(old.error)}`);
+  assert.equal(old.error.kind, "invalid_repository");
+  assert.equal(
+    old.error.message,
+    "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+  );
+  assert.equal(await lstat(path.join(fixture.out, "ws", "s-p1c-old")).catch(() => null), null, "no worktree is created");
+
+  const state = await withFakeGitVersion(path.join(fixture.out, "v2.45.1"), "git version 2.45.1", async () => {
+    const modern = await createGitWorktreeWorkspace(input("s-p1c-modern"));
+    const snapshot = await modern.snapshotRecoveryState();
+    await modern.destroy();
+    return snapshot;
+  });
+
+  // Kurtarma da aynı kapıdan geçer (korumasız git → red, worktree geri gelmez).
+  // Aynı 2.43.0 dizini: önbellekteki sürüm de 2.43.0.
+  const recover = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () =>
+    settle(() => restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir })),
+  );
+  if (recover.value !== null) {
+    await recover.value.destroy().catch(() => undefined);
+  }
+  assert.ok(recover.error instanceof WorkspaceError, `recover: expected WorkspaceError, got ${String(recover.error)}`);
+  assert.equal(recover.error.kind, "invalid_repository", "recover");
+  assert.equal(
+    recover.error.message,
+    "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+    "recover",
+  );
+  assert.equal(await lstat(state.workspaceDir).catch(() => null), null, "no worktree is recovered");
+});
+
+test("every promisor form git itself honors is gated on an unprotected git: two-level remote.partialCloneFilter / remote.promisor, empty extensions.partialClone, empty remote.<name>.partialCloneFilter, remote.<name>.promisor as true/yes/1/bare key (MEDIUM-1, P1)", async () => {
+  // Merkez ölçtü (Git 2.50.1, `GIT_NO_LAZY_FETCH` tanımsız, `GIT_TRACE`): bu
+  // biçimlerin HEPSİ eksik nesne okumasında tembel `git fetch` başlatır.
+  // 3 seviyeli `remote.origin.promisor` satırları (filter/extension YOK)
+  // promisor sorgusunun 3 seviyeli yolunu ve `--bool` normalleştirmesini
+  // (`yes`/`1`/çıplak anahtar → true) tek başına sabitler.
+  // `value === null` → çıplak anahtar (`.git/config`'e doğrudan yazılır).
+  const cases: ReadonlyArray<readonly [label: string, key: string, value: string | null]> = [
+    ["two-level remote.partialclonefilter", "remote.partialclonefilter", "blob:none"],
+    ["two-level remote.promisor", "remote.promisor", "true"],
+    ["empty extensions.partialclone", "extensions.partialclone", ""],
+    ["empty remote.origin.partialclonefilter", "remote.origin.partialclonefilter", ""],
+    ["remote.origin.promisor=true", "remote.origin.promisor", "true"],
+    ["remote.origin.promisor=yes", "remote.origin.promisor", "yes"],
+    ["remote.origin.promisor=1", "remote.origin.promisor", "1"],
+    ["bare remote.origin.promisor key", "remote.origin.promisor", null],
+  ];
+  for (const [index, [label, key, value]] of cases.entries()) {
+    const fixture = await buildPlainRepo(`p1c-form-${index}`);
+    if (value === null) {
+      await appendFile(path.join(fixture.repo, ".git", "config"), '[remote "origin"]\n\tpromisor\n');
+    } else {
+      await gitOk(fixture.repo, ["config", key, value]);
+    }
+    const expectedLine = value === null ? key : `${key}=${value}`;
+    const local = (await gitText(fixture.repo, ["config", "--local", "--list"])).split("\n");
+    assert.ok(local.includes(expectedLine), `${label}: fixture key set`);
+    assert.deepEqual(
+      local.filter((line) => line !== expectedLine && /promisor|partialclone/i.test(line)),
+      [],
+      `${label}: fixture has no other promisor signal`,
+    );
+    const sessionId = `s-p1c-form-${index}`;
+    const workspaceDir = path.join(fixture.out, "ws", sessionId);
+    // Her durum kendi dizininde (sürüm önbelleği `PATH` anahtarlı).
+    const result = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () =>
+      settle(() =>
+        createGitWorktreeWorkspace({
+          repoRoot: fixture.repo,
+          workspaceDir,
+          sessionId,
+          editablePaths: ["f.txt"],
+          readonlyPaths: [],
+        }),
+      ),
+    );
+    if (result.value !== null) {
+      await result.value.destroy().catch(() => undefined);
+    }
+    assert.ok(result.error instanceof WorkspaceError, `${label}: expected WorkspaceError, got ${String(result.error)}`);
+    assert.equal(result.error.kind, "invalid_repository", label);
+    assert.equal(
+      result.error.message,
+      "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+      label,
+    );
+    assert.equal(await lstat(workspaceDir).catch(() => null), null, `${label}: no worktree is created`);
   }
 });

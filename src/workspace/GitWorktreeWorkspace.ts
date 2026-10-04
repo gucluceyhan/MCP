@@ -1841,8 +1841,9 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
   }
 
   // ── tembel promisor çekme kapatılabilir mi (inceleme MEDIUM-1) ───────────
-  // İlk nesne okuyan git komutundan ÖNCE: git < 2.44 + promisor'lı repo →
-  // sabit `invalid_repository` (yukarıdaki adımlar yalnız fs'tir).
+  // İlk nesne okuyan git komutundan ÖNCE: `GIT_NO_LAZY_FETCH`'i denetlemeyen
+  // git + promisor'lı repo → sabit `invalid_repository` (yukarıdaki adımlar
+  // yalnız fs'tir).
   await assertPartialCloneSupported(repoRoot);
 
   // ── ana depo: HEAD commit'i zorunlu (v1 worktree tabanı, spec 7) ──────────
@@ -2423,8 +2424,9 @@ export async function restoreGitWorktreeWorkspace(
     state.currentCreatedPaths,
   );
 
-  // İlk git komutundan ÖNCE (inceleme MEDIUM-1): git < 2.44 + promisor'lı
-  // repo → sabit `invalid_repository` (oluşturmayla aynı kapı).
+  // İlk git komutundan ÖNCE (inceleme MEDIUM-1): `GIT_NO_LAZY_FETCH`'i
+  // denetlemeyen git + promisor'lı repo → sabit `invalid_repository`
+  // (oluşturmayla aynı kapı).
   await assertPartialCloneSupported(repoRoot);
   await materializeWorkspace(workspace, state, repoRoot, workspaceDir);
   return workspace;

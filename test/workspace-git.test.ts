@@ -25,6 +25,7 @@ import {
   computeRepoId,
   discoverRepoRoot,
   parseCatFileBatch,
+  parseGitVersion,
   partialCloneUnsupported,
   runGit,
 } from "../dist/workspace/git.js";
@@ -284,11 +285,12 @@ test("runGit: inherited repo-local GIT_* variables never redirect a command to a
 });
 
 test("runGit: a partial clone never lazy-fetches a missing object from its promisor remote (W-M2)", async (t) => {
-  // `GIT_NO_LAZY_FETCH` yalnız git ≥ 2.44'te etkili — eski git'te koruma
-  // oluşturma/kurtarma reddidir (MEDIUM-1), bu test o sürümde anlamsız.
+  // `GIT_NO_LAZY_FETCH` yalnız onu denetleyen git'te etkili (2.45.1+ ya da
+  // yamalı bakım sürümü) — korumasız git'te koruma oluşturma/kurtarma
+  // reddidir (MEDIUM-1), bu test o sürümde anlamsız.
   const versionText = (await runGit(["--version"], { cwd: tmp })).stdout.toString("utf8");
   if (partialCloneUnsupported(versionText, true)) {
-    t.skip("git < 2.44: GIT_NO_LAZY_FETCH is not honored");
+    t.skip("this git does not honor GIT_NO_LAZY_FETCH");
     return;
   }
   const src = await makeRepo("lazy-src");
@@ -373,24 +375,97 @@ test("buildGitEnv: every variable the live `git rev-parse --local-env-vars` repo
   }
 });
 
-test("partialCloneUnsupported: git < 2.44 (or unparseable) + promisor → reject; no promisor or git ≥ 2.44 → allow (MEDIUM-1)", () => {
+test("buildGitEnv: mixed-case repo-local / GIT_CONFIG_KEY_n names are stripped and every safety value is a single upper-case copy (Windows env names are case-insensitive, P1)", () => {
+  // Windows'ta `Git_Dir` = `GIT_DIR` (Node child_process belgesi): her harf
+  // varyantı süzülmeli; güvenlik sabitlerinin varyantı (base ya da extra'dan)
+  // yan yana kalırsa hangisinin kazanacağı belirsiz → sabit TEK kopya olmalı.
+  const base: NodeJS.ProcessEnv = {
+    PATH: "/usr/bin",
+    Git_Dir: "/other/.git",
+    git_work_tree: "/other",
+    Git_Index_File: "/tmp/no-such-index",
+    git_config_count: "1",
+    Git_Config_Key_0: "core.worktree",
+    git_config_value_0: "/elsewhere",
+    Git_Config_Parameters: "'user.name'='Injected'",
+    Git_No_Lazy_Fetch: "0",
+    git_terminal_prompt: "1",
+    Lc_All: "tr_TR.UTF-8",
+    Git_Config_Global: "/g/config",
+  };
+  const env = buildGitEnv(base, {
+    git_no_lazy_fetch: "0",
+    LC_all: "tr_TR.UTF-8",
+    Git_Terminal_Prompt: "1",
+    Git_Committer_Name: "Splash",
+  });
+  const upper = Object.keys(env).map((key) => key.toUpperCase());
+  for (const name of LOCAL_ENV_VARS) {
+    assert.equal(upper.includes(name), false, `no case variant of ${name} survives`);
+  }
+  assert.equal(
+    upper.some((name) => /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(name)),
+    false,
+    "no case variant of GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n survives",
+  );
+  for (const [name, value] of [
+    ["GIT_TERMINAL_PROMPT", "0"],
+    ["LC_ALL", "C"],
+    ["GIT_NO_LAZY_FETCH", "1"],
+  ] as const) {
+    assert.deepEqual(
+      Object.keys(env).filter((key) => key.toUpperCase() === name),
+      [name],
+      `${name}: exactly one (upper-case) copy`,
+    );
+    assert.equal(env[name], value, `${name}: fixed value`);
+  }
+  assert.equal(env.Git_Config_Global, "/g/config", "a mixed-case name that is not repo-local is kept as-is");
+  assert.equal(env.Git_Committer_Name, "Splash", "call-site extra is applied");
+  assert.equal(base.Git_Dir, "/other/.git", "base must not be mutated");
+});
+
+test("partialCloneUnsupported: only Git releases whose lazy-fetch path checks GIT_NO_LAZY_FETCH (2.45.1+, patched maintenance releases) allow a promisor repo; unparseable → reject; no promisor → allow (MEDIUM-1, P1)", () => {
+  // Sınırlar git etiketlerinden ölçüldü (`promisor-remote.c` `fetch_objects()`):
+  // her bakım serisinde ilk yamalı patch kabul, bir öncesi red.
   const cases: Array<readonly [string, boolean, boolean]> = [
-    ["git version 2.43.0", true, true],
-    ["git version 2.43.7 (Apple Git-150)", true, true],
-    ["git version 2.20.1", true, true],
     ["git version 1.9.5", true, true],
-    ["", true, true],
-    ["not git at all", true, true],
-    ["git version 2.44.0", true, false],
-    ["git version 2.44", true, false],
-    ["git version 2.44.0.windows.1", true, false],
+    ["git version 2.20.1", true, true],
+    ["git version 2.38.5", true, true],
+    ["git version 2.39.3", true, true],
+    ["git version 2.39.4", true, false],
+    ["git version 2.39.5 (Apple Git-154)", true, false],
+    ["git version 2.40.1", true, true],
+    ["git version 2.40.2", true, false],
+    ["git version 2.41.0", true, true],
+    ["git version 2.41.1", true, false],
+    ["git version 2.42.1", true, true],
+    ["git version 2.42.2", true, false],
+    ["git version 2.43.0", true, true],
+    ["git version 2.43.3", true, true],
+    ["git version 2.43.4", true, false],
+    ["git version 2.44", true, true],
+    ["git version 2.44.0", true, true],
+    ["git version 2.44.0.windows.1", true, true],
+    ["git version 2.44.1", true, false],
+    ["git version 2.45.0", true, true],
+    ["git version 2.45.1", true, false],
+    ["git version 2.45.1.windows.1", true, false],
+    ["git version 2.46.0", true, false],
     ["git version 2.50.1 (Apple Git-155)", true, false],
     ["git version 3.0.0", true, false],
-    ["git version 2.43.0", false, false],
+    ["", true, true],
+    ["not git at all", true, true],
+    ["git version 2.38.5", false, false],
+    ["git version 2.45.0", false, false],
     ["", false, false],
     ["git version 2.50.1", false, false],
   ];
   for (const [version, promisor, expected] of cases) {
     assert.equal(partialCloneUnsupported(version, promisor), expected, `${JSON.stringify(version)} promisor=${promisor}`);
   }
+  // Apple Git ön eki: sayısal sürüm parantez öncesinden okunur.
+  assert.deepEqual(parseGitVersion("git version 2.39.5 (Apple Git-154)"), [2, 39, 5]);
+  assert.deepEqual(parseGitVersion("git version 2.44"), [2, 44, 0]);
+  assert.equal(parseGitVersion("not git at all"), null);
 });
