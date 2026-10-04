@@ -24,7 +24,7 @@
 
 import type { ReasoningEffort } from "../backend/InferenceBackend.js";
 import type { ResolvedRules } from "../rules/types.js";
-import type { WorkspaceRecoveryState } from "../workspace/Workspace.js";
+import type { PathFingerprint, WorkspaceRecoveryState } from "../workspace/Workspace.js";
 import type {
   CompactResult,
   RulesSource,
@@ -35,8 +35,18 @@ import type {
 
 // ── Şema sürümü (spec 9) ────────────────────────────────────────────────────
 
-/** Kalıcı oturum şemasının tek dışa-aktarılan sabiti. Bilinmeyen sürüm kabul edilmez. */
-export const SESSION_SCHEMA_VERSION = 1 as const;
+/**
+ * Yeni oturumların kalıcı şema sürümü. v2 = `liveBaseFingerprints` (K1 stale
+ * ölçeği) ZORUNLU. Bilinmeyen sürüm kabul edilmez.
+ */
+export const SESSION_SCHEMA_VERSION = 2 as const;
+/**
+ * Okunabilir kalan eski sürüm: alan YOK → stale referansı worktree parmak
+ * izi (eski davranış). Yeniden kaydedilirken v1 KALIR (canlı referans geriye
+ * dönük yakalanamaz).
+ */
+export const LEGACY_SESSION_SCHEMA_VERSION = 1 as const;
+export type SessionSchemaVersion = typeof SESSION_SCHEMA_VERSION | typeof LEGACY_SESSION_SCHEMA_VERSION;
 
 // ── Sabit güvenli metinler (spec 42/408) ─────────────────────────────────────
 
@@ -103,7 +113,7 @@ export interface PersistedRound {
  * (spec 112-122); SessionManager bunu opak taşır (spec 113).
  */
 export interface PersistedSession {
-  schemaVersion: 1;
+  schemaVersion: SessionSchemaVersion;
 
   /** Güvenli opak oturum kimliği — istenen kimlikle birebir eşit (spec 209). */
   sessionId: string;
@@ -129,6 +139,14 @@ export interface PersistedSession {
 
   /** Worktree'nin birebir yeniden kurulması için gereken immutable kurtarma durumu. */
   workspaceRecovery: WorkspaceRecoveryState;
+
+  /**
+   * K1 stale referansı (v2 ZORUNLU, v1'de YOK): her düzenlenebilir yolun
+   * oluşturma anında ANA working dosyasından strict yakalanan parmak izi —
+   * stale denetimi canlı↔canlı karşılaştırır. Worktree parmak izi
+   * (`workspaceRecovery.baseFingerprints`) doğrulama/kurtarma içindir.
+   */
+  liveBaseFingerprints?: Array<readonly [string, PathFingerprint]>;
 
   /** Tamamlanan (üretilmiş) tur sayısı — 1..N. */
   round: number;

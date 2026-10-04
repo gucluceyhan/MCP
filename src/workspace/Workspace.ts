@@ -146,10 +146,16 @@ export interface WorkspaceDiffOptions {
  *   taban parmak izleri.
  * - `basePaths`: immutable base commit'te var olan TÜM dosya/sembolik-yol
  *   yolları → git modu (create "varlıksızlık" ve çakışma denetimleri için).
+ * - `liveFingerprints` (K1 — stale ölçeği): düzenlenebilir yolların ANA
+ *   working dosyasından oluşturma anında yakalanan strict canlı parmak izi
+ *   (stale denetimiyle aynı ölçek). Yalnız `createGitWorktreeWorkspace`
+ *   doldurur; kalıcı kopyası `PersistedSession.liveBaseFingerprints`'tir
+ *   (kurtarılan workspace'te yok — worktree kurulumu için gerekmez).
  */
 export interface WorkspaceBaseInfo {
   fingerprints: ReadonlyMap<string, PathFingerprint>;
   basePaths: ReadonlyMap<string, string>;
+  liveFingerprints?: ReadonlyMap<string, PathFingerprint>;
 }
 
 /**

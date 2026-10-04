@@ -388,7 +388,8 @@ test("version mismatch: unknown schema_version fails closed (fake fs)", async ()
   const dir = path.join("/tmp/splash-out", "sessions", SESSION_ID);
   mem.files.set(path.join(dir, "session.json"), {
     mode: 0o600,
-    content: JSON.stringify({ ...makeSession(), schemaVersion: 2 }, null, 2),
+    // v2 artık bilinen sürüm (K1); bilinmeyen = 3.
+    content: JSON.stringify({ ...makeSession(), schemaVersion: 3 }, null, 2),
   });
   await assert.rejects(store.load(SESSION_ID), (e: unknown) => e instanceof SessionError && e.kind === "session_corrupt");
 });
@@ -650,7 +651,7 @@ test("save: unsupported schema version reds with session_operation_failed (fake 
   const mem = new MemFs();
   const store = storeWith(mem);
   await assert.rejects(
-    store.save({ ...makeSession(), schemaVersion: 2 } as unknown as PersistedSession),
+    store.save({ ...makeSession(), schemaVersion: 3 } as unknown as PersistedSession),
     (e: unknown) => e instanceof SessionError && e.kind === "session_operation_failed",
   );
 });
@@ -1426,4 +1427,100 @@ test("delete: call order — unlink(session.json) precedes every rmdir; only nar
   assert.equal(mem.dirs.has(sessionsDir), true);
   assert.equal(mem.dirs.has(dir), false);
   assert.equal(mem.dirs.has(workspace), false);
+});
+
+// ── İz 5 / K1: şema v2 `liveBaseFingerprints` + v1 okuma uyumu ──────────────
+//
+// v2 = canlı (ana working dosyası) stale referansı ZORUNLU; v1 (eski) alanı
+// taşıyamaz ve okunabilir KALIR. Anahtar kümesi sürüme bağlı, alan
+// fail-closed doğrulanır (yol STRICT, sentinel modu RED, yol kümesi =
+// düzenlenebilir yollar).
+
+const LIVE_FILE = { exists: true, type: "file", mode: "100755", contentSha256: "b".repeat(64) } as const;
+
+function makeV2Session(overrides: Partial<PersistedSession> = {}): PersistedSession {
+  return makeSession({ schemaVersion: 2, liveBaseFingerprints: [["src/a.ts", { ...LIVE_FILE }]], ...overrides });
+}
+
+function isCorrupt(e: unknown): boolean {
+  assert.ok(e instanceof SessionError);
+  assert.equal(e.kind, "session_corrupt");
+  assert.equal(e.message, "The session state is corrupt and cannot be recovered");
+  return true;
+}
+
+test("K1 v2: save → load round-trips liveBaseFingerprints and schemaVersion 2 (real fs)", async () => {
+  await withRealStore(async (store) => {
+    await store.create(SESSION_ID);
+    const session = makeV2Session({ latestWorkspaceStateHash: "a".repeat(64) });
+    await store.save(session);
+    const loaded = await store.load(SESSION_ID);
+    assert.deepEqual(loaded, session);
+    assert.equal(loaded.schemaVersion, 2);
+  });
+});
+
+test("K1 v1 fixture: a raw v1 session.json (no liveBaseFingerprints) still loads unchanged (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.create(SESSION_ID);
+    const v1 = makeSession(); // schemaVersion 1, alan YOK — Step 9/10 diski
+    assert.equal(v1.schemaVersion, 1);
+    assert.ok(!("liveBaseFingerprints" in v1));
+    await writeRawSessionFile(store, outputRoot, v1);
+    const loaded = await store.load(SESSION_ID);
+    assert.deepEqual(loaded, v1);
+    assert.ok(!("liveBaseFingerprints" in loaded), "v1 load must not invent a live reference");
+    // Yeniden kaydetme v1 olarak kalır (referans geriye dönük yakalanamaz).
+    await store.save(loaded);
+    assert.deepEqual(await store.load(SESSION_ID), v1);
+  });
+});
+
+test("K1 schema: v2 without liveBaseFingerprints and v1 WITH it both fail closed (exact key set by version)", async () => {
+  for (const tampered of [
+    { ...makeV2Session(), liveBaseFingerprints: undefined },
+    { ...makeSession(), liveBaseFingerprints: [["src/a.ts", { ...LIVE_FILE }]] },
+  ]) {
+    await withRealStore(async (store, outputRoot) => {
+      await store.create(SESSION_ID);
+      await writeRawSessionFile(store, outputRoot, tampered);
+      await assert.rejects(store.load(SESSION_ID), isCorrupt);
+    });
+  }
+});
+
+test("K1 schema: malformed liveBaseFingerprints fail closed (sentinel, path set, duplicate, unsafe path, shape)", async () => {
+  const cases: Array<{ label: string; value: unknown }> = [
+    { label: "live sentinel mode", value: [["src/a.ts", { exists: true, type: "other", mode: "symlinked-ancestor" }]] },
+    { label: "missing editable path", value: [] },
+    { label: "extra path", value: [["src/a.ts", { ...LIVE_FILE }], ["src/b.ts", { exists: false }]] },
+    { label: "duplicate path", value: [["src/a.ts", { ...LIVE_FILE }], ["src/a.ts", { exists: false }]] },
+    { label: "unsafe path", value: [["../a.ts", { ...LIVE_FILE }]] },
+    { label: "file without content", value: [["src/a.ts", { exists: true, type: "file", mode: "100644" }]] },
+    { label: "not an array", value: { "src/a.ts": LIVE_FILE } },
+    { label: "bad tuple", value: [["src/a.ts"]] },
+  ];
+  for (const { label, value } of cases) {
+    await withRealStore(async (store, outputRoot) => {
+      await store.create(SESSION_ID);
+      await writeRawSessionFile(store, outputRoot, { ...makeV2Session(), liveBaseFingerprints: value });
+      await assert.rejects(store.load(SESSION_ID), isCorrupt, label);
+    });
+  }
+});
+
+test("K1 save: version/field disagreement is never written (session_operation_failed, fake fs)", async () => {
+  const mem = new MemFs();
+  const store = storeWith(mem);
+  await store.create(SESSION_ID);
+  for (const bad of [
+    { ...makeV2Session(), liveBaseFingerprints: undefined },
+    makeSession({ liveBaseFingerprints: [["src/a.ts", { ...LIVE_FILE }]] }),
+  ]) {
+    await assert.rejects(
+      store.save(bad as PersistedSession),
+      (e: unknown) => e instanceof SessionError && e.kind === "session_operation_failed",
+    );
+  }
+  assert.ok(![...mem.files.keys()].some((file) => file.endsWith("session.json")), "nothing persisted");
 });
