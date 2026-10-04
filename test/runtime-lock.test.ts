@@ -21,6 +21,8 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -372,4 +374,195 @@ test("release: idempotent when the lock directory is already gone", async (t) =>
   await rm(lockDirOf(dir), { recursive: true, force: true });
 
   await lock.release(acquired.token); // no-op: hata YOK.
+});
+
+// ── İz 2 inceleme düzeltmeleri (M1: kimliğe bağlı kurtarma) ─────────────
+
+/**
+ * Süreçler arası yarışları DETERMİNİSTİK üretmek için `node:fs/promises`
+ * dışa aktarımları geçici olarak sarmalanır (`syncBuiltinESMExports` —
+ * RuntimeLock'un adlandırılmış import'ları canlı bağlıdır). Sarmalayıcı,
+ * "ikinci süreci" senkron fs çağrılarıyla TAM o anda oynatır.
+ */
+const requireCjs = createRequire(import.meta.url);
+const fspCjs = requireCjs("node:fs/promises") as Record<string, unknown>;
+
+function hookFsPromises(t: TestContext, name: "stat" | "writeFile", make: (original: (...args: never[]) => Promise<unknown>) => unknown): void {
+  const original = fspCjs[name] as (...args: never[]) => Promise<unknown>;
+  fspCjs[name] = make(original);
+  syncBuiltinESMExports();
+  t.after(() => {
+    fspCjs[name] = original;
+    syncBuiltinESMExports();
+  });
+}
+
+/** "Süreç A" — senkron: kilit dizinini yaratır + canlı sahip kaydı yazar. */
+function simulateForeignAcquire(runtimeDir: string, pid: number, token: string): void {
+  mkdirSync(lockDirOf(runtimeDir));
+  writeFileSync(
+    ownerFileOf(runtimeDir),
+    `${JSON.stringify({ schema_version: 1, pid, token, owner_id: "process-a", acquired_at: "2026-10-04T00:00:00.000Z" })}\n`,
+  );
+}
+
+test("M1: two lockers interleaving on the SAME stale lock never own it at once (reclaim is bound to the inspected instance)", async (t) => {
+  const dir = await freshRuntimeDir(t);
+  const DEAD = 999_101;
+  const A_PID = 999_102;
+  await plantLock(
+    dir,
+    { schema_version: 1, pid: DEAD, token: "dead-token", owner_id: "crashed", acquired_at: "2026-01-01T00:00:00.000Z" },
+    60_000,
+  );
+  let interleaved = false;
+  const liveness: PidLiveness = (pid) => {
+    if (pid === DEAD) {
+      if (!interleaved) {
+        interleaved = true;
+        // B bayat kararını VERDİ; B kurtarmadan ÖNCE süreç A aynı bayat
+        // kilidi kurtarır (rename → sil) ve YENİ kilidini alır.
+        const tomb = path.join(dir, "a-tombstone");
+        renameSync(lockDirOf(dir), tomb);
+        rmSync(tomb, { recursive: true, force: true });
+        simulateForeignAcquire(dir, A_PID, "token-of-A");
+      }
+      return "dead";
+    }
+    return pid === A_PID ? "alive" : "unknown";
+  };
+  const b = new RuntimeLock(dir, { liveness });
+
+  const result = await b.acquire("session-B");
+
+  assert.deepEqual(result, { acquired: false, reason: "busy" }, "B must not steal A's fresh lock");
+  const raw = await readFile(ownerFileOf(dir), "utf8");
+  assert.ok(raw.includes("token-of-A"), "A's live lock must survive");
+  // A tek sahip: kendi token'ıyla bırakabilir.
+  await new RuntimeLock(dir, { liveness }).release("token-of-A");
+  assert.deepEqual(await readdir(dir), [], "no tombstone/guard residue");
+});
+
+test("M1: a lock that VANISHES between EEXIST and inspection is never 'reclaimed' — a new live owner survives", async (t) => {
+  const dir = await freshRuntimeDir(t);
+  const OLD = 999_201;
+  const A_PID = 999_202;
+  await plantLock(
+    dir,
+    { schema_version: 1, pid: OLD, token: "old-token", owner_id: "old", acquired_at: "2026-01-01T00:00:00.000Z" },
+    0,
+  );
+  let fired = false;
+  hookFsPromises(t, "stat", (original) => async (...args: never[]) => {
+    const target = args[0] as unknown as string;
+    if (!fired && target === lockDirOf(dir)) {
+      fired = true;
+      // Sahip kilidi bıraktı (dizin yok) → B'nin stat'ı ENOENT görür; ama
+      // B devam etmeden süreç A yeni (canlı) kilidini alır.
+      rmSync(lockDirOf(dir), { recursive: true, force: true });
+      try {
+        return await original(...args);
+      } finally {
+        simulateForeignAcquire(dir, A_PID, "token-of-A");
+      }
+    }
+    return original(...args);
+  });
+  const b = new RuntimeLock(dir, { liveness: (pid) => (pid === A_PID || pid === OLD ? "alive" : "unknown") });
+
+  const result = await b.acquire("session-B");
+
+  assert.equal(fired, true, "the race window must have been exercised");
+  assert.deepEqual(result, { acquired: false, reason: "busy" });
+  const raw = await readFile(ownerFileOf(dir), "utf8");
+  assert.ok(raw.includes("token-of-A"), "A's live lock must survive");
+});
+
+test("M1: the owner record is written exclusively (wx) and a failed write never removes a directory that is not ours", async (t) => {
+  const dir = await freshRuntimeDir(t);
+  const C_PID = 999_301;
+  let swapped = false;
+  hookFsPromises(t, "writeFile", (original) => async (...args: never[]) => {
+    const target = args[0] as unknown as string;
+    if (!swapped && target === ownerFileOf(dir)) {
+      swapped = true;
+      // B'nin mkdir'i ile kayıt yazımı ARASINDA dizin el değiştirir:
+      // B'nin dizini kenara gider, yerinde C'nin canlı kilidi durur.
+      renameSync(lockDirOf(dir), path.join(dir, "b-moved-aside"));
+      simulateForeignAcquire(dir, C_PID, "token-of-C");
+    }
+    return original(...args);
+  });
+  const b = new RuntimeLock(dir, { liveness: (pid) => (pid === C_PID ? "alive" : "unknown") });
+
+  const result = await b.acquire("session-B");
+
+  assert.equal(swapped, true);
+  assert.equal(result.acquired, false, "B must not claim a lock whose record it could not write exclusively");
+  const raw = await readFile(ownerFileOf(dir), "utf8");
+  assert.ok(raw.includes("token-of-C"), "C's owner record must not be overwritten nor removed");
+});
+
+test("M1: an ABANDONED reclaim guard (crashed reclaimer, beyond grace) does not block stale recovery forever", async (t) => {
+  const dir = await freshRuntimeDir(t);
+  const DEAD = 999_401;
+  await plantLock(
+    dir,
+    { schema_version: 1, pid: DEAD, token: "dead-token", owner_id: "crashed", acquired_at: "2026-01-01T00:00:00.000Z" },
+    60_000,
+  );
+  const guard = path.join(dir, `${INFERENCE_LOCK_DIR}.reclaim`);
+  await mkdir(guard);
+  const old = (Date.now() - 60_000) / 1000;
+  await utimes(guard, old, old);
+  const lock = new RuntimeLock(dir, { liveness: (pid) => (pid === DEAD ? "dead" : "alive") });
+
+  const result = await lock.acquire("session-1");
+
+  assert.equal(result.acquired, true);
+  assert.deepEqual(await readdir(dir), [INFERENCE_LOCK_DIR], "the abandoned guard is gone; no residue");
+});
+
+test("M1: a FRESH reclaim guard (another reclaimer mid-flight) is respected — the stale lock is not renamed by us", async (t) => {
+  const dir = await freshRuntimeDir(t);
+  const DEAD = 999_501;
+  await plantLock(
+    dir,
+    { schema_version: 1, pid: DEAD, token: "dead-token", owner_id: "crashed", acquired_at: "2026-01-01T00:00:00.000Z" },
+    60_000,
+  );
+  const guard = path.join(dir, `${INFERENCE_LOCK_DIR}.reclaim`);
+  await mkdir(guard);
+  const lock = new RuntimeLock(dir, { liveness: (pid) => (pid === DEAD ? "dead" : "alive") });
+
+  const result = await lock.acquire("session-1");
+
+  assert.deepEqual(result, { acquired: false, reason: "uncertain" });
+  const raw = await readFile(ownerFileOf(dir), "utf8");
+  assert.ok(raw.includes("dead-token"), "the guarded reclaim belongs to the other process");
+  assert.ok((await stat(guard)).isDirectory(), "another process's guard is never removed while fresh");
+});
+
+test("M4 seam: peek() reports the lock state WITHOUT acquiring, writing or deleting anything", async (t) => {
+  const dir = await freshRuntimeDir(t);
+  const LIVE = 999_601;
+  const DEAD = 999_602;
+  const MYSTERY = 999_603;
+  const liveness: PidLiveness = (pid) => (pid === LIVE ? "alive" : pid === DEAD ? "dead" : "unknown");
+  const lock = new RuntimeLock(dir, { liveness });
+
+  assert.equal(await lock.peek(), "free", "no lock directory → free");
+  assert.deepEqual(await readdir(dir), [], "peek creates nothing");
+
+  for (const [pid, expected] of [[LIVE, "busy"], [DEAD, "free"], [MYSTERY, "uncertain"]] as const) {
+    await rm(lockDirOf(dir), { recursive: true, force: true });
+    await plantLock(
+      dir,
+      { schema_version: 1, pid, token: `tok-${pid}`, owner_id: "x", acquired_at: "2026-01-01T00:00:00.000Z" },
+      60_000,
+    );
+    assert.equal(await lock.peek(), expected, `owner pid ${pid}`);
+    const raw = await readFile(ownerFileOf(dir), "utf8");
+    assert.ok(raw.includes(`tok-${pid}`), "peek never reclaims or rewrites");
+  }
 });

@@ -537,11 +537,23 @@ async function nearestExistingAncestor(dir: string): Promise<string> {
  * Non-git dizin → `invalid_repository` ("The project root is not a valid
  * Git working tree"). Non-git YEDEK mekanizma YOK (spec 7, DESIGN 7.2).
  *
- * Başlangıç dizini henüz yoksa (örn. planlanmış bir alt dizin override'ı)
- * keşif en yakın var olan ataldan başlatılır; git oradan toplevel'i bulur.
+ * Açık override (`repo_root` / `SPLASH_REPO_ROOT`) VAR OLMALI (İz 4 S#14,
+ * DESIGN 7.2): yok/erişilemez → sabit mesajlı `invalid_repository` — üst
+ * dizindeki bir repository'ye ASLA sessizce bağlanılmaz. Yalnız CWD
+ * keşfinde başlangıç dizini yoksa en yakın var olan ataldan başlanır.
  */
 export async function discoverRepoRoot(options: DiscoverRepoRootOptions = {}): Promise<string> {
   const startDir = path.resolve(options.override ?? options.cwd ?? process.cwd());
+  if (options.override !== undefined) {
+    try {
+      await stat(startDir);
+    } catch {
+      throw new WorkspaceError(
+        "invalid_repository",
+        "The configured project root does not exist or is not accessible",
+      );
+    }
+  }
   const probeDir = await nearestExistingAncestor(startDir);
 
   let toplevelText: string;

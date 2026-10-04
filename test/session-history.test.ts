@@ -127,6 +127,41 @@ test("buildHistory: çok-tur repliği — her feedback/validation/sonuç birer k
   assert.match(all, /file=f0\.ts edit=0 reason=reason-0/);
 });
 
+test("buildHistory: tur-0 oturumu refine ile 1. tur ürettiyse rounds[0].feedback result_1'den ÖNCE bir kez görünür", () => {
+  const history = buildHistory(
+    [round(1, "fb1", "result1", 1, 1, 0), round(2, "fb2", "result2", 2, 2, 0)],
+    "fb3",
+  );
+  // user(fb1) → assistant(r1) → user(fb2 + val1) → assistant(r2) → user(fb3 + val2)
+  assert.deepEqual(
+    history.map((m) => m.role),
+    ["user", "assistant", "user", "assistant", "user"],
+  );
+  const first = history[0];
+  assert.ok(first !== undefined);
+  assert.equal(first.kind, "refinement");
+  assert.equal(first.protected, false, "eski refinement — azaltma adayı");
+  assert.equal(first.content, "REFINEMENT FEEDBACK\nfb1");
+  const all = history.map((m) => m.content).join("\n");
+  for (const fb of ["fb1", "fb2", "fb3"]) {
+    assert.equal(occurrences(all, fb), 1, `${fb} tam bir kez`);
+  }
+  assert.equal(history.filter((m) => m.protected).length, 1);
+  assert.equal(history[history.length - 1]?.protected, true);
+
+  // Tek tur (tur-0 → refine → 1. tur) + güncel geri bildirim.
+  const single = buildHistory([round(1, "only-fb1", "r1", 1, 1, 0)], "fb2");
+  assert.deepEqual(
+    single.map((m) => [m.role, m.kind, m.protected]),
+    [
+      ["user", "refinement", false],
+      ["assistant", "worker_response", false],
+      ["user", "refinement", true],
+    ],
+  );
+  assert.equal(single[0]?.content, "REFINEMENT FEEDBACK\nonly-fb1");
+});
+
 test("buildHistory: boş tur → tek korumalı feedback mesajı (validation YOK)", () => {
   const history = buildHistory([], "initial correction");
   assert.equal(history.length, 1);

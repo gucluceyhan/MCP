@@ -116,11 +116,21 @@ test("discoverRepoRoot: a repo without commits (no HEAD) is rejected (spec 7)", 
 
 test("discoverRepoRoot: override starts discovery from the given directory", async () => {
   const repo = await makeRepo("ovr");
+  // Override VAR OLAN bir alt dizin (S#14: var olmayan override hatadır).
+  await mkdir(path.join(repo, "x", "y"), { recursive: true });
   const root = await discoverRepoRoot({ override: path.join(repo, "x", "y") });
   assert.equal(root, await (await import("node:fs/promises")).realpath(repo));
 });
 
-test("discoverRepoRoot: missing override directory falls back to CWD discovery", async () => {
+test("discoverRepoRoot: a non-existent override is a clear configuration error — never bound to an ancestor repo (S#14)", async () => {
+  const repo = await makeRepo("ovr-missing");
+  const err = await expectWorkspaceError("invalid_repository", () =>
+    discoverRepoRoot({ override: path.join(repo, "does", "not", "exist"), cwd: repo }),
+  );
+  assert.equal(err.message, "The configured project root does not exist or is not accessible");
+});
+
+test("discoverRepoRoot: no override → CWD discovery", async () => {
   const repo = await makeRepo("cwd");
   const root = await discoverRepoRoot({ cwd: repo });
   assert.equal(root, await (await import("node:fs/promises")).realpath(repo));

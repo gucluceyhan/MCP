@@ -1229,11 +1229,44 @@ test("Step 9 state hash recorded under a non-default diff config is still accept
       await recreated.applyPatchSet(formatRewrite());
       assert.equal(await recreated.matchesRecoveryStateHash(wrong), false);
       assert.equal(await recreated.matchesRecoveryStateHash(legacyHash), true, "recreate + reapply → legacy hash");
+
+      // (c) Near-miss: eski hash'ten SONRA tek bayt değişir → iki formül de eşleşmez.
+      const nearMiss = path.join(recreated.workspaceDir, FORMAT_FILES[0]![0]);
+      await writeFile(nearMiss, Buffer.concat([await readFile(nearMiss), Buffer.from(" ")]));
+      assert.equal(await recreated.matchesRecoveryStateHash(legacyHash), false, "near-miss: legacy formula");
+      assert.equal(await recreated.matchesRecoveryStateHash(state.recoveryStateHash), false, "near-miss: current formula");
     } finally {
       await recreated.destroy();
     }
   });
   await ws.destroy().catch(() => undefined);
+});
+
+test("matchesRecoveryStateHash: a Git failure of the Step 9 formula is a non-match, not an error (L1)", async () => {
+  const { fixture } = await buildFormatRepo("hash-legacy-error");
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-legacy-error"),
+    sessionId: "s-legacy-error",
+    editablePaths: FORMAT_FILES.map(([file]) => file),
+  });
+  try {
+    await ws.applyPatchSet(formatRewrite());
+    const current = await ws.recoveryStateHash();
+    // Eksik `diff.orderFile`: pin'siz eski diff `fatal` ile düşer; güncel formül (-O<devnull>) etkilenmez.
+    const missing = path.join(fixture.out, "missing-order-file");
+    await withGlobalGitConfig(fixture.out, `[diff]\n\torderFile = ${missing}\n`, async () => {
+      await assert.rejects(
+        runGit([...LEGACY_FULL_DIFF_ARGS, ws.baseCommit], { cwd: ws.workspaceDir, config: ["core.hooksPath=/dev/null"] }),
+        "fixture: the legacy formula fails under this config",
+      );
+      assert.equal(await ws.recoveryStateHash(), current);
+      assert.equal(await ws.matchesRecoveryStateHash(current), true);
+      assert.equal(await ws.matchesRecoveryStateHash("0".repeat(64)), false, "legacy git failure → false");
+    });
+  } finally {
+    await ws.destroy();
+  }
 });
 
 // ── 12) imha (spec 73) ──────────────────────────────────────────────────────

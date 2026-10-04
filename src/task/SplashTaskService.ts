@@ -31,6 +31,7 @@ import type { SplashConfig } from "../config.js";
 import type {
   CoordinatedInferenceRequest,
   CoordinatedInferenceResult,
+  InferenceProbeResult,
 } from "../backend/InferenceCoordinator.js";
 import type { RulesResolverLike } from "../rules/types.js";
 import type { Workspace, WorkspaceCreateInput } from "../workspace/Workspace.js";
@@ -67,11 +68,13 @@ export interface ContextAssemblerLike {
 }
 
 /**
- * Koordinatör görünümü: yalnız `dispatch`. Üretime süreç-tek
+ * Koordinatör görünümü: `dispatch` (+ isteğe bağlı `probe`). Üretime süreç-tek
  * `InferenceCoordinator` yapısal olarak sağlar (spec 4).
  */
 export interface CoordinatorLike {
   dispatch(request: CoordinatedInferenceRequest): Promise<CoordinatedInferenceResult>;
+  /** İsteğe bağlı ölçüm-öncesi ön-kapı (İz 2 / M4) — bkz. `RoundCoordinator`. */
+  probe?(signal?: AbortSignal): Promise<InferenceProbeResult>;
 }
 
 /** Worker Contract görünümü: strict çıktı parseı (saf). */

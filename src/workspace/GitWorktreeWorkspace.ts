@@ -463,15 +463,19 @@ export class GitWorktreeWorkspace implements Workspace {
    * Step 9 ile varsayılan-DIŞI config'te kaydedilmiş açık oturumların hash'i
    * yükseltme sonrası da tanınır (Codex P2 — PR #34). Kalıcı durum yeniden
    * YAZILMAZ; sonraki üretilmiş tur güncel formülle yazar. İmha → red.
+   * Filter re-check + güncel formül `recoveryStateHash()` içinde (tek yer) —
+   * hataları YAYILIR; yalnız eski formülün git hatası `false`'tur
+   * (kullanıcı config'i o diff'i bozabilir: ör. eksik `diff.orderFile`).
    */
   async matchesRecoveryStateHash(expected: string): Promise<boolean> {
-    this.assertUsable();
-    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
-    const current = await this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
-    if (current === expected) {
+    if ((await this.recoveryStateHash()) === expected) {
       return true;
     }
-    return (await this.stateDiffHash([], [])) === expected; // Step 9 (e746e8f) formülü
+    try {
+      return (await this.stateDiffHash([], [])) === expected; // Step 9 (e746e8f) formülü
+    } catch {
+      return false;
+    }
   }
 
   /** Base-göreceli tam diff'in SHA-256'sı (filter re-check ÇAĞIRANDA). */
@@ -2296,7 +2300,8 @@ async function captureBase(
  * git iç mantığını bilmez (spec 113); yalnız state'i verir/geri alır.
  *
  * Maddelendirme (spec 109-111, 126, 127):
- * - worktree HAYATTA + kimlik (HEAD==base) + state hash == kalıcı hash →
+ * - worktree HAYATTA + kimlik (HEAD==base) + state hash kalıcı hash'le
+ *   eşleşir (`matchesRecoveryStateHash`: güncel VEYA Step 9 formülü) →
  *   REUSE (imha/yeniden kurma YOK — spec 126).
  * - worktree HAYATTA ama kimlik uyuşmaz VEYA state hash çelişki → güvenilmez:
  *   güvenli imha + yeniden kur (spec 110/127); ana depoya dokunulmaz.
@@ -2307,8 +2312,8 @@ async function captureBase(
  *     rekonstrüksiyon YOK, spec 275).
  *
  * Dönen workspace: yeniden kurulduysa immutable base'tedir; hayatta reuse'ta
- * kalıcının kendisidir. SessionManager `recoveryStateHash()`'ı kalıcı hash'le
- * karşılaştırıp (spec 120/121) gerekirse son worker sonucunu yeniden uygular.
+ * kalıcının kendisidir. SessionManager son worker sonucunu yeniden uygulayıp
+ * kalıcı hash'i `matchesRecoveryStateHash()` ile doğrular (spec 120/121).
  */
 export async function restoreGitWorktreeWorkspace(
   state: WorkspaceRecoveryState,
