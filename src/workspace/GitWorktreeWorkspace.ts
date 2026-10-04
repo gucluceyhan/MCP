@@ -88,7 +88,8 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import type { Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { constants as fsConstants, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -479,11 +480,32 @@ export class GitWorktreeWorkspace implements Workspace {
     // filter re-check (PR #24 audit F-6): diff, içerik değiştirmiş tracked
     // dosyaları worktree attribute yüzeyiyle okur → içerikten ÖNCE.
     await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    return this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+  }
+
+  /**
+   * Güncel state kalıcı hash'le eşleşiyor mu? Önce güncel formül; eşleşmezse
+   * Step 9 formülü (biçim bayrağı/pin YOK, kullanıcının config'i altında):
+   * Step 9 ile varsayılan-DIŞI config'te kaydedilmiş açık oturumların hash'i
+   * yükseltme sonrası da tanınır (Codex P2 — PR #34). Kalıcı durum yeniden
+   * YAZILMAZ; sonraki üretilmiş tur güncel formülle yazar. İmha → red.
+   */
+  async matchesRecoveryStateHash(expected: string): Promise<boolean> {
+    this.assertUsable();
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    const current = await this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+    if (current === expected) {
+      return true;
+    }
+    return (await this.stateDiffHash([], [])) === expected; // Step 9 (e746e8f) formülü
+  }
+
+  /** Base-göreceli tam diff'in SHA-256'sı (filter re-check ÇAĞIRANDA). */
+  private async stateDiffHash(formatArgs: readonly string[], config: readonly string[]): Promise<string> {
     const result = await this.git(
       [
         "diff",
-        ...PATCH_FORMAT_ARGS,
-        ...STATE_HASH_DIFF_ARGS,
+        ...formatArgs,
         "--binary",
         "--full-index",
         "--no-ext-diff",
@@ -491,7 +513,7 @@ export class GitWorktreeWorkspace implements Workspace {
         "--no-renames",
         this.baseCommit,
       ],
-      { config: STATE_HASH_DIFF_CONFIG },
+      { config },
     );
     return createHash("sha256").update(result.stdout).digest("hex");
   }
@@ -2225,20 +2247,30 @@ async function blobOidFor(gitRoot: string, canonical: string, bytes: Buffer): Pr
   }
 }
 
+/** Düzenli dosya modunun git-ilintili biçimi (`0o100` bit). */
+function regularFileMode(stat: Stats): "100755" | "100644" {
+  return (stat.mode & 0o100) !== 0 ? "100755" : "100644";
+}
+
 /**
  * DESIGN §7.3 invariantı ("base == ana working tree"), oluşturmada her
  * düzenlenebilir yol için — delta + seçili untracked kopyası SONRASI,
- * `add -A` ÖNCESİ (iki K1 okuması arasında). Ana referans = 1. okuma.
+ * `add -A` ÖNCESİ (iki K1 okuması arasında). Uzlaştırma REFERANSA göredir
+ * (1. okuma); referanstan sapma taze ana okumayla doğrulanır — taze ana hâl
+ * referanstan farklıysa yakalama sırasında değişmiştir (A→B→A ara hâli
+ * tabana giremez) → yarış reddi.
  * - varlık/tip eşit olmalı (yok⇔yok, dosya⇔dosya, link⇔link); aksi (ör.
- *   sparse: ana ağaçta yok, HEAD'de var; dizin/özel) → `invalid_repository`.
- * - link: hedef metni eşit olmalı; aksi → aynı red.
- * - düzenli dosya: bayt eşitse tamam; değilse iki tarafın git blob oid'i
- *   (`hash-object --path` — clean normalizasyonu dahil; dış filtreler
- *   oluşumda reddedildi) karşılaştırılır. Eşit = yalnız git normalizasyonu
- *   (`text=auto` CRLF, `fileMode=false`) → worktree baytı AYNEN kalır.
- *   Farklı = git yerel değişikliği gizliyor (`assume-unchanged` /
- *   `skip-worktree`) → ana bayt (no-follow) + mod worktree'ye yazılır;
- *   worker gerçek hâli görür, `add -A` tabana alır.
+ *   sparse: ana ağaçta yok, HEAD'de var; dizin/özel) ya da link hedefi
+ *   farkı → `invalid_repository`.
+ * - içerik: worktree baytı referans özetine eşitse tamam. Değilse taze ana
+ *   bayt referansa eşit olmalı; iki tarafın git blob oid'i
+ *   (`hash-object --path`, clean dahil; dış filtreler oluşumda reddedildi)
+ *   eşitse yalnız normalizasyondur (`text=auto` CRLF) → worktree baytı
+ *   AYNEN; farklıysa git yerel değişikliği gizliyor (`assume-unchanged` /
+ *   `skip-worktree`) → ana bayt worktree'ye yazılır (O_NOFOLLOW).
+ * - mod: içerik kararından BAĞIMSIZ; worktree modu referanstan farklıysa
+ *   (gizli `chmod`, `fileMode=false`) taze ana mod referansa eşit olmalı →
+ *   worktree modu referansa aynalanır.
  */
 async function reconcileEditableWithMain(
   repoRoot: string,
@@ -2247,6 +2279,10 @@ async function reconcileEditableWithMain(
   mainReference: ReadonlyMap<string, PathFingerprint>,
 ): Promise<void> {
   const mismatch = (): WorkspaceError => new WorkspaceError("invalid_repository", MAIN_VIEW_MISMATCH);
+  const raced = (): WorkspaceError =>
+    new WorkspaceError("workspace_operation_failed", "The repository changed while the session base was being captured");
+  const captureFailed = (err: unknown): WorkspaceError =>
+    new WorkspaceError("workspace_operation_failed", "Capturing the repository state failed", { cause: err });
   for (const canonical of editable) {
     const main = mainReference.get(canonical);
     const mainAbs = resolveContained(repoRoot, canonical);
@@ -2262,7 +2298,7 @@ async function reconcileEditableWithMain(
       wsStat = await lstat(wsAbs);
     } catch (err) {
       if (!errnoIs(err, "ENOENT") && !errnoIs(err, "ENOTDIR")) {
-        throw new WorkspaceError("workspace_operation_failed", "Capturing the repository state failed", { cause: err });
+        throw captureFailed(err);
       }
       wsStat = null;
     }
@@ -2271,35 +2307,70 @@ async function reconcileEditableWithMain(
     if (wsType !== mainType || wsType === "other") {
       throw mismatch();
     }
-    if (!main.exists || wsType === "absent") {
+    if (!main.exists || wsStat === null) {
       continue;
     }
     if (wsType === "symlink") {
-      if (sha256Hex(Buffer.from(await readlink(wsAbs), "utf8")) !== main.contentSha256) {
+      let target: string;
+      try {
+        target = await readlink(wsAbs);
+      } catch (err) {
+        throw captureFailed(err);
+      }
+      if (sha256Hex(Buffer.from(target, "utf8")) !== main.contentSha256) {
         throw mismatch();
       }
       continue;
     }
-    let mainBytes: Buffer;
     let wsBytes: Buffer;
     try {
-      mainBytes = await noFollowReadFile(mainAbs);
       wsBytes = await noFollowReadFile(wsAbs);
     } catch (err) {
-      throw new WorkspaceError("workspace_operation_failed", "Capturing the repository state failed", { cause: err });
+      throw captureFailed(err);
     }
-    if (mainBytes.equals(wsBytes)) {
-      continue;
+    if (sha256Hex(wsBytes) !== main.contentSha256) {
+      let mainBytes: Buffer;
+      try {
+        mainBytes = await noFollowReadFile(mainAbs);
+      } catch (err) {
+        throw captureFailed(err);
+      }
+      if (sha256Hex(mainBytes) !== main.contentSha256) {
+        throw raced();
+      }
+      if ((await blobOidFor(repoRoot, canonical, mainBytes)) !== (await blobOidFor(workspaceDir, canonical, wsBytes))) {
+        await withNoFollowHandle(wsAbs, fsConstants.O_WRONLY | fsConstants.O_TRUNC, (handle) => handle.writeFile(mainBytes));
+      }
     }
-    if ((await blobOidFor(repoRoot, canonical, mainBytes)) === (await blobOidFor(workspaceDir, canonical, wsBytes))) {
-      continue; // yalnız git normalizasyonu — worker görünümü worktree ölçeğinde kalır
+    if (regularFileMode(wsStat) !== main.mode) {
+      let fresh: Stats;
+      try {
+        fresh = await lstat(mainAbs);
+      } catch (err) {
+        throw captureFailed(err);
+      }
+      if (!fresh.isFile() || regularFileMode(fresh) !== main.mode) {
+        throw raced();
+      }
+      await withNoFollowHandle(wsAbs, fsConstants.O_RDONLY, (handle) => handle.chmod(main.mode === "100755" ? 0o755 : 0o644));
     }
-    try {
-      await writeFile(wsAbs, mainBytes);
-      await chmod(wsAbs, main.mode === "100755" ? 0o755 : 0o644);
-    } catch (err) {
-      throw new WorkspaceError("workspace_operation_failed", "Copying the selected context failed", { cause: err });
-    }
+  }
+}
+
+/** Worktree düzenli dosyasına no-follow kol üzerinden yazım/chmod (yaprak link izlenmez). */
+async function withNoFollowHandle(
+  target: string,
+  flags: number,
+  action: (handle: FileHandle) => Promise<void>,
+): Promise<void> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(target, flags | fsConstants.O_NOFOLLOW);
+    await action(handle);
+  } catch (err) {
+    throw new WorkspaceError("workspace_operation_failed", "Copying the selected context failed", { cause: err });
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -2661,8 +2732,8 @@ async function materializeWorkspace(
   if (dirExists) {
     // Hayatta worktree: kimlik (HEAD==base + toplevel) + state hash.
     if (await worktreeIdentityMatches(workspaceDir, state.baseCommit)) {
-      const hash = await workspace.recoveryStateHash().catch(() => null);
-      if (hash !== null && hash === state.recoveryStateHash) {
+      // Step 9 formülüyle kaydedilmiş hash de kabul (matchesRecoveryStateHash).
+      if (await workspace.matchesRecoveryStateHash(state.recoveryStateHash).catch(() => false)) {
         // spec 109/126: BİREBİR eşleşme → REUSE (imha/yeniden kurma YOK).
         return;
       }

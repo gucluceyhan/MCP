@@ -12,7 +12,7 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
@@ -346,6 +346,42 @@ for (const flag of ["--assume-unchanged", "--skip-worktree"] as const) {
   });
 }
 
+for (const flag of ["--assume-unchanged", "--skip-worktree"] as const) {
+  test(`İz5 (c) MEDIUM-A: ${flag} + mode-only local change (fileMode=true, chmod +x) — base mode = MAIN mode; patch applies to main without a mode mismatch`, async (t) => {
+    const fixture = await makeFixture(t);
+    git(fixture.repoRoot, "config", "core.fileMode", "true");
+    git(fixture.repoRoot, "update-index", flag, "src/a.ts");
+    await chmod(path.join(fixture.repoRoot, "src/a.ts"), 0o755);
+    assert.equal(git(fixture.repoRoot, "diff", "HEAD", "--name-only"), "", "git does not see the mode change");
+
+    const ws = await createGitWorktreeWorkspace({
+      repoRoot: fixture.repoRoot,
+      workspaceDir: path.join(fixture.root, "ws-view"),
+      sessionId: "mode-1",
+      editablePaths: ["src/a.ts"],
+    });
+    const entry = ws.readBaseEntry("src/a.ts");
+    assert.ok(entry.exists && entry.type === "file");
+    assert.equal(entry.mode, "100755", "base mode follows the MAIN file");
+    await ws.destroy();
+
+    const result = await taskRefineClose(t, fixture, "src/a.ts");
+    assertFreshChain(result);
+    const patchPath = result.close.patch_path as string;
+    const patch = await readFile(patchPath, "utf8");
+    t.diagnostic(`patch header: ${JSON.stringify(patch.split("\n").slice(0, 3))}`);
+    const copy = path.join(fixture.root, "copy");
+    await cp(fixture.repoRoot, copy, { recursive: true, verbatimSymlinks: true });
+    const applied = spawnSync("git", ["apply", patchPath], { cwd: copy, encoding: "utf8" });
+    t.diagnostic(`git apply exit=${applied.status} stderr=${JSON.stringify(applied.stderr)}`);
+    assert.equal(applied.status, 0);
+    assert.equal(applied.stderr, "", "no 'has type 100755, expected 100644' mismatch");
+    assert.match(patch, /^index [0-9a-f]+\.\.[0-9a-f]+ 100755$/m, "patch records the main file's mode");
+    assert.equal((await lstat(path.join(copy, "src/a.ts"))).mode & 0o777, 0o755);
+    assert.equal(await readFile(path.join(copy, "src/a.ts"), "utf8"), "const value = 3;\nconst tail = 0;\n");
+  });
+}
+
 test("İz5 (c) sparse benzeri: skip-worktree path ABSENT in main but present in HEAD → creation rejected (fixed message), no worktree left", async (t) => {
   const fixture = await makeFixture(t);
   git(fixture.repoRoot, "update-index", "--skip-worktree", "src/a.ts");
@@ -453,12 +489,13 @@ test("İz5 K1 ölçek: liveFingerprints = MAIN working file (CRLF bytes, 100755)
     mode: "100755",
     contentSha256: sha256("const value = 1;\r\nconst tail = 0;\r\n"),
   });
-  // Worktree ölçeği (worker görünümü + doğrulama) AYNEN: git'in yazdığı LF + 100644 —
-  // HIGH-1 uzlaştırması blob oid'leri eşit (yalnız normalizasyon) gördüğü için KOPYALAMAZ.
+  // Worktree ölçeği (worker görünümü + doğrulama): içerik git'in yazdığı LF —
+  // uzlaştırma blob oid'leri eşit (yalnız normalizasyon) gördüğü için baytı
+  // KOPYALAMAZ; mod içerikten bağımsız ana dosyaya aynalanır (MEDIUM-A).
   assert.deepEqual(ws.base.fingerprints.get("src/a.ts"), {
     exists: true,
     type: "file",
-    mode: "100644",
+    mode: "100755",
     contentSha256: sha256("const value = 1;\nconst tail = 0;\n"),
   });
   const entry = ws.readBaseEntry("src/a.ts");
@@ -492,96 +529,66 @@ test("İz5 K1 yarış: main changes between the two creation reads → creation 
   assert.equal(git(fixture.repoRoot, "status", "--porcelain"), "");
 });
 
-test("İz5 K1 sıralama (içerik): read 1 precedes the delta (base carries a change made right after it), read 2 follows the base commit", async (t) => {
+test("İz5 K1 sıralama (okuma 2): the second read runs after the base commit", async (t) => {
   const fixture = await makeFixture(t);
-  const mainFile = path.join(fixture.repoRoot, "src/a.ts");
-  const original = await readFile(mainFile);
   const headSha = git(fixture.repoRoot, "rev-parse", "HEAD").trim();
   const wsDir = path.join(fixture.root, "ws");
   let reads = 0;
-  let worktreeAtRead1: boolean | null = null;
   let headAtRead2: string | null = null;
   t.after(() => setLiveCaptureSeams(null));
   setLiveCaptureSeams({
     readFile: async (target) => {
       reads += 1;
-      const bytes = await noFollowReadFile(target);
-      if (reads === 1) {
-        worktreeAtRead1 = existsSync(wsDir);
-        await writeFile(mainFile, "const value = 7;\nconst tail = 0;\n"); // okuma 1'den HEMEN sonra
-        return bytes;
+      if (reads === 2) {
+        headAtRead2 = git(wsDir, "rev-parse", "HEAD").trim();
       }
-      headAtRead2 = git(wsDir, "rev-parse", "HEAD").trim();
-      return original; // denetim geçsin: delta'nın ölçtüğünü kanıtlamak için
+      return noFollowReadFile(target);
     },
   });
   const ws = await createGitWorktreeWorkspace({ repoRoot: fixture.repoRoot, workspaceDir: wsDir, sessionId: "order-1", editablePaths: ["src/a.ts"] });
   t.after(() => ws.destroy().catch(() => undefined));
   assert.equal(reads, 2);
-  assert.equal(worktreeAtRead1, false, "read 1 runs before the worktree exists");
-  const entry = ws.readBaseEntry("src/a.ts");
-  assert.ok(entry.exists && entry.type === "file");
-  assert.equal(entry.content.toString("utf8"), "const value = 7;\nconst tail = 0;\n", "the delta was captured AFTER read 1");
   assert.notEqual(headAtRead2, headSha, "read 2 runs after the base commit");
   assert.equal(headAtRead2, ws.baseCommit);
 });
 
-test("İz5 K1 sıralama (mod): a mode change right after read 1 is in the base → read 1 precedes the delta capture", async (t) => {
-  const fixture = await makeFixture(t);
-  const mainFile = path.join(fixture.repoRoot, "src/a.ts");
-  let reads = 0;
-  t.after(() => setLiveCaptureSeams(null));
-  setLiveCaptureSeams({
-    lstat: async (target) => {
-      const stat = await lstat(target);
-      if (target !== mainFile || reads === 0) {
-        return stat;
-      }
-      // Okuma 2: çalıştırma bitlerini gizle → denetim geçer (yalnız sıralama ölçülür).
-      return Object.assign(Object.create(Object.getPrototypeOf(stat) as object) as typeof stat, stat, { mode: stat.mode & ~0o111 });
-    },
-    readFile: async (target) => {
-      reads += 1;
-      const bytes = await noFollowReadFile(target);
-      if (reads === 1) {
-        await chmod(mainFile, 0o755);
-      }
-      return bytes;
-    },
+// Okuma 1'in delta'dan ÖNCE olduğu: okuma 1'den HEMEN sonraki değişikliği
+// delta yakalar → uzlaştırma (okuma 2'den ÖNCE) referanstan sapmayı ve taze
+// ana hâlin de saptığını görür → yarış reddi `reads === 1` ile gelir. Okuma 1
+// delta'dan sonra olsaydı delta referansı taşır, red ancak okuma 2'de gelirdi.
+for (const kind of ["content", "mode"] as const) {
+  test(`İz5 K1 sıralama (okuma 1, ${kind}): a change right after read 1 is caught by the reconcile step (read 1 precedes the delta) — creation rejected`, async (t) => {
+    const fixture = await makeFixture(t);
+    git(fixture.repoRoot, "config", "core.fileMode", "true");
+    const mainFile = path.join(fixture.repoRoot, "src/a.ts");
+    const wsDir = path.join(fixture.root, "ws");
+    let reads = 0;
+    t.after(() => setLiveCaptureSeams(null));
+    setLiveCaptureSeams({
+      readFile: async (target) => {
+        reads += 1;
+        const bytes = await noFollowReadFile(target);
+        if (reads === 1) {
+          if (kind === "content") {
+            await writeFile(mainFile, "const value = 7;\nconst tail = 0;\n");
+          } else {
+            await chmod(mainFile, 0o755);
+          }
+        }
+        return bytes;
+      },
+    });
+    await assert.rejects(
+      createGitWorktreeWorkspace({ repoRoot: fixture.repoRoot, workspaceDir: wsDir, sessionId: `order-${kind}`, editablePaths: ["src/a.ts"] }),
+      (e: unknown) =>
+        e instanceof WorkspaceError &&
+        e.kind === "workspace_operation_failed" &&
+        e.message === "The repository changed while the session base was being captured",
+    );
+    assert.equal(reads, 1, "rejected by the reconcile step, before read 2");
+    assert.equal(await worktreeCount(fixture.repoRoot), 1, "half-built worktree removed");
   });
-  const ws = await createGitWorktreeWorkspace({
-    repoRoot: fixture.repoRoot,
-    workspaceDir: path.join(fixture.root, "ws"),
-    sessionId: "order-2",
-    editablePaths: ["src/a.ts"],
-  });
-  t.after(() => ws.destroy().catch(() => undefined));
-  const base = ws.base.fingerprints.get("src/a.ts");
-  assert.ok(base !== undefined && base.exists);
-  assert.equal(base.mode, "100755");
-});
-
-test("İz5 K1 yarış (yalnız mod): chmod +x between the two reads → creation rejected", async (t) => {
-  const fixture = await makeFixture(t);
-  const mainFile = path.join(fixture.repoRoot, "src/a.ts");
-  let reads = 0;
-  t.after(() => setLiveCaptureSeams(null));
-  setLiveCaptureSeams({
-    readFile: async (target) => {
-      reads += 1;
-      const bytes = await noFollowReadFile(target);
-      if (reads === 1) {
-        await chmod(mainFile, 0o755);
-      }
-      return bytes;
-    },
-  });
-  await assert.rejects(
-    createGitWorktreeWorkspace({ repoRoot: fixture.repoRoot, workspaceDir: path.join(fixture.root, "ws"), sessionId: "race-mode", editablePaths: ["src/a.ts"] }),
-    (e: unknown) => e instanceof WorkspaceError && e.message === "The repository changed while the session base was being captured",
-  );
-  assert.equal(await worktreeCount(fixture.repoRoot), 1);
-});
+}
 
 test("İz5 K1 yakalama hatası: unreadable main file → workspace_operation_failed before any worktree exists", async (t) => {
   const fixture = await makeFixture(t);

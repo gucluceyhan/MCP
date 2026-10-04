@@ -726,10 +726,11 @@ create(task):
     existence + type + relevant mode + content        (Section 7.5)
     (stale reference: the MAIN working file, read before the working-tree
      delta is captured and again after the base commit — a difference
-     fails creation; before staging, each editable file must match the
-     main file: a local change Git hides — assume-unchanged/skip-worktree —
-     is copied from the main file, an existence/type mismatch — e.g.
-     sparse — fails creation)
+     fails creation; before staging, each editable file is reconciled
+     with the first read: a local change Git hides — assume-unchanged /
+     skip-worktree — is copied from the main file (bytes; mode always
+     mirrored), an existence/type/link-target mismatch — e.g. sparse —
+     fails creation)
   → HEAD of <wsDir> is now the BASE (== the exact main working-tree state
     visible to Claude Code at session start)
   → the BASE IS IMMUTABLE from here on (Section 7.5)
@@ -886,14 +887,20 @@ delta is captured and again after the base commit. If the two reads differ,
 the main tree changed during capture and creation fails
 (`workspace_operation_failed`); an
 editable path reached through a symlinked ancestor is rejected
-(`unsafe_path`). Between the two reads every editable file of the base must
-match the main file: when Git hides a local change (`assume-unchanged` /
-`skip-worktree`; the blob ids of the two sides differ) the main bytes and
-mode are copied into the base, so the worker edits what Claude Code sees and
-the patch applies to it; an existence/type mismatch (e.g. a sparse path
-absent from the main tree) fails creation (`invalid_repository`). Mere
-normalization (`text=auto` CRLF, `core.fileMode=false`; equal blob ids)
-leaves the base as Git wrote it. The reference is persisted as
+(`unsafe_path`). Between the two reads every editable file of the base is
+reconciled with the first read (the reference): an existence/type mismatch
+(e.g. a sparse path absent from the main tree) or a different symlink target
+fails creation (`invalid_repository`). Content: when Git hides a local
+change (`assume-unchanged` / `skip-worktree`; the blob ids of the two sides
+differ) the main bytes are copied into the base, so the worker edits what
+Claude Code sees and the patch applies to it; mere normalization
+(`text=auto` CRLF; equal blob ids) leaves the base bytes as Git wrote them.
+Mode, independently of content: the base mode is set to the main file's
+mode (a hidden `chmod`, `core.fileMode=false`), so the exported patch
+carries the main mode. Any deviation is accepted only if a fresh main read
+still equals the reference; otherwise the main tree changed during capture
+(`workspace_operation_failed`) — an intermediate state never enters the
+base. The reference is persisted as
 `liveBaseFingerprints` (session schema v2) and the check compares live with
 live, so Git's own view of a file can no longer cause a permanent false
 `stale_base`; any byte or mode change of the main file (including an
@@ -1352,7 +1359,15 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
     `diff.suppressBlankEmpty=false`), so user porcelain config can neither
     corrupt the patch nor invalidate a persisted session; output under the
     default config is byte-identical to before. The export itself keeps the
-    configured diff context (Section 7.6).
+    configured diff context (Section 7.6). A persisted hash computed with
+    the Step 9 formula (unpinned, under that config) is still accepted
+    (reuse decision + recovery verification; persisted state is not
+    rewritten — the next generated round writes the current formula).
+    Before `splash_diff` / `splash_close` use a RAM-cached workspace, its
+    state is checked against the committed hash; on drift (an external
+    edit after the last round) the committed state is re-applied and
+    verified, and on failure RAM is evicted with `session_recovery_failed`
+    (nothing exported or deleted).
 11. **End-to-end** on a real repo + real local model: verify compact
     responses, on-demand diff, `git apply` merge into the main checkout,
     refine-loop convergence with bounded token growth, the stale-base path

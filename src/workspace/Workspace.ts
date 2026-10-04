@@ -344,6 +344,14 @@ export interface Workspace {
     */
    recoveryStateHash(): Promise<string>;
 
+   /**
+    * Güncel state `expected` kalıcı hash'le eşleşiyor mu? Güncel formül VEYA
+    * Step 9 formülü (biçim kilidi öncesi; kullanıcı config'i altında) kabul
+    * edilir — Step 9'da kaydedilmiş açık oturumlar kurtarılabilir kalır
+    * (Step 10 sertleştirme e). Yalnız boolean; içerik dönmEZ. İmha → red.
+    */
+   matchesRecoveryStateHash(expected: string): Promise<boolean>;
+
     /**
      * Son başarılı turda worker tarafından oluşturulan yollar (Step 9:
      * kapsamlı sıfırlama + kurtarma yeniden-uygulaması için bilinen küme).
