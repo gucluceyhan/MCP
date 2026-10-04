@@ -1,3 +1,5 @@
+import http from "node:http";
+import https from "node:https";
 import type {
   InferenceBackend,
   InferenceMessage,
@@ -30,6 +32,18 @@ import type { BackendConfig } from "../config.js";
  *   teknik detayda anahtar `[REDACTED]` ile değiştirilir (bkz.
  *   `extractHttpDetail`) — anahtar ne `message`'de ne `cause`'ta yaşar.
  * - Her çağında caller'ın `AbortSignal`'i korunur; otomatik retry YOK.
+ * - JENERASYONDA transport zaman aşımı YOK (İz 2 / H1): global `fetch`
+ *   (undici) başlık/gövde için 300 sn varsayılan tavan uygular (ölçüldü:
+ *   300.99 sn'de `UND_ERR_HEADERS_TIMEOUT`) — `stream:false` uzun bir
+ *   jenerasyonu runtime hâlâ üretirken "ağ hatası"na çevirirdi. Varsayılan
+ *   transport `node:http(s)`'tir: istek başına bağlantı, yönlendirme
+ *   İZLENMEZ (3xx = tip'li `http` hatası; prompt başka kökene gitmez — L4),
+ *   yanıt gövdesi `maxResponseBytes` ile sınırlı. `/v1/chat/completions`
+ *   SINIRSIZDIR (iptalin tek sahibi caller'ın sinyali); kontrol çağrıları
+ *   (`/status`, `/v1/models`) 60 sn, ölçüm çağrıları (`/tokenize`,
+ *   `/apply-template`) 300 sn soket-boşta tavanıyla sınırlıdır (İz 2 audit
+ *   MEDIUM-1: kilitlenmiş bir runtime, kilit TUTULURKEN `/status`'ta süresiz
+ *   bekletemez). Transport enjekte edilebilir (test dikişi).
  *
  * Uçlar (tam olarak, runtime'ın canlı API'sine göre):
  *   GET  /status                 → ready + maximum_context_tokens
@@ -42,13 +56,168 @@ import type { BackendConfig } from "../config.js";
  *   POST /tokenize               → ham içeriğin tam token kimlikleri
  *   POST /apply-template         → render edilmiş sohbet şablonu (prompt)
  */
+/** Runtime'a TEK HTTP gidiş-dönüşünün isteği (transport dikişi). */
+export interface RuntimeHttpRequest {
+  url: URL;
+  method: "GET" | "POST";
+  headers: Record<string, string>;
+  body?: string;
+  signal?: AbortSignal;
+  /**
+   * Soket-boşta tavanı (ms): başlık beklerken ya da gövde akışı durduğunda
+   * bu kadar veri gelmezse istek `ETIMEDOUT` koduyla düşer. YOKSA sınırsız
+   * (yalnız jenerasyon — MEDIUM-1).
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Başlıkları alınmış yanıt. Gövde AYRI okunur — bağlantı/başlık hatası ile
+ * gövde-okuma hatası farklı haritalanır. `text(maxBytes)` tavanı aşan
+ * gövdeyi okumayı keser ve `ResponseTooLargeError` ile reddeder.
+ */
+export interface RuntimeHttpResponse {
+  status: number;
+  text(maxBytes: number): Promise<string>;
+}
+
+export type RuntimeHttpTransport = (request: RuntimeHttpRequest) => Promise<RuntimeHttpResponse>;
+
+export interface OpenAICompatBackendOptions {
+  /** Enjekte edilebilir transport (varsayılan: `createNodeHttpTransport()`). */
+  transport?: RuntimeHttpTransport;
+  /** Yanıt gövdesi bayt tavanı (varsayılan: `DEFAULT_MAX_RESPONSE_BYTES`). */
+  maxResponseBytes?: number;
+  /**
+   * TEST DİKİŞİ: kontrol/ölçüm tavanları (varsayılan: aşağıdaki sabitler).
+   * Kullanıcı yapılandırması DEĞİLDİR (config/env yolu yok).
+   */
+  requestTimeoutsMs?: { control: number; measurement: number };
+}
+
+/** Kontrol çağrıları (`/status`, `/v1/models`) soket-boşta tavanı: 60 sn. */
+export const CONTROL_REQUEST_TIMEOUT_MS = 60_000;
+/** Ölçüm çağrıları (`/tokenize`, `/apply-template`) soket-boşta tavanı: 300 sn. */
+export const MEASUREMENT_REQUEST_TIMEOUT_MS = 300_000;
+
+/**
+ * Yanıt gövdesi tavanı: 64 MiB. Meşru en büyük yanıtlar (tam bağlam
+ * `/apply-template` prompt'u, ~260K tokenlık `/tokenize` dizisi, çıkış payı
+ * kadar tamamlanma) bunun çok altındadır; tavan yalnız hatalı/kötü niyetli
+ * bir uç noktanın sınırsız bellek tüketmesini keser.
+ */
+export const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+/** Gövde tavanı aşıldı (transport → adaptör iç sinyali; içerik taşımaz). */
+export class ResponseTooLargeError extends Error {
+  constructor() {
+    super("Response body exceeded the size limit");
+    this.name = "ResponseTooLargeError";
+  }
+}
+
+/**
+ * Varsayılan transport: `node:http(s)`. Bilinçli olarak:
+ * - varsayılan zaman aşımı YOK — yalnız istek `timeoutMs` taşıyorsa soket-
+ *   boşta tavanı (`ETIMEDOUT`); paylaşılan agent'ın soket politikası devreye
+ *   girmesin diye `agent: false` (istek başına bağlantı),
+ * - yönlendirme izlenmez (node:http hiç izlemez),
+ * - iptal yalnız caller'ın `signal`'i,
+ * - gövde `TextDecoder` ile çözülür (`fetch().text()` ile aynı: UTF-8, BOM
+ *   atılır, geçersiz bayt → U+FFFD).
+ */
+export function createNodeHttpTransport(): RuntimeHttpTransport {
+  return (request) =>
+    new Promise<RuntimeHttpResponse>((resolve, reject) => {
+      const client = request.url.protocol === "https:" ? https : http;
+      const headers: Record<string, string> = { ...request.headers };
+      if (request.body !== undefined) {
+        headers["content-length"] = String(Buffer.byteLength(request.body));
+      }
+      // Zaman aşımı hatası: gövde okuması da bunu (ECONNRESET değil) görsün
+      // diye burada tutulur — dürüst "timed out" eşlemesi.
+      let timeoutError: Error | null = null;
+      const req = client.request(
+        request.url,
+        { method: request.method, headers, signal: request.signal, agent: false },
+        (res) => {
+          resolve({
+            status: res.statusCode ?? 0,
+            text: (maxBytes) => readBody(res, maxBytes, () => timeoutError),
+          });
+        },
+      );
+      if (request.timeoutMs !== undefined) {
+        // Soket-boşta tavanı (başlık bekleme + gövde akışı). Yalnız kontrol/
+        // ölçüm çağrılarında verilir; jenerasyon sınırsızdır (MEDIUM-1).
+        req.setTimeout(request.timeoutMs, () => {
+          timeoutError = Object.assign(new Error("Inference runtime request timed out"), { code: "ETIMEDOUT" });
+          req.destroy(timeoutError);
+        });
+      }
+      // Yanıt sonrası gelen istek hatası (ör. gövde ortasında iptal) gövde
+      // okumasında yüzeye çıkar; buradaki reject o noktada etkisizdir.
+      req.on("error", reject);
+      req.end(request.body);
+    });
+}
+
+/**
+ * Gövdeyi tavanla okur; erken kapanış/hata → red (asla takılmaz). Soket
+ * zaman aşımıyla yıkıldıysa red nedeni o zaman aşımı hatasıdır.
+ */
+function readBody(
+  res: http.IncomingMessage,
+  maxBytes: number,
+  timedOut: () => Error | null,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const fail = (err: unknown): void => {
+      if (!settled) {
+        settled = true;
+        reject(timedOut() ?? err);
+      }
+    };
+    res.on("data", (chunk: Buffer) => {
+      if (settled) {
+        return;
+      }
+      size += chunk.length;
+      if (size > maxBytes) {
+        fail(new ResponseTooLargeError());
+        res.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    res.on("end", () => {
+      if (!settled) {
+        settled = true;
+        resolve(new TextDecoder().decode(Buffer.concat(chunks)));
+      }
+    });
+    res.on("error", fail);
+    res.on("close", () => fail(new Error("Response closed before the body completed")));
+  });
+}
+
 export class OpenAICompatBackend implements InferenceBackend {
   #config: BackendConfig;
+  #http: HttpDeps;
   /** Son başarılı yenileme; başarısız yenileme bunu ASLA dokunmaz. */
   #runtimeInfo: RuntimeInfo | null = null;
 
-  constructor(config: BackendConfig) {
+  constructor(config: BackendConfig, options: OpenAICompatBackendOptions = {}) {
     this.#config = config;
+    this.#http = {
+      transport: options.transport ?? createNodeHttpTransport(),
+      maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+      controlTimeoutMs: options.requestTimeoutsMs?.control ?? CONTROL_REQUEST_TIMEOUT_MS,
+      measurementTimeoutMs: options.requestTimeoutsMs?.measurement ?? MEASUREMENT_REQUEST_TIMEOUT_MS,
+    };
   }
 
   get runtimeInfo(): RuntimeInfo | null {
@@ -60,7 +229,7 @@ export class OpenAICompatBackend implements InferenceBackend {
   async refreshRuntimeInfo(signal?: AbortSignal): Promise<RuntimeInfo> {
     // 1) /status — yetki (authoritative) kapasite. Bilinmeyen ek alanlar
     // (schema_version, admission, identity, metrics, ...) kabul edilir.
-    const status = await requestJson(this.#config, "GET", "/status", undefined, signal);
+    const status = await requestJson(this.#config, this.#http, "GET", "/status", undefined, signal);
     if (!isRecord(status) || status.ready !== true) {
       throw new BackendError("invalid_status", "Inference runtime is not ready (/status)");
     }
@@ -74,7 +243,7 @@ export class OpenAICompatBackend implements InferenceBackend {
 
     // 2) /v1/models — sunulan model, yapılandırılan modelle TAM eşleşmeli.
     // Fuzzy eşleşme ya da sessiz ikame YOK.
-    const models = await requestJson(this.#config, "GET", "/v1/models", undefined, signal);
+    const models = await requestJson(this.#config, this.#http, "GET", "/v1/models", undefined, signal);
     if (!isRecord(models) || models.object !== "list" || !Array.isArray(models.data)) {
       throw new BackendError(
         "invalid_status",
@@ -101,7 +270,7 @@ export class OpenAICompatBackend implements InferenceBackend {
     }
 
     // 3) Runtime kimliği (Step 3): `/status.instance.pid` — sunan
-    //    süreç. Sıkı doğrulama (pozitif tam sayı); eksik ya da bozuk
+    //    süreç. Sıkı doğrulama (güvenli tam sayı, > 1); eksik ya da bozuk
     //    değer `runtimeProcessId`'yi boşta BIRAKIR (özellik konulmaz,
     //    `undefined` yazılmaz) — coordinator "kullanılır kimlik yok"
     //    deyip fail-closed davranır; asla tahmin edilmez. Ham
@@ -111,7 +280,10 @@ export class OpenAICompatBackend implements InferenceBackend {
     const instance = status.instance;
     if (isRecord(instance)) {
       const pid = instance.pid;
-      if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+      // `Number.isSafeInteger` + `pid > 1` (İz 2 / L3): PID 1 (launchd/init)
+      // tüm host'un atasıdır — kimlik olarak kabul edilseydi çakışma
+      // taramasından HER süreç dışlanırdı (sessiz fail-open).
+      if (typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1) {
         runtimeProcessId = pid;
       }
     }
@@ -180,6 +352,7 @@ export class OpenAICompatBackend implements InferenceBackend {
 
     const parsed = await requestJson(
       this.#config,
+      this.#http,
       "POST",
       "/v1/chat/completions",
       body,
@@ -193,7 +366,7 @@ export class OpenAICompatBackend implements InferenceBackend {
   async tokenize(content: string, options: TokenizeOptions = {}): Promise<TokenizeResult> {
     // Boş içerik için davranış runtime'a aittir; adaptor koruma koymaz.
     const body = { content, add_special: options.addSpecial ?? false };
-    const parsed = await requestJson(this.#config, "POST", "/tokenize", body, options.signal);
+    const parsed = await requestJson(this.#config, this.#http, "POST", "/tokenize", body, options.signal);
     if (!isRecord(parsed)) {
       throw new BackendError(
         "invalid_response",
@@ -241,6 +414,7 @@ export class OpenAICompatBackend implements InferenceBackend {
     }
     const parsed = await requestJson(
       this.#config,
+      this.#http,
       "POST",
       "/apply-template",
       body,
@@ -351,20 +525,92 @@ function extractHttpDetail(bodyText: string, apiKey: string | undefined): string
   return truncateSafe(redactSecret(message, apiKey));
 }
 
+/** Adaptörün transport bağımlılıkları (constructor'da çözülür). */
+interface HttpDeps {
+  transport: RuntimeHttpTransport;
+  maxResponseBytes: number;
+  /** Kontrol (`/status`, `/v1/models`) soket-boşta tavanı (ms). */
+  controlTimeoutMs: number;
+  /** Ölçüm (`/tokenize`, `/apply-template`) soket-boşta tavanı (ms). */
+  measurementTimeoutMs: number;
+}
+
+/**
+ * Zaman aşımı hata kodları (İz 2 / H1). Varsayılan transport zaman aşımı
+ * KOYMAZ; ama enjekte edilmiş (ör. fetch/undici tabanlı) bir transport ya
+ * da TCP bağlantı katmanı (`ETIMEDOUT`) bunları üretebilir — dürüst, ayrı
+ * bir mesaja eşlenir ("ulaşılamadı"/"geçersiz JSON" DEĞİL).
+ */
+const TIMEOUT_CODES: ReadonlySet<string> = new Set([
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "ETIMEDOUT",
+]);
+
+/**
+ * Hatanın makine kodu (`err.code`, yoksa fetch tarzı `err.cause.code`) —
+ * YALNIZ büyük harf/rakam/alt çizgi biçimindeyse (İz 2 / L5). `cause`
+ * kanalına ham hata nesnesi DEĞİL yalnız bu kod girer: ham mesajlar host/
+ * port, hatta geçersiz header değerini (anahtar!) yansıtabilir (ölçüldü:
+ * CR/LF'li anahtarla fetch'in TypeError mesajı anahtarı içeriyordu).
+ */
+function errorCode(err: unknown): string | undefined {
+  const pick = (value: unknown): string | undefined => {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    const code = (value as { code?: unknown }).code;
+    return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined;
+  };
+  return pick(err) ?? (typeof err === "object" && err !== null ? pick((err as { cause?: unknown }).cause) : undefined);
+}
+
+/**
+ * Taşıma hatasını tip'li `network` hatasına çevirir: iptal → "aborted",
+ * zaman aşımı kodu → "timed out", diğer → "could not reach". `cause` yalnız
+ * hata KODUDUR (ya da `undefined`).
+ */
+function networkError(err: unknown, signal: AbortSignal | undefined, path: string): BackendError {
+  const code = errorCode(err);
+  let message: string;
+  if (isAbort(err, signal)) {
+    message = `Request aborted (${path})`;
+  } else if (code !== undefined && TIMEOUT_CODES.has(code)) {
+    message = `Timed out waiting for the inference runtime (${path})`;
+  } else {
+    message = `Could not reach the inference runtime (${path})`;
+  }
+  return new BackendError("network", message, { cause: code });
+}
+
+/**
+ * Görünür ASCII (0x21-0x7E) — HTTP header değerinde güvenli bayt kümesi.
+ * `loadConfig` bunu zaten zorlar (İz 2 / L5); burası doğrudan kurulan
+ * `BackendConfig` için savunma derinliğidir (CR/LF → header enjeksiyonu).
+ */
+const VISIBLE_ASCII = /^[\x21-\x7e]+$/;
+
 /**
  * Tüm çağrıların TEK modül-privat JSON gidiş-dönüşü yardımcısı.
  *
- * Tek istek, tek yanıt: retry YOK, planlama YOK (DESIGN.md 2.5).
+ * Tek istek, tek yanıt: retry YOK, planlama YOK, yönlendirme YOK; zaman
+ * aşımı yalnız kontrol/ölçüm çağrılarında, jenerasyonda YOK (DESIGN.md 2.5).
  * Hata haritası:
- *   bağlantı hatası                     → BackendError("network")
- *   iptal (fetch ya da gövde okuması)   → BackendError("network") + "aborted"
- *   2xx dışı durum                      → BackendError("http") + `status`;
+ *   bağlantı hatası                     → BackendError("network"); `cause` = hata kodu
+ *   zaman aşımı kodu (TIMEOUT_CODES)    → BackendError("network") + "timed out"
+ *   iptal (istek ya da gövde okuması)   → BackendError("network") + "aborted"
+ *   2xx dışı durum (3xx DAHİL)          → BackendError("http") + `status`;
  *                                        gövde detayı (≤200) YALNIZCA `cause`'ta;
  *                                        API anahtarı ayarlıysa detaydaki anahtar
  *                                        geçişleri `[REDACTED]` yapılır
+ *   gövde tavanı aşıldı                 → 2xx: BackendError("invalid_response");
+ *                                        2xx-dışı: detaysız `http`
  *   2xx ama parse edilemeyen gövde      → BackendError("invalid_response");
  *                                        `cause` `undefined` (parse hatası
  *                                        gövde snippet'i taşır — saklanmaz)
+ *   anahtar header'a güvenle yazılamaz  → BackendError("invalid_request"),
+ *                                        ağa ÇIKMADAN (anahtar mesajda yok)
  *
  * DESIGN.md bölüm 9: `message` hiçbir durumda istek/yanıt içeriği taşımaz —
  * coordinator bunu frontier'a yüzeyine taşır; teknik detay `cause`'tadır.
@@ -374,6 +620,7 @@ function extractHttpDetail(bodyText: string, apiKey: string | undefined): string
  */
 async function requestJson(
   config: BackendConfig,
+  deps: HttpDeps,
   method: "GET" | "POST",
   path: string,
   body: unknown,
@@ -385,40 +632,59 @@ async function requestJson(
   }
   // Anahtar BİR kere, bu header'da; hiçbir mesaj ya da log'da yok.
   if (config.apiKey !== undefined) {
+    if (!VISIBLE_ASCII.test(config.apiKey)) {
+      throw new BackendError(
+        "invalid_request",
+        "The configured API key contains characters that are not allowed in an HTTP header",
+      );
+    }
     headers["authorization"] = `Bearer ${config.apiKey}`;
   }
 
-  let response: Response;
+  // Tavan uç noktaya göre SABİTTİR (MEDIUM-1): jenerasyon sınırsız;
+  // kontrol/ölçüm çağrıları sınırlı — kilit tutulurken asılı kalınmaz.
+  const timeoutMs =
+    path === "/v1/chat/completions"
+      ? undefined
+      : path === "/status" || path === "/v1/models"
+        ? deps.controlTimeoutMs
+        : deps.measurementTimeoutMs;
+
+  let response: RuntimeHttpResponse;
   try {
-    response = await fetch(new URL(path, config.baseUrl), {
+    response = await deps.transport({
+      url: new URL(path, config.baseUrl),
       method,
       headers,
-      body: method === "POST" ? JSON.stringify(body) : undefined,
-      signal,
+      ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
+      ...(signal !== undefined ? { signal } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     });
   } catch (err) {
-    const message =
-      isAbort(err, signal)
-        ? `Request aborted (${path})`
-        : `Could not reach the inference runtime (${path})`;
-    throw new BackendError("network", message, { cause: err });
+    throw networkError(err, signal, path);
   }
+
+  const ok = response.status >= 200 && response.status < 300;
 
   // Gövde tam BİR kere okunur ve hiçbir hata mesajına ASLA yansıtılmaz.
   let bodyText: string;
   try {
-    bodyText = await response.text();
+    bodyText = await response.text(deps.maxResponseBytes);
   } catch (readErr) {
-    // Gövde okuma SIRASINDA gelen iptal bir ağ hatasıdır: network/aborted.
-    if (isAbort(readErr, signal)) {
-      throw new BackendError("network", `Request aborted (${path})`, { cause: readErr });
+    // Gövde okuma SIRASINDA gelen iptal / zaman aşımı bir ağ hatasıdır.
+    const code = errorCode(readErr);
+    if (isAbort(readErr, signal) || (code !== undefined && TIMEOUT_CODES.has(code))) {
+      throw networkError(readErr, signal, path);
     }
-    // Socket reset vb.: gövde boş kabul edilir — 2xx'te parse hatası
-    // (invalid_response), 2xx-dışında genel http mesajı. Mevcut harita korunur.
+    if (readErr instanceof ResponseTooLargeError && ok) {
+      throw new BackendError("invalid_response", `Response from ${path} exceeded the size limit`);
+    }
+    // Socket reset / 2xx-dışı tavan aşımı: gövde boş kabul edilir — 2xx'te
+    // parse hatası (invalid_response), 2xx-dışında detaysız http. Mevcut harita.
     bodyText = "";
   }
 
-  if (!response.ok) {
+  if (!ok) {
     // `message` fragment-taşıyan değildir; gövde detayı yalnız `cause`'ta.
     // Anahtar ayarlıysa detayda redakte edilir (bkz. extractHttpDetail).
     throw new BackendError(
@@ -459,6 +725,15 @@ function validateChatCompletion(parsed: unknown): InferenceResult {
     throw new BackendError(
       "invalid_response",
       `Expected a 'choices[0].message' object from ${endpoint}`,
+    );
+  }
+  // Çıkış bütçesi tükendi (İz 2 / L1): yanıt yarım kesildi — içerik (varsa)
+  // eksik bir worker çıktısıdır. "Geçersiz JSON"/"metin dışı yanıt" yerine
+  // dürüst, ayrı tip'li hata (bütçe/kapsam sorunu; model bozukluğu değil).
+  if (first.finish_reason === "length") {
+    throw new BackendError(
+      "output_truncated",
+      `Inference output budget exhausted before the response completed (${endpoint})`,
     );
   }
   // `content` string OLMALIDIR. Canlı runtime'da tüm tamamlanma bütçesini

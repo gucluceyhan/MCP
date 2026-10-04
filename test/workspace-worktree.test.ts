@@ -43,6 +43,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
+  appendFile,
   chmod,
   lstat,
   mkdir,
@@ -61,6 +62,8 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   WorkspaceError,
   type Workspace,
@@ -4012,5 +4015,511 @@ test("recovery: expected workspaceDir inside the repo fails with the stable unsa
     );
   } finally {
     await ws.destroy().catch(() => undefined);
+  }
+});
+
+// ── İnceleme düzeltmeleri — İz 1: workspace/git (W-H1, W-M5, L3, L4, L6) ────
+
+/** Basit tek-dosyalı repo (`f.txt` committed) + repo DIŞI çıktı kökü. */
+async function buildPlainRepo(name: string): Promise<Fixture> {
+  const repo = path.join(tmp, name, "repo");
+  const out = path.join(tmp, name);
+  await mkdir(repo, { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "Plain User"]);
+  await gitOk(repo, ["config", "user.email", "plain@local.invalid"]);
+  await writeFile(path.join(repo, "f.txt"), "v1\n");
+  await gitOk(repo, ["add", "f.txt"]);
+  await gitOk(repo, ["commit", "-m", "plain init"]);
+  return { repo, out };
+}
+
+/** Ana depo durumunun karşılaştırılabilir kaydı: HEAD + dal ref'i + index + status + dosyalar. */
+async function mainRepoSnapshot(repo: string): Promise<Record<string, string>> {
+  const files = await readAll(repo);
+  const fileDigest = [...files.entries()].map(([key, value]) => `${key}:${sha256(value)}`).join("|");
+  return {
+    head: await gitText(repo, ["rev-parse", "HEAD"]),
+    branch: await gitText(repo, ["rev-parse", "refs/heads/main"]),
+    symbolicHead: await gitText(repo, ["symbolic-ref", "HEAD"]),
+    index: (await git(repo, ["ls-files", "-s", "-z"])).toString("utf8"),
+    status: (await git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).toString("utf8"),
+    files: fileDigest,
+  };
+}
+
+test("inherited absolute GIT_DIR/GIT_WORK_TREE never redirect create/apply into the main repository: HEAD/ref/index/files stay exact (W-H1)", async () => {
+  const fixture = await buildPlainRepo("wh1-env");
+  await writeFile(path.join(fixture.repo, "untracked.txt"), "user's untracked\n");
+  const before = await mainRepoSnapshot(fixture.repo);
+  const input: WorkspaceCreateInput = {
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-wh1"),
+    sessionId: "s-wh1",
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  };
+  let ws: GitWorktreeWorkspace | null = null;
+  let outcome: unknown = null;
+  process.env.GIT_DIR = path.join(fixture.repo, ".git");
+  process.env.GIT_WORK_TREE = fixture.repo;
+  try {
+    ws = await createGitWorktreeWorkspace(input);
+    await ws.applyPatchSet(workerResult([{ kind: "modify", path: "f.txt", operations: [{ search: "v1", replace: "v2-worker" }] }]));
+    await ws.resetToBase();
+    await ws.applyPatchSet(workerResult([{ kind: "modify", path: "f.txt", operations: [{ search: "v1", replace: "v2-worker" }] }]));
+  } catch (err) {
+    outcome = err;
+  } finally {
+    delete process.env.GIT_DIR;
+    delete process.env.GIT_WORK_TREE;
+  }
+  try {
+    assert.deepEqual(await mainRepoSnapshot(fixture.repo), before, "the main checkout must stay byte-identical");
+    assert.equal(outcome, null, `create/apply must succeed in the isolated worktree: ${String(outcome)}`);
+    assert.ok(ws !== null);
+    assert.equal(await readFile(path.join(ws.workspaceDir, "f.txt"), "utf8"), "v2-worker\n");
+    assert.notEqual(ws.baseCommit, before.head, "the base commit lives in the worktree, never on the main branch");
+  } finally {
+    await ws?.destroy().catch(() => undefined);
+  }
+});
+
+test("a tampered created-path set never unlinks through an ancestor symlink outside the workspace; the residue stays (W-M5)", async () => {
+  const fixture = await buildPlainRepo("wm5-tamper");
+  const outsideDir = path.join(fixture.out, "outside-dir");
+  await mkdir(outsideDir, { recursive: true });
+  const sentinel = path.join(outsideDir, "x");
+  await writeFile(sentinel, "outside sentinel\n");
+  // base'te committed bir dizin-symlink'i: `lnk` → workspace DIŞINDAKİ dizin.
+  await symlink(outsideDir, path.join(fixture.repo, "lnk"));
+  await gitOk(fixture.repo, ["add", "lnk"]);
+  await gitOk(fixture.repo, ["commit", "-m", "outside dir link"]);
+
+  const input: WorkspaceCreateInput = {
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-wm5"),
+    sessionId: "s-wm5",
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  };
+  const ws = await createGitWorktreeWorkspace(input);
+  const state = await ws.snapshotRecoveryState();
+  await ws.destroy();
+  // Kurcalanmış (şema-geçerli) kalıcı küme: `lnk/x` kanonik bir yoldur.
+  const tampered: WorkspaceRecoveryState = { ...state, currentCreatedPaths: ["lnk/x"] };
+  const ws2 = await restoreGitWorktreeWorkspace(tampered, { expectedWorkspaceDir: state.workspaceDir });
+  try {
+    assert.ok((await lstat(path.join(ws2.workspaceDir, "lnk"))).isSymbolicLink(), "fixture: the ancestor is a symlink");
+    const err = await expectWorkspaceError("workspace_operation_failed", () => ws2.resetToBase());
+    assert.equal(err.message, "Cleaning the worker-created paths failed");
+    assert.equal(await readFile(sentinel, "utf8"), "outside sentinel\n", "a file outside the workspace must never be unlinked");
+    // Küme BİLİNEN KALINTI olarak kalır: sonraki tur da aynı güvenli redde düşer.
+    await expectWorkspaceError("workspace_operation_failed", () => ws2.applyPatchSet(workerResult([])));
+    assert.equal(await readFile(sentinel, "utf8"), "outside sentinel\n");
+  } finally {
+    await ws2.destroy().catch(() => undefined);
+  }
+});
+
+/** PATH'teki gerçek `git` ikilisinin mutlak yolu (yarış sarmalayıcısı için). */
+async function realGitPath(): Promise<string> {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (dir === "") {
+      continue;
+    }
+    const candidate = path.join(dir, "git");
+    const st = await stat(candidate).catch(() => null);
+    if (st !== null && st.isFile() && (st.mode & 0o111) !== 0) {
+      return candidate;
+    }
+  }
+  throw new Error("git not found on PATH");
+}
+
+function shQuote(text: string): string {
+  return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Yarış enjeksiyonu (L3/L4): PATH'in önüne konan `git` sarmalayıcısı,
+ * argv'sinde `trigger` kelimesini taşıyan İLK çağrıdan hemen ÖNCE `action`
+ * kabuk satırını BİR KEZ çalıştırır (`$REAL` = gerçek git), sonra gerçek
+ * git'e `exec` eder — Splash'in iki git çağrısı arasındaki pencereyi
+ * deterministik açar (git/fs seam'i yok). Dönen `fired`: tetik çalıştı mı.
+ */
+async function withGitRaceHook<T>(
+  dir: string,
+  trigger: string,
+  action: string,
+  fn: () => Promise<T>,
+): Promise<{ result: T | null; error: unknown; fired: boolean }> {
+  const binDir = path.join(dir, "race-bin");
+  await mkdir(binDir, { recursive: true });
+  const marker = path.join(binDir, "fired");
+  const script = [
+    "#!/bin/sh",
+    `REAL=${shQuote(await realGitPath())}`,
+    "hit=",
+    'for a in "$@"; do',
+    `  if [ "$a" = ${shQuote(trigger)} ]; then hit=1; fi`,
+    "done",
+    `if [ -n "$hit" ] && [ ! -e ${shQuote(marker)} ]; then`,
+    `  : > ${shQuote(marker)}`,
+    `  ${action}`,
+    "fi",
+    'exec "$REAL" "$@"',
+    "",
+  ].join("\n");
+  const wrapper = path.join(binDir, "git");
+  await writeFile(wrapper, script);
+  await chmod(wrapper, 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${savedPath ?? ""}`;
+  let result: T | null = null;
+  let error: unknown = null;
+  try {
+    result = await fn();
+  } catch (err) {
+    error = err;
+  } finally {
+    process.env.PATH = savedPath;
+  }
+  const fired = (await lstat(marker).catch(() => null)) !== null;
+  return { result, error, fired };
+}
+
+test("base capture diffs against the resolved HEAD sha: a commit landing between rev-parse and the delta capture never drops the user's change (L3)", async () => {
+  const fixture = await buildPlainRepo("l3-race");
+  await writeFile(path.join(fixture.repo, "f.txt"), "v2-dirty\n"); // unstaged kullanıcı değişikliği
+  const headBefore = await gitText(fixture.repo, ["rev-parse", "HEAD"]);
+  const input: WorkspaceCreateInput = {
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-l3"),
+    sessionId: "s-l3",
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  };
+  // İlk `diff` (delta yakalama) çağrısından hemen önce kullanıcı değişikliği commit'ler:
+  // HEAD ilerler, çalışma ağacı temizlenir — ama içerik aynı (v2-dirty) kalır.
+  const action = `"$REAL" -C ${shQuote(fixture.repo)} -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q -a -m race >/dev/null 2>&1`;
+  const { result: ws, error, fired } = await withGitRaceHook(fixture.out, "diff", action, () => createGitWorktreeWorkspace(input));
+  try {
+    assert.equal(fired, true, "the race hook must fire");
+    assert.equal(error, null, `creation must succeed: ${String(error)}`);
+    assert.ok(ws !== null);
+    assert.equal(await readFile(path.join(fixture.repo, "f.txt"), "utf8"), "v2-dirty\n", "fixture: main working tree content");
+    // Kanca commit'i GERÇEKTEN oldu: HEAD ilerledi, bir önceki commit = yakalanan HEAD.
+    assert.notEqual(await gitText(fixture.repo, ["rev-parse", "HEAD"]), headBefore, "fixture: HEAD moved during creation");
+    assert.equal(await gitText(fixture.repo, ["rev-parse", "HEAD~1"]), headBefore, "fixture: the race commit sits on top of the captured HEAD");
+    // Worktree yakalanan HEAD'den kuruldu: base commit'in ebeveyni = headBefore.
+    assert.equal(await gitText(fixture.repo, ["rev-parse", `${ws.baseCommit}^`]), headBefore);
+    // Base = ana working-tree'nin BİREBİR durumu (spec 19/20) — HEAD kaymasından bağımsız.
+    assert.deepEqual(ws.readBaseEntry("f.txt"), {
+      exists: true,
+      type: "file",
+      mode: "100644",
+      content: Buffer.from("v2-dirty\n"),
+    });
+  } finally {
+    await ws?.destroy().catch(() => undefined);
+  }
+});
+
+test("selected untracked symlink retargeted outside after the primary check: the copy-time check rejects it (L4)", async () => {
+  const fixture = await buildPlainRepo("l4-race");
+  const outsideTarget = path.join(fixture.out, "outside-secret.txt");
+  await writeFile(outsideTarget, "host secret\n");
+  await symlink("f.txt", path.join(fixture.repo, "ln")); // untracked, İÇE (birincil kontrol geçer)
+  const workspaceDir = path.join(fixture.out, "ws", "s-l4");
+  const input: WorkspaceCreateInput = {
+    repoRoot: fixture.repo,
+    workspaceDir,
+    sessionId: "s-l4",
+    editablePaths: ["ln"],
+    readonlyPaths: [],
+  };
+  // Birincil kontrolden SONRA, kopyadan ÖNCE (`worktree add` anında) link dışa çevrilir.
+  const linkAbs = path.join(fixture.repo, "ln");
+  const action = `rm -f ${shQuote(linkAbs)} && ln -s ${shQuote(outsideTarget)} ${shQuote(linkAbs)}`;
+  const { result: ws, error, fired } = await withGitRaceHook(fixture.out, "worktree", action, () => createGitWorktreeWorkspace(input));
+  try {
+    assert.equal(fired, true, "the race hook must fire");
+    assert.equal(await readlink(linkAbs), outsideTarget, "fixture: the link now points outside");
+    assert.ok(error instanceof WorkspaceError, `creation must be rejected, got: ${String(error)}`);
+    assert.equal(error.kind, "unsafe_path");
+    assert.equal(error.message, "A selected path is an unsafe symlink");
+    assert.equal(await lstat(workspaceDir).catch(() => null), null, "no partial worktree is left (spec 74)");
+  } finally {
+    await ws?.destroy().catch(() => undefined);
+  }
+});
+
+test("case (b) reconstruction boundary: a pruned delta blob of a NON-selected dirty file fails closed at mktree (no partial worktree) (L6)", async () => {
+  const fixture = await buildRecFixture("l6-boundary");
+  // seçilmemiş, tracked, unstaged değişiklikli dosya: delta blob'u yalnız base ağacından erişilebilir.
+  await writeFile(path.join(fixture.repo, "src", "other.ts"), "o1\n");
+  await gitOk(fixture.repo, ["add", "src/other.ts"]);
+  await gitOk(fixture.repo, ["commit", "-m", "other"]);
+  await writeFile(path.join(fixture.repo, "src", "other.ts"), "o2-UNSTAGED\n");
+  const ws = await createGitWorktreeWorkspace(recInput(fixture, "s-l6"));
+  const state = await ws.snapshotRecoveryState();
+  await ws.destroy();
+  await pruneBaseObject(fixture, state.baseCommit);
+  const err = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir }).then(
+    async (restored) => {
+      await restored.destroy().catch(() => undefined);
+      throw new Error("expected the reconstruction to fail closed");
+    },
+    (caught: unknown) => caught,
+  );
+  assert.ok(err instanceof WorkspaceError, `expected WorkspaceError, got: ${String(err)}`);
+  assert.equal((err.cause as { command?: unknown } | undefined)?.command, "mktree", "mktree itself verifies object existence");
+  assert.equal(await lstat(state.workspaceDir).catch(() => null), null, "no partial worktree is left");
+});
+
+test("a file named like the resolved HEAD sha in the main tree never makes the delta capture ambiguous (INFO-3)", async () => {
+  const fixture = await buildPlainRepo("info3-ambiguous");
+  const headSha = await gitText(fixture.repo, ["rev-parse", "HEAD"]);
+  await writeFile(path.join(fixture.repo, headSha), "untracked file named like the sha\n");
+  await writeFile(path.join(fixture.repo, "f.txt"), "v2-dirty\n");
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-info3"),
+    sessionId: "s-info3",
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  });
+  try {
+    assert.deepEqual(ws.readBaseEntry("f.txt"), {
+      exists: true,
+      type: "file",
+      mode: "100644",
+      content: Buffer.from("v2-dirty\n"),
+    });
+  } finally {
+    await ws.destroy();
+  }
+});
+
+/**
+ * Sahte git sürümü (MEDIUM-1): PATH'in önüne konan sarmalayıcı `--version`
+ * argümanlı çağrıya `versionLine` basar, geri kalan her çağrıyı gerçek
+ * git'e `exec` eder. Splash'in sürüm önbelleği `PATH` anahtarlıdır — bu
+ * blok kendi sürüm okumasını yapar.
+ */
+async function withFakeGitVersion<T>(dir: string, versionLine: string, fn: () => Promise<T>): Promise<T> {
+  const binDir = path.join(dir, "fake-version-bin");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    'for a in "$@"; do',
+    `  if [ "$a" = "--version" ]; then printf '%s\\n' ${shQuote(versionLine)}; exit 0; fi`,
+    "done",
+    `exec ${shQuote(await realGitPath())} "$@"`,
+    "",
+  ].join("\n");
+  const wrapper = path.join(binDir, "git");
+  await writeFile(wrapper, script);
+  await chmod(wrapper, 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${savedPath ?? ""}`;
+  try {
+    return await fn();
+  } finally {
+    process.env.PATH = savedPath;
+  }
+}
+
+/** Sonuç ya da yakalanan hata (oluşturulan workspace'ler çağıran tarafından imha edilir). */
+async function settle<T>(fn: () => Promise<T>): Promise<{ value: T | null; error: unknown }> {
+  try {
+    return { value: await fn(), error: null };
+  } catch (err) {
+    return { value: null, error: err };
+  }
+}
+
+test("git without GIT_NO_LAZY_FETCH + partial clone (promisor remote): creation and recovery reject with a fixed invalid_repository; a non-promisor repo and a protected git (2.45.1) are unaffected (MEDIUM-1)", async () => {
+  const source = await buildPlainRepo("m1-src");
+  await gitOk(source.repo, ["config", "uploadpack.allowFilter", "true"]);
+  const out = path.join(tmp, "m1-clone");
+  const clone = path.join(out, "repo");
+  await mkdir(out, { recursive: true });
+  // Checkout'lu partial clone doğrudan git ile kurulur: runGit'in
+  // GIT_NO_LAZY_FETCH'i checkout'un blob çekmesini (doğru biçimde) engellerdi.
+  await promisify(execFile)("git", ["clone", "-q", "--filter=blob:none", `file://${source.repo}`, clone]);
+  // Not: `clone --filter` fikstürü `remote.origin.partialclonefilter`'ı da
+  // yazar — bu test 3 seviyeli promisor sorgusunu ve `--bool`'u TEK BAŞINA
+  // ayırt etmez; onlar biçim tablosu testinde (aşağıda) sabitlenir.
+  assert.equal(await gitText(clone, ["config", "--get", "remote.origin.promisor"]), "true", "fixture: promisor remote");
+  const plain = await buildPlainRepo("m1-plain");
+  const cloneInput = (sessionId: string): WorkspaceCreateInput => ({
+    repoRoot: clone,
+    workspaceDir: path.join(out, "ws", sessionId),
+    sessionId,
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  });
+
+  // Korumalı git (sahte 2.45.1; kurulu git sürümünden bağımsız): promisor'lı
+  // repo da oluşturulur — mevcut davranış. Ayrı dizin ŞART: sürüm önbelleği
+  // `PATH` anahtarlı; aşağıdaki 2.43.0 bloğuyla aynı `out` → aynı PATH →
+  // önbellekteki 2.45.1 okunur ve eski dal reddetmez (ölçüldü).
+  const state = await withFakeGitVersion(path.join(out, "v2.45.1"), "git version 2.45.1", async () => {
+    const modern = await createGitWorktreeWorkspace(cloneInput("s-m1-modern"));
+    const snapshot = await modern.snapshotRecoveryState();
+    await modern.destroy();
+    return snapshot;
+  });
+
+  const created: GitWorktreeWorkspace[] = [];
+  try {
+    const outcome = await withFakeGitVersion(out, "git version 2.43.0", async () => ({
+      create: await settle(() => createGitWorktreeWorkspace(cloneInput("s-m1-old"))),
+      recover: await settle(() => restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir })),
+      plain: await settle(() =>
+        createGitWorktreeWorkspace({
+          repoRoot: plain.repo,
+          workspaceDir: path.join(plain.out, "ws", "s-m1-plain"),
+          sessionId: "s-m1-plain",
+          editablePaths: ["f.txt"],
+          readonlyPaths: [],
+        }),
+      ),
+    }));
+    for (const value of [outcome.create.value, outcome.recover.value, outcome.plain.value]) {
+      if (value !== null) {
+        created.push(value);
+      }
+    }
+    for (const [label, result] of [["create", outcome.create], ["recover", outcome.recover]] as const) {
+      assert.ok(result.error instanceof WorkspaceError, `${label}: expected WorkspaceError, got ${String(result.error)}`);
+      assert.equal(result.error.kind, "invalid_repository", label);
+      assert.equal(result.error.message, "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)", label);
+    }
+    assert.equal(await lstat(path.join(out, "ws", "s-m1-old")).catch(() => null), null, "no worktree is created");
+    assert.equal(await lstat(state.workspaceDir).catch(() => null), null, "no worktree is recovered");
+    assert.equal(outcome.plain.error, null, `a non-promisor repo is unaffected on old git: ${String(outcome.plain.error)}`);
+  } finally {
+    for (const ws of created) {
+      await ws.destroy().catch(() => undefined);
+    }
+  }
+});
+
+test("a repository whose only promisor signal is remote.<name>.partialCloneFilter is gated like any promisor remote: an unprotected git rejects creation and recovery, a protected git creates (MEDIUM-1, P1)", async () => {
+  // git `promisor_remote_config()`: `remote.<ad>.partialclonefilter` anahtarı
+  // TEK BAŞINA remote'u promisor yapar (değerinden bağımsız).
+  const fixture = await buildPlainRepo("p1c-filter-only");
+  await gitOk(fixture.repo, ["config", "remote.origin.partialclonefilter", "blob:none"]);
+  const local = await gitText(fixture.repo, ["config", "--local", "--list"]);
+  assert.ok(local.split("\n").includes("remote.origin.partialclonefilter=blob:none"), "fixture: filter key set");
+  assert.ok(!/promisor|extensions\.partialclone/i.test(local), "fixture: no promisor key, no extensions.partialClone");
+  const input = (sessionId: string): WorkspaceCreateInput => ({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", sessionId),
+    sessionId,
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  });
+
+  // Ayrı dizinler ŞART: sürüm önbelleği `PATH` anahtarlı.
+  const old = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () =>
+    settle(() => createGitWorktreeWorkspace(input("s-p1c-old"))),
+  );
+  if (old.value !== null) {
+    await old.value.destroy().catch(() => undefined);
+  }
+  assert.ok(old.error instanceof WorkspaceError, `expected WorkspaceError, got ${String(old.error)}`);
+  assert.equal(old.error.kind, "invalid_repository");
+  assert.equal(
+    old.error.message,
+    "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+  );
+  assert.equal(await lstat(path.join(fixture.out, "ws", "s-p1c-old")).catch(() => null), null, "no worktree is created");
+
+  const state = await withFakeGitVersion(path.join(fixture.out, "v2.45.1"), "git version 2.45.1", async () => {
+    const modern = await createGitWorktreeWorkspace(input("s-p1c-modern"));
+    const snapshot = await modern.snapshotRecoveryState();
+    await modern.destroy();
+    return snapshot;
+  });
+
+  // Kurtarma da aynı kapıdan geçer (korumasız git → red, worktree geri gelmez).
+  // Aynı 2.43.0 dizini: önbellekteki sürüm de 2.43.0.
+  const recover = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () =>
+    settle(() => restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir })),
+  );
+  if (recover.value !== null) {
+    await recover.value.destroy().catch(() => undefined);
+  }
+  assert.ok(recover.error instanceof WorkspaceError, `recover: expected WorkspaceError, got ${String(recover.error)}`);
+  assert.equal(recover.error.kind, "invalid_repository", "recover");
+  assert.equal(
+    recover.error.message,
+    "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+    "recover",
+  );
+  assert.equal(await lstat(state.workspaceDir).catch(() => null), null, "no worktree is recovered");
+});
+
+test("every promisor form git itself honors is gated on an unprotected git: two-level remote.partialCloneFilter / remote.promisor, empty extensions.partialClone, empty remote.<name>.partialCloneFilter, remote.<name>.promisor as true/yes/1/bare key (MEDIUM-1, P1)", async () => {
+  // Merkez ölçtü (Git 2.50.1, `GIT_NO_LAZY_FETCH` tanımsız, `GIT_TRACE`): bu
+  // biçimlerin HEPSİ eksik nesne okumasında tembel `git fetch` başlatır.
+  // 3 seviyeli `remote.origin.promisor` satırları (filter/extension YOK)
+  // promisor sorgusunun 3 seviyeli yolunu ve `--bool` normalleştirmesini
+  // (`yes`/`1`/çıplak anahtar → true) tek başına sabitler.
+  // `value === null` → çıplak anahtar (`.git/config`'e doğrudan yazılır).
+  const cases: ReadonlyArray<readonly [label: string, key: string, value: string | null]> = [
+    ["two-level remote.partialclonefilter", "remote.partialclonefilter", "blob:none"],
+    ["two-level remote.promisor", "remote.promisor", "true"],
+    ["empty extensions.partialclone", "extensions.partialclone", ""],
+    ["empty remote.origin.partialclonefilter", "remote.origin.partialclonefilter", ""],
+    ["remote.origin.promisor=true", "remote.origin.promisor", "true"],
+    ["remote.origin.promisor=yes", "remote.origin.promisor", "yes"],
+    ["remote.origin.promisor=1", "remote.origin.promisor", "1"],
+    ["bare remote.origin.promisor key", "remote.origin.promisor", null],
+  ];
+  for (const [index, [label, key, value]] of cases.entries()) {
+    const fixture = await buildPlainRepo(`p1c-form-${index}`);
+    if (value === null) {
+      await appendFile(path.join(fixture.repo, ".git", "config"), '[remote "origin"]\n\tpromisor\n');
+    } else {
+      await gitOk(fixture.repo, ["config", key, value]);
+    }
+    const expectedLine = value === null ? key : `${key}=${value}`;
+    const local = (await gitText(fixture.repo, ["config", "--local", "--list"])).split("\n");
+    assert.ok(local.includes(expectedLine), `${label}: fixture key set`);
+    assert.deepEqual(
+      local.filter((line) => line !== expectedLine && /promisor|partialclone/i.test(line)),
+      [],
+      `${label}: fixture has no other promisor signal`,
+    );
+    const sessionId = `s-p1c-form-${index}`;
+    const workspaceDir = path.join(fixture.out, "ws", sessionId);
+    // Her durum kendi dizininde (sürüm önbelleği `PATH` anahtarlı).
+    const result = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () =>
+      settle(() =>
+        createGitWorktreeWorkspace({
+          repoRoot: fixture.repo,
+          workspaceDir,
+          sessionId,
+          editablePaths: ["f.txt"],
+          readonlyPaths: [],
+        }),
+      ),
+    );
+    if (result.value !== null) {
+      await result.value.destroy().catch(() => undefined);
+    }
+    assert.ok(result.error instanceof WorkspaceError, `${label}: expected WorkspaceError, got ${String(result.error)}`);
+    assert.equal(result.error.kind, "invalid_repository", label);
+    assert.equal(
+      result.error.message,
+      "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+      label,
+    );
+    assert.equal(await lstat(workspaceDir).catch(() => null), null, `${label}: no worktree is created`);
   }
 });

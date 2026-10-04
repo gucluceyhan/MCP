@@ -9,7 +9,12 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
+  createPsScanner,
   RuntimeConflictDetector,
   type ProcessInfo,
 } from "../dist/backend/RuntimeConflictDetector.js";
@@ -311,4 +316,100 @@ test("a failing scanner (synchronous throw) also propagates", async () => {
     throw new Error("ps unavailable");
   });
   await assert.rejects(detector.detect(500));
+});
+
+// ── İz 2 inceleme düzeltmeleri (M2 / M3) ─────────────────────────────────
+
+test("M2: macOS framework Python (Python.app/Contents/MacOS/Python) running mlx_lm.server → mlx (measured ps shape)", async () => {
+  // Ölçüldü (Homebrew python@3.13, venv ve doğrudan çağrı): ps komut satırı
+  // venv yolunu DEĞİL framework yürütülebilirini gösterir.
+  const kind = await detectorFor([
+    proc(
+      31726,
+      1,
+      "/opt/homebrew/Cellar/python@3.13/3.13.3/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python -m mlx_lm.server",
+    ),
+  ]).detect(null);
+  assert.equal(kind, "mlx");
+  const official = await detectorFor([
+    proc(42, 1, "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_vlm.server --port 8081"),
+  ]).detect(null);
+  assert.equal(official, "mlx");
+});
+
+test("M2: an interpreter path containing spaces (executable known from ps comm) running mlx_lm.server → mlx", async () => {
+  const exe = "/Users/u/Documents/Yazılımlarım ve Kodlar/.venv/bin/python3";
+  const kind = await detectorFor([
+    { pid: 31936, ppid: 1, command: `${exe} -m mlx_lm.server --port 8080`, executable: exe },
+  ]).detect(null);
+  assert.equal(kind, "mlx");
+  // Aynı boşluklu yol ile Splash runtime biçimi de tanınır.
+  const splash = await detectorFor([
+    { pid: 31937, ppid: 1, command: `${exe} /opt/splash/bin/splash serve`, executable: exe },
+  ]).detect(null);
+  assert.equal(splash, "splash");
+});
+
+test("M2: a spaced-path executable that is NOT an interpreter stays a non-conflict (no false positive)", async () => {
+  const exe = "/Applications/My Editor.app/Contents/MacOS/my editor";
+  const kind = await detectorFor([
+    { pid: 50, ppid: 1, command: `${exe} -m mlx_lm.server notes.txt`, executable: exe },
+    // `executable` komut satırının ÖNEKİ değilse (yarış/uyumsuzluk) ilk token kuralı aynen.
+    { pid: 51, ppid: 1, command: "vim mlx_lm.server", executable: "/usr/bin/python3" },
+  ]).detect(null);
+  assert.equal(kind, "none");
+});
+
+test("M3: the configured runtime's ANCESTORS (uv/uvx launcher) are excluded → none", async () => {
+  const kind = await detectorFor([
+    proc(1, 0, "/sbin/launchd"),
+    proc(400, 1, "uvx splash serve"),
+    proc(500, 400, "python3 /Users/u/.cache/uv/splash serve"),
+  ]).detect(500);
+  assert.equal(kind, "none");
+});
+
+test("M3: sibling subtrees of an ancestor are NOT excluded (a second runtime under the same launcher still conflicts)", async () => {
+  const kind = await detectorFor([
+    proc(1, 0, "/sbin/launchd"),
+    proc(400, 1, "uvx splash serve"),
+    proc(500, 400, "python3 /Users/u/.cache/uv/splash serve"),
+    proc(600, 400, "python3 /Users/u/other/splash serve --port 9000"),
+  ]).detect(500);
+  assert.equal(kind, "splash");
+  // Bir ata zinciri döngüsü (bozuk tablo) sonsuz döngüye girmez.
+  const cyclic = await detectorFor([
+    proc(700, 701, "uvx splash serve"),
+    proc(701, 700, "python3 /x/splash serve"),
+  ]).detect(701);
+  assert.equal(cyclic, "none");
+});
+
+test("M2: the REAL ps scanner reports the spaced interpreter path so the classifier sees mlx (darwin)", { skip: process.platform !== "darwin" }, async (t) => {
+  // Gerçek süreç: boşluklu dizinde `python3` adlı bir symlink (node'a) —
+  // argv: `-e <bekle> -- -m mlx_lm.server`. Komut satırı ilk-token
+  // kuralıyla yorumlayıcıyı GÖREMEZ; `ps -o comm=` (argv[0]) sınırı verir.
+  const root = await mkdtemp(path.join(tmpdir(), "splash-ps-"));
+  const dir = path.join(root, "My Projects", "Yazilimlarim ve Kodlar", "bin");
+  await mkdir(dir, { recursive: true });
+  const exe = path.join(dir, "python3");
+  await symlink(process.execPath, exe);
+  const child = spawn(exe, ["-e", "setTimeout(() => {}, 15000)", "--", "-m", "mlx_lm.server"], { stdio: "ignore" });
+  t.after(async () => {
+    child.kill("SIGKILL");
+    await rm(root, { recursive: true, force: true });
+  });
+  const pid = child.pid;
+  assert.ok(pid !== undefined);
+  const scan = createPsScanner();
+  let entry: ProcessInfo | undefined;
+  for (let i = 0; i < 50 && entry?.command.includes("mlx_lm.server") !== true; i++) {
+    entry = (await scan()).find((p) => p.pid === pid);
+    if (entry?.command.includes("mlx_lm.server") !== true) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  assert.ok(entry !== undefined && entry.command.includes("mlx_lm.server"), "the child must appear in the process table");
+  const only = await new RuntimeConflictDetector(async () => [entry as ProcessInfo]).detect(null);
+  assert.equal(only, "mlx");
 });

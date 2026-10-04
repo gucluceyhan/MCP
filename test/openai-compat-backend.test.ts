@@ -13,9 +13,22 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import http from "node:http";
+import https from "node:https";
 import type { AddressInfo } from "node:net";
-import { OpenAICompatBackend } from "../dist/backend/OpenAICompatBackend.js";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  CONTROL_REQUEST_TIMEOUT_MS,
+  MEASUREMENT_REQUEST_TIMEOUT_MS,
+  OpenAICompatBackend,
+  createNodeHttpTransport,
+  type RuntimeHttpRequest,
+} from "../dist/backend/OpenAICompatBackend.js";
+import { InferenceCoordinator } from "../dist/backend/InferenceCoordinator.js";
+import { INFERENCE_LOCK_DIR } from "../dist/backend/RuntimeLock.js";
 import { BackendError } from "../dist/backend/errors.js";
 import type { InferenceMessage, ReasoningEffort } from "../dist/backend/InferenceBackend.js";
 import type { BackendConfig } from "../dist/config.js";
@@ -1192,4 +1205,402 @@ test("socket destroyed mid-body WITHOUT a client abort rejects invalid_response 
     "invalid_response",
   );
   assert.equal(err.message, "Response from /tokenize was not valid JSON");
+});
+
+// ── İz 2 inceleme düzeltmeleri (H1 / L1 / L3 / L4 / L5) ──────────────────
+
+/**
+ * Node'un yerleşik `fetch`'i (undici) varsayılan Agent'ı `headersTimeout` /
+ * `bodyTimeout` = 300 sn ile kurar (ölçüldü: başlığı 320 sn geciktiren yerel
+ * sunucuda global fetch 300.99 sn'de `UND_ERR_HEADERS_TIMEOUT` ile düştü).
+ * 300 sn beklemek yerine global dispatcher'ı geçici olarak KÜÇÜLTÜLMÜŞ
+ * zaman aşımlı bir Agent'la değiştiririz: adaptörün runtime çağrıları bu
+ * varsayılandan ETKİLENMEMELİDİR (sözleşme: transport zaman aşımı YOK; iptal
+ * yalnız caller'ın sinyali).
+ */
+const UNDICI_GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.1");
+
+async function withShrunkGlobalFetchTimeouts(ms: number, fn: () => Promise<void>): Promise<void> {
+  // Yerleşik undici tembel yüklenir: bir data: isteği global Agent'ı kurar.
+  await (await fetch("data:,warm")).text();
+  const holder = globalThis as unknown as Record<symbol, { constructor: new (o: object) => { close(): Promise<void> } }>;
+  const previous = holder[UNDICI_GLOBAL_DISPATCHER];
+  assert.ok(previous !== undefined, "the built-in fetch must expose its global dispatcher");
+  const Agent = previous.constructor;
+  const shrunk = new Agent({ headersTimeout: ms, bodyTimeout: ms });
+  holder[UNDICI_GLOBAL_DISPATCHER] = shrunk as unknown as (typeof holder)[symbol];
+  try {
+    await fn();
+  } finally {
+    holder[UNDICI_GLOBAL_DISPATCHER] = previous;
+    await shrunk.close();
+  }
+}
+
+/** Başlıkları ya da gövdeyi geciktiren yerel sunucu (H1). */
+async function startDelayingServer(
+  mode: "headers" | "body",
+  delayMs: number,
+  body: unknown,
+): Promise<{ baseUrl: string; close(): Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const payload = JSON.stringify(body);
+      if (mode === "headers") {
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(payload);
+        }, delayMs);
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.flushHeaders();
+        setTimeout(() => res.end(payload), delayMs);
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const { port } = server.address() as AddressInfo;
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+  };
+}
+
+test("H1: a generation that withholds the response headers longer than the fetch default still completes (no transport timeout)", async (t) => {
+  // undici zaman aşımları ~1 sn çözünürlüklü "fast timer" kullanır (ölçüldü:
+  // 100 ms'ye küçültülmüş tavan ~1005 ms'de tetiklendi) — gecikme bunun üstünde.
+  const server = await startDelayingServer("headers", 2_000, CHAT_OK);
+  t.after(() => server.close());
+  await withShrunkGlobalFetchTimeouts(100, async () => {
+    // Kontrol (LOW-6): küçültülmüş tavan GERÇEKTEN etkin — ham fetch düşer;
+    // aksi hâlde aşağıdaki başarı hiçbir şey kanıtlamazdı.
+    await assert.rejects(
+      fetch(`${server.baseUrl}/v1/chat/completions`, { method: "POST", body: "{}" }),
+      (err: unknown) => (err as { cause?: { code?: string } }).cause?.code === "UND_ERR_HEADERS_TIMEOUT",
+    );
+    const backend = new OpenAICompatBackend(makeConfig(server.baseUrl));
+    const result = await backend.run(MESSAGES);
+    assert.equal(result.content, "TAMAM");
+  });
+});
+
+test("H1: a response body that arrives later than the fetch body default still completes (no transport timeout)", async (t) => {
+  const server = await startDelayingServer("body", 2_000, { tokens: [1, 2, 3] });
+  t.after(() => server.close());
+  await withShrunkGlobalFetchTimeouts(100, async () => {
+    // Kontrol (LOW-6): ham fetch'in gövde okuması küçültülmüş tavanda düşer.
+    const raw = await fetch(`${server.baseUrl}/tokenize`, { method: "POST", body: "{}" });
+    await assert.rejects(raw.text(), (err: unknown) => {
+      const e = err as { code?: string; cause?: { code?: string } };
+      return e.code === "UND_ERR_BODY_TIMEOUT" || e.cause?.code === "UND_ERR_BODY_TIMEOUT";
+    });
+    const backend = new OpenAICompatBackend(makeConfig(server.baseUrl));
+    const result = await backend.tokenize("hello");
+    assert.equal(result.count, 3);
+  });
+});
+
+test("H1: an injected transport's timeout error maps to an honest 'timed out' network message; cause carries only the code", async () => {
+  for (const code of ["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "ETIMEDOUT"]) {
+    // fetch tarzı sarmalama: TypeError("fetch failed") + cause.code
+    const wrapped = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("Headers Timeout Error"), { code }),
+    });
+    const backend = new OpenAICompatBackend(makeConfig("http://127.0.0.1:9"), {
+      transport: async () => {
+        throw wrapped;
+      },
+    });
+    const err = await expectBackendError(backend.run(MESSAGES), "network");
+    assert.equal(err.message, "Timed out waiting for the inference runtime (/v1/chat/completions)", code);
+    assert.equal(err.cause, code);
+  }
+  // Gövde okuması SIRASINDA zaman aşımı da dürüst mesaj (boş gövde → "invalid JSON" DEĞİL).
+  const backend = new OpenAICompatBackend(makeConfig("http://127.0.0.1:9"), {
+    transport: async () => ({
+      status: 200,
+      text: async () => {
+        throw Object.assign(new Error("Body Timeout Error"), { code: "UND_ERR_BODY_TIMEOUT" });
+      },
+    }),
+  });
+  const err = await expectBackendError(backend.tokenize("x"), "network");
+  assert.equal(err.message, "Timed out waiting for the inference runtime (/tokenize)");
+  assert.equal(err.cause, "UND_ERR_BODY_TIMEOUT");
+});
+
+test("H1: the injected transport receives the exact request (url, method, headers, body, signal)", async () => {
+  const seen: Array<{ url: string; method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }> = [];
+  const controller = new AbortController();
+  const backend = new OpenAICompatBackend(makeConfig("http://127.0.0.1:9", "k-1"), {
+    transport: async (request) => {
+      seen.push({ ...request, url: request.url.href });
+      return { status: 200, text: async () => JSON.stringify({ tokens: [7] }) };
+    },
+  });
+  const result = await backend.tokenize("abc", { signal: controller.signal });
+  assert.equal(result.count, 1);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]?.url, "http://127.0.0.1:9/tokenize");
+  assert.equal(seen[0]?.method, "POST");
+  assert.equal(seen[0]?.headers["authorization"], "Bearer k-1");
+  assert.equal(seen[0]?.headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(seen[0]?.body ?? "null"), { content: "abc", add_special: false });
+  assert.equal(seen[0]?.signal, controller.signal);
+});
+
+test("L4: a 307/308 redirect is NOT followed — the prompt never reaches another origin; typed http error", async (t) => {
+  const captured: string[] = [];
+  const other = await startMockRuntime((req) => {
+    captured.push(req.body);
+    return { status: 200, body: CHAT_OK };
+  });
+  t.after(() => other.close());
+  for (const status of [307, 308]) {
+    const redirecting = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(status, { location: `${other.baseUrl}/v1/chat/completions` });
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => redirecting.listen(0, "127.0.0.1", () => resolve()));
+    const { port } = redirecting.address() as AddressInfo;
+    try {
+      const backend = new OpenAICompatBackend(makeConfig(`http://127.0.0.1:${port}`, "k-redirect"));
+      await expectBackendError(backend.run(MESSAGES), "http", status);
+    } finally {
+      await new Promise<void>((resolve) => {
+        redirecting.close(() => resolve());
+        redirecting.closeAllConnections();
+      });
+    }
+  }
+  assert.deepEqual(captured, [], "the redirect target must never receive the prompt");
+});
+
+test("L4: a response body larger than the cap is rejected (2xx → invalid_response; non-2xx → http without detail)", async (t) => {
+  const big = { tokens: Array.from({ length: 2_000 }, (_, i) => i) };
+  const mock = await startMockRuntime((req) =>
+    req.path === "/tokenize"
+      ? { status: 200, body: big }
+      : { status: 500, body: { error: { message: "x".repeat(4_000) } } },
+  );
+  t.after(() => mock.close());
+  const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl), { maxResponseBytes: 1_024 });
+  const err = await expectBackendError(backend.tokenize("x"), "invalid_response");
+  assert.equal(err.message, "Response from /tokenize exceeded the size limit");
+  assert.equal(err.cause, undefined);
+  const httpErr = await expectBackendError(backend.renderPrompt(MESSAGES), "http", 500);
+  assert.equal(httpErr.cause, undefined, "an oversized error body yields no detail");
+  // Varsayılan tavan aynı yanıtları kabul eder (yalnız sınır aşımı reddedilir).
+  const roomy = new OpenAICompatBackend(makeConfig(mock.baseUrl));
+  assert.equal((await roomy.tokenize("x")).count, 2_000);
+});
+
+test("L1: finish_reason 'length' is a typed output_truncated error — never a normal result or 'invalid JSON'", async (t) => {
+  const truncated = (content: unknown) => ({
+    ...CHAT_OK,
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "length" }],
+  });
+  let next: unknown = truncated('{"schema_version":1,"summary":"half');
+  const mock = await startMockRuntime(() => ({ status: 200, body: next }));
+  t.after(() => mock.close());
+  const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl));
+  const err = await expectBackendError(backend.run(MESSAGES), "output_truncated");
+  assert.equal(
+    err.message,
+    "Inference output budget exhausted before the response completed (/v1/chat/completions)",
+  );
+  // Tüm bütçeyi reasoning tüketti (content null) — aynı dürüst tür.
+  next = truncated(null);
+  await expectBackendError(backend.run(MESSAGES), "output_truncated");
+  // finish_reason 'stop' aynen normal sonuç.
+  next = CHAT_OK;
+  assert.equal((await backend.run(MESSAGES)).content, "TAMAM");
+});
+
+test("L3: /status instance.pid must be a safe integer > 1 (pid 1 would exclude the whole host from the conflict scan)", async (t) => {
+  let pid: unknown = 1;
+  const mock = await startMockRuntime((req) =>
+    req.path === "/status"
+      ? { status: 200, body: { ...STATUS_OK, instance: { pid } } }
+      : { status: 200, body: MODELS_OK },
+  );
+  t.after(() => mock.close());
+  const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl));
+  for (const bad of [1, 2 ** 53, 2 ** 53 + 2]) {
+    pid = bad;
+    const info = await backend.refreshRuntimeInfo();
+    assert.equal(Object.hasOwn(info, "runtimeProcessId"), false, `pid ${bad} must not be trusted`);
+  }
+  pid = 2;
+  assert.equal((await backend.refreshRuntimeInfo()).runtimeProcessId, 2);
+});
+
+test("L5: a network failure's cause carries only the error code (never the raw error object)", async () => {
+  const port = await closedPort();
+  const backend = new OpenAICompatBackend(makeConfig(`http://127.0.0.1:${port}`));
+  const err = await expectBackendError(backend.run(MESSAGES), "network");
+  assert.equal(err.cause, "ECONNREFUSED");
+});
+
+test("L5: an API key with CR/LF never leaks into message, cause or stack (directly built config)", async (t) => {
+  const mock = await startMockRuntime(() => ({ status: 200, body: CHAT_OK }));
+  t.after(() => mock.close());
+  const KEY = "LEAKYKEY-123\r\nX-Injected: yes";
+  const backend = new OpenAICompatBackend(makeConfig(mock.baseUrl, KEY));
+  let caught: unknown;
+  try {
+    await backend.run(MESSAGES);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof BackendError, "an invalid header value must reject typed");
+  assert.equal(caught.kind, "invalid_request", "rejected before the wire — honest kind, not 'could not reach'");
+  const surface = `${caught.message}|${String(caught.cause)}|${caught.stack ?? ""}|${JSON.stringify(caught.cause ?? null)}`;
+  assert.ok(!surface.includes("LEAKYKEY"), "the key must not appear anywhere on the error");
+  assert.equal(mock.requests.length, 0, "a header-injection attempt must never reach the wire");
+});
+
+// ── İz 2 audit düzeltmeleri (MEDIUM-1 / LOW-7) ───────────────────────────
+
+test("MEDIUM-1: control/measurement calls carry a bounded timeout; ONLY generation is unbounded", async () => {
+  const seen = new Map<string, RuntimeHttpRequest>();
+  const backend = new OpenAICompatBackend(makeConfig("http://127.0.0.1:9"), {
+    transport: async (request) => {
+      seen.set(request.url.pathname, request);
+      const body =
+        request.url.pathname === "/status"
+          ? STATUS_OK
+          : request.url.pathname === "/v1/models"
+            ? MODELS_OK
+            : request.url.pathname === "/tokenize"
+              ? { tokens: [1] }
+              : request.url.pathname === "/apply-template"
+                ? { prompt: "p" }
+                : CHAT_OK;
+      return { status: 200, text: async () => JSON.stringify(body) };
+    },
+  });
+  await backend.refreshRuntimeInfo();
+  await backend.countPromptTokens(MESSAGES);
+  await backend.run(MESSAGES);
+  assert.equal(CONTROL_REQUEST_TIMEOUT_MS, 60_000);
+  assert.equal(MEASUREMENT_REQUEST_TIMEOUT_MS, 300_000);
+  assert.equal(seen.get("/status")?.timeoutMs, 60_000);
+  assert.equal(seen.get("/v1/models")?.timeoutMs, 60_000);
+  assert.equal(seen.get("/apply-template")?.timeoutMs, 300_000);
+  assert.equal(seen.get("/tokenize")?.timeoutMs, 300_000);
+  const chat = seen.get("/v1/chat/completions");
+  assert.ok(chat !== undefined);
+  assert.equal(Object.hasOwn(chat, "timeoutMs"), false, "generation has no timeout at all");
+});
+
+test("MEDIUM-1: the node transport honours timeoutMs while waiting for headers AND while the body idles (ETIMEDOUT)", async (t) => {
+  const headers = await startDelayingServer("headers", 2_000, { ok: true });
+  const body = await startDelayingServer("body", 2_000, { ok: true });
+  t.after(() => Promise.all([headers.close(), body.close()]));
+  const transport = createNodeHttpTransport();
+
+  const started = Date.now();
+  await assert.rejects(
+    transport({ url: new URL(`${headers.baseUrl}/status`), method: "GET", headers: {}, timeoutMs: 150 }),
+    (err: unknown) => (err as { code?: string }).code === "ETIMEDOUT",
+  );
+  assert.ok(Date.now() - started < 1_500, "the timeout fires long before the delayed headers");
+
+  const response = await transport({ url: new URL(`${body.baseUrl}/status`), method: "GET", headers: {}, timeoutMs: 150 });
+  assert.equal(response.status, 200);
+  await assert.rejects(response.text(1_024), (err: unknown) => (err as { code?: string }).code === "ETIMEDOUT");
+});
+
+test("MEDIUM-1: a hung runtime /status inside dispatch → honest 'Timed out' and the coordinator lock is released", async (t) => {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      if (req.url === "/status") {
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ...STATUS_OK, instance: { pid: 4242 } }));
+        }, 2_000);
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.url === "/v1/models" ? MODELS_OK : CHAT_OK));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  t.after(
+    () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+  );
+  const { port } = server.address() as AddressInfo;
+  const root = await mkdtemp(path.join(tmpdir(), "splash-m1-timeout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtimeDir = path.join(root, "runtime");
+  const backend = new OpenAICompatBackend(makeConfig(`http://127.0.0.1:${port}`), {
+    requestTimeoutsMs: { control: 150, measurement: 150 },
+  });
+  const coordinator = new InferenceCoordinator({
+    backend,
+    runtimeDir,
+    scanner: async () => [{ pid: 4242, ppid: 1, command: "splash serve" }],
+  });
+
+  const err = await expectBackendError(
+    coordinator.dispatch({ ownerId: "s-1", messages: MESSAGES }),
+    "network",
+  );
+  assert.equal(err.message, "Timed out waiting for the inference runtime (/status)");
+  assert.equal(err.cause, "ETIMEDOUT");
+  await assert.rejects(stat(path.join(runtimeDir, INFERENCE_LOCK_DIR)), { code: "ENOENT" });
+  assert.equal(coordinator.activeOwnerId, null);
+});
+
+test("LOW-7: aborting while waiting for the response headers (real transport) rejects promptly as network/aborted", async (t) => {
+  const server = await startDelayingServer("headers", 2_000, CHAT_OK);
+  t.after(() => server.close());
+  const controller = new AbortController();
+  const backend = new OpenAICompatBackend(makeConfig(server.baseUrl));
+  const started = Date.now();
+  const pending = backend.run(MESSAGES, { signal: controller.signal });
+  setTimeout(() => controller.abort(), 50);
+  const err = await expectBackendError(pending, "network");
+  assert.equal(err.message, "Request aborted (/v1/chat/completions)");
+  assert.ok(Date.now() - started < 1_500, "the abort is not delayed until the headers arrive");
+});
+
+test("LOW-7: an https base URL uses TLS; a self-signed runtime certificate is rejected with only the error code as cause", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "splash-tls-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const keyPath = path.join(dir, "key.pem");
+  const certPath = path.join(dir, "cert.pem");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyPath, "-out", certPath, "-days", "1", "-subj", "/CN=127.0.0.1"], { stdio: "ignore" });
+  const server = https.createServer({ key: await readFile(keyPath), cert: await readFile(certPath) }, (req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(STATUS_OK));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  t.after(
+    () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+  );
+  const { port } = server.address() as AddressInfo;
+  const backend = new OpenAICompatBackend(makeConfig(`https://127.0.0.1:${port}`, "k-tls"));
+  const err = await expectBackendError(backend.refreshRuntimeInfo(), "network");
+  assert.equal(err.message, "Could not reach the inference runtime (/status)");
+  assert.equal(err.cause, "DEPTH_ZERO_SELF_SIGNED_CERT");
 });
