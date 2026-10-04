@@ -732,9 +732,11 @@ create(task):
      delta is captured and again after the base commit — a difference
      fails creation; before staging, each editable file is reconciled
      with the first read: a local change Git hides — assume-unchanged /
-     skip-worktree — is copied from the main file (bytes; mode always
-     mirrored), an existence/type/link-target mismatch — e.g. sparse —
-     fails creation)
+     skip-worktree — is copied from the main file (bytes; the mode is
+     always mirrored onto the worktree file AND, after staging, onto the
+     base commit's index entry — with core.fileMode=false `git add` keeps
+     the old index mode), an existence/type/link-target mismatch — e.g.
+     sparse — fails creation)
   → HEAD of <wsDir> is now the BASE (== the exact main working-tree state
     visible to Claude Code at session start)
   → the BASE IS IMMUTABLE from here on (Section 7.5)
@@ -900,8 +902,17 @@ differ) the main bytes are copied into the base, so the worker edits what
 Claude Code sees and the patch applies to it; mere normalization
 (`text=auto` CRLF; equal blob ids) leaves the base bytes as Git wrote them.
 Mode, independently of content: the base mode is set to the main file's
-mode (a hidden `chmod`, `core.fileMode=false`), so the exported patch
-carries the main mode. Any deviation is accepted only if a fresh main read
+mode (a hidden `chmod`, `core.fileMode=false`) — on the worktree file and,
+after staging, on the base commit's index entry (`git update-index
+--chmod=±x`: with `core.fileMode=false`, `git add` keeps the previous index
+mode and a new entry defaults to 100644; the index is re-read and a
+remaining mismatch fails creation). So the base commit, the fingerprint and
+the exported patch all carry the main mode, and `git apply` keeps it on the
+main file (Git ≥ 2.44; older Git warns and writes 100644 under
+`core.fileMode=false`. Measured, Apple Git 2.50.1: with
+`core.fileMode=false` a patch carrying the HEAD mode silently changed the
+main file's executable bit). Any
+deviation is accepted only if a fresh main read
 still equals the reference; otherwise the main tree changed during capture
 (`workspace_operation_failed`) — an intermediate state never enters the
 base. The reference is persisted as
@@ -919,8 +930,9 @@ validation is the worktree file's bytes (an edit copied from what the
 worker saw round-trips exactly; a normalized LF search against a CRLF base
 is rejected deterministically); the transient base commit stays the
 diff/reset/export base. `text`/`eol` normalization can make the blob and
-the working file differ (CRLF vs. LF); when a round's `git reset --hard`
-rewrites an editable file in normalized form, Splash writes the captured
+the working file differ (CRLF vs. LF); when any `git reset --hard` (round
+start, failed-apply rollback, `resetToBase`) rewrites an editable file in
+normalized form, Splash writes the captured
 base bytes back (pure fs, same symlink/ancestor checks as the attribute
 restore) and re-records the file in the index (stat only — so even
 `diff.autoRefreshIndex=false` reports no phantom change), so the worker's

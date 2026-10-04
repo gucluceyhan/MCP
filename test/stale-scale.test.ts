@@ -36,6 +36,7 @@ import type { SplashConfig } from "../dist/config.js";
 import { createGitWorktreeWorkspace, setLiveCaptureSeams, setWorkspaceFs } from "../dist/workspace/GitWorktreeWorkspace.js";
 import { noFollowReadFile } from "../dist/workspace/SafeRepoReader.js";
 import { WorkspaceError, type Workspace, type WorkspaceCreateInput } from "../dist/workspace/Workspace.js";
+import type { WorkerEdit } from "../dist/worker/result.js";
 
 const GIT_ENV_KEYS = [
   "GIT_CONFIG_NOSYSTEM",
@@ -135,8 +136,10 @@ class FakeBackend implements InferenceBackend {
   async renderPrompt(): Promise<never> {
     throw new Error("renderPrompt must not be called");
   }
+  /** İstem token sayısı — dev bir değer turu `needs_split`'e düşürür (tur-0 oturumu). */
+  promptTokens = 1_000;
   async countPromptTokens(): Promise<number> {
-    return 1_000;
+    return this.promptTokens;
   }
 }
 
@@ -792,4 +795,243 @@ test("İz5 LOW-2 (ölçüldü → düzeltildi): diff.autoRefreshIndex=false — 
   assert.deepEqual(round2.filesChanged, ["src/new.ts"]);
   assert.deepEqual(round2.diffStats, { files: 1, insertions: 1, deletions: 1 });
   assert.equal(await readFile(path.join(fixture.root, "ws/src/other.ts"), "utf8"), "const other = 1;\r\n", "restored to base bytes");
+});
+
+// ── Codex P1 (PR #40): uzlaştırılmış mod base commit'e de yazılır ────────────
+//
+// `core.fileMode=false` iken `add -A` index modunu KORUR: uzlaştırma worktree
+// dosyasını ana moda aynalasa bile base commit HEAD modunu taşıyordu → export
+// patch'i (`index … <HEAD modu>`) ana dosyaya `git apply` ile uygulanınca exec
+// biti SESSİZCE değişiyordu (ölçüldü, Apple Git 2.50.1: uyarı YOK).
+// `fileMode=true` kolu regresyon korumasıdır (delta modu zaten taşır).
+//
+// Base ağacı / parmak izi / patch `index … <mod>` SÖZLEŞMEDİR (koşulsuz). Düz
+// `git apply`'ın `core.fileMode=false`'ta modu patch'ten alması Git 2.44'ten
+// itibarendir (`check_preimage`, cp/apply-core-filemode 0482c32c); öncesi
+// uyarı verip 100644 yazar → o kolun stderr/mod iddiaları sürüme bağlı.
+
+/** `git --version` ≥ 2.44 mü (düz `git apply` fileMode=false'ta patch modunu korur)? */
+function gitApplyRespectsFileMode(): boolean {
+  const match = /git version (\d+)\.(\d+)/.exec(execFileSync("git", ["--version"]).toString("utf8"));
+  if (match === null) {
+    return false;
+  }
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 2 || (major === 2 && minor >= 44);
+}
+
+for (const fileMode of ["false", "true"] as const) {
+  for (const direction of ["+x", "-x"] as const) {
+    const label = direction === "+x" ? "main 0755 / HEAD 100644" : "main 0644 / HEAD 100755";
+    test(`İz5 Codex P1: core.fileMode=${fileMode}, ${label} — base commit + export patch carry the MAIN mode; git apply on a copy keeps it`, async (t) => {
+      const fixture = await makeFixture(t);
+      const file = path.join(fixture.repoRoot, "src/a.ts");
+      const mainMode = direction === "+x" ? "100755" : "100644";
+      if (direction === "-x") {
+        await chmod(file, 0o755);
+        git(fixture.repoRoot, "update-index", "--chmod=+x", "src/a.ts");
+        git(fixture.repoRoot, "commit", "-m", "exec");
+      }
+      git(fixture.repoRoot, "config", "core.fileMode", fileMode);
+      await chmod(file, direction === "+x" ? 0o755 : 0o644);
+      if (fileMode === "false") {
+        assert.equal(git(fixture.repoRoot, "status", "--porcelain"), "", "git hides the mode change");
+      }
+
+      // (a/d) base commit'in ağacı ana modu taşır.
+      const ws = await createGitWorktreeWorkspace({
+        repoRoot: fixture.repoRoot,
+        workspaceDir: path.join(fixture.root, "ws-mode"),
+        sessionId: "mode-p1",
+        editablePaths: ["src/a.ts"],
+      });
+      const treeMode = git(ws.workspaceDir, "ls-tree", ws.baseCommit, "--", "src/a.ts").split(" ")[0];
+      const entry = ws.readBaseEntry("src/a.ts");
+      await ws.destroy();
+      assert.equal(treeMode, mainMode, "base commit records the main mode");
+      assert.ok(entry.exists && entry.type === "file");
+      assert.equal(entry.mode, mainMode, "fingerprint and base commit agree");
+
+      // (b) export patch'i aynı config'li kopyada uygulanınca ana mod KALIR.
+      const result = await taskRefineClose(t, fixture, "src/a.ts");
+      assertFreshChain(result);
+      const patchPath = result.close.patch_path as string;
+      const patch = await readFile(patchPath, "utf8");
+      assert.match(patch, new RegExp(`^index [0-9a-f]+\\.\\.[0-9a-f]+ ${mainMode}$`, "m"), "patch records the main mode");
+      const copy = path.join(fixture.root, "copy");
+      await cp(fixture.repoRoot, copy, { recursive: true, verbatimSymlinks: true });
+      assert.equal(git(copy, "config", "core.fileMode").trim(), fileMode);
+      const applied = spawnSync("git", ["apply", patchPath], { cwd: copy, encoding: "utf8" });
+      t.diagnostic(`git apply exit=${applied.status} stderr=${JSON.stringify(applied.stderr)}`);
+      assert.equal(applied.status, 0);
+      const copyExec = ((await lstat(path.join(copy, "src/a.ts"))).mode & 0o100) !== 0;
+      if (fileMode === "true" || gitApplyRespectsFileMode()) {
+        assert.equal(applied.stderr, "", "no mode mismatch warning");
+        assert.equal(copyExec, direction === "+x", "main mode (exec bit) survives git apply");
+      } else {
+        t.diagnostic(`Git < 2.44: plain git apply ignores the patch mode under core.fileMode=false (exec=${copyExec}) — not asserted`);
+      }
+      assert.equal(await readFile(path.join(copy, "src/a.ts"), "utf8"), "const value = 3;\nconst tail = 0;\n");
+    });
+  }
+}
+
+test("İz5 Codex P1: core.fileMode=false + UNTRACKED 0755 editable — base commit records 100755 (a new index entry defaults to 100644)", async (t) => {
+  const fixture = await makeFixture(t);
+  git(fixture.repoRoot, "config", "core.fileMode", "false");
+  await writeFile(path.join(fixture.repoRoot, "src/run.sh"), "#!/bin/sh\necho 1\n", { mode: 0o755 });
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repoRoot,
+    workspaceDir: path.join(fixture.root, "ws-untracked"),
+    sessionId: "mode-untracked",
+    editablePaths: ["src/run.sh"],
+  });
+  t.after(() => ws.destroy().catch(() => undefined));
+  assert.equal(git(ws.workspaceDir, "ls-tree", ws.baseCommit, "--", "src/run.sh").split(" ")[0], "100755");
+  const entry = ws.readBaseEntry("src/run.sh");
+  assert.ok(entry.exists && entry.type === "file");
+  assert.equal(entry.mode, "100755");
+});
+
+test("İz5 Codex P1: core.fileMode=false + main 0755 / HEAD 100644 — a worktree re-created after restart keeps 0755; recovery verifies; close patch carries 100755", async (t) => {
+  const fixture = await makeFixture(t);
+  git(fixture.repoRoot, "config", "core.fileMode", "false");
+  await chmod(path.join(fixture.repoRoot, "src/a.ts"), 0o755);
+  const rt = await makeRuntime(t, fixture);
+  rt.backend.runBehavior = modify("src/a.ts", "const value = 1;", "const value = 2;");
+  const task = await call(rt, "splash_task", { task: "Change the value", files: ["src/a.ts"] });
+  assert.equal(task.json.status, "applied", JSON.stringify(task.json));
+  const sessionId = task.json.session_id as string;
+  await rt.runtime.dispose();
+  // Worktree dizini git DIŞINDA silinir → kurtarma base commit'ten yeniden kurar.
+  const wsDir = path.join(fixture.sessionsDir, sessionId, "workspace");
+  await rm(wsDir, { recursive: true, force: true });
+
+  const rt2 = await makeRuntime(t, fixture);
+  rt2.backend.runBehavior = modify("src/a.ts", "const value = 1;", "const value = 3;");
+  const refine = await call(rt2, "splash_refine", { session_id: sessionId, feedback: "again" });
+  assert.equal(refine.isError, false, JSON.stringify(refine.json));
+  assert.equal(refine.json.status, "applied", JSON.stringify(refine.json));
+  assert.equal(refine.json.base_status, "fresh");
+  assert.notEqual((await lstat(path.join(wsDir, "src/a.ts"))).mode & 0o100, 0, "re-created worktree file keeps the main mode (exec bit)");
+  const close = await call(rt2, "splash_close", { session_id: sessionId });
+  assert.equal(close.isError, false, JSON.stringify(close.json));
+  const patch = await readFile(close.json.patch_path as string, "utf8");
+  assert.match(patch, /^index [0-9a-f]+\.\.[0-9a-f]+ 100755$/m);
+});
+
+// ── Codex P2 (PR #40): W-M6 geri yüklemesi HER reset yolunda ─────────────────
+//
+// Normalize edilmiş (text=auto) untracked CRLF editable: `reset --hard` blob'tan
+// LF yazar. Geri yükleme yalnız tur başı reset'inden sonra koşuyordu; apply
+// rollback'i ve `resetToBase()` dosyayı LF bırakıyordu (worker'ın gördüğü taban
+// CRLF).
+
+const CRLF_BASE = "const value = 1;\r\nconst tail = 0;\r\n";
+
+async function crlfUntrackedFixture(t: TestContext): Promise<Fixture> {
+  const fixture = await makeFixture(t);
+  await writeFile(path.join(fixture.repoRoot, ".gitattributes"), "* text=auto\n");
+  git(fixture.repoRoot, "add", ".gitattributes");
+  git(fixture.repoRoot, "commit", "-m", "attrs");
+  await writeFile(path.join(fixture.repoRoot, "src/new.ts"), CRLF_BASE);
+  return fixture;
+}
+
+/** Repo config'inde komutlu dış filter (apply sonrası re-check'i tetikler); script çalışırsa marker oluşur. */
+async function defineEvilFilter(fixture: Fixture): Promise<string> {
+  const marker = path.join(fixture.root, "filter-ran");
+  const script = path.join(fixture.root, "evil-clean.sh");
+  await writeFile(script, `#!/bin/sh\ntouch "${marker}"\ncat\n`, { mode: 0o755 });
+  git(fixture.repoRoot, "config", "filter.evil.clean", script);
+  return marker;
+}
+
+/** src/new.ts'i değiştirir + filter'lı `.gitattributes` oluşturur → yazım SONRASI re-check reddi. */
+const FAILING_EDITS: WorkerEdit[] = [
+  { kind: "modify", path: "src/new.ts", operations: [{ search: "const value = 1;", replace: "const value = 22;" }] },
+  { kind: "create", path: "src/.gitattributes", content: "* filter=evil\n" },
+];
+
+test("İz5 Codex P2: resetToBase restores the normalized (CRLF) base bytes of an untracked editable", async (t) => {
+  const fixture = await crlfUntrackedFixture(t);
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repoRoot,
+    workspaceDir: path.join(fixture.root, "ws"),
+    sessionId: "reset-1",
+    editablePaths: ["src/new.ts"],
+  });
+  t.after(() => ws.destroy().catch(() => undefined));
+  const wsFile = path.join(ws.workspaceDir, "src/new.ts");
+  const hashAtBase = await ws.recoveryStateHash();
+  await ws.applyPatchSet({
+    schemaVersion: 1,
+    summary: "Edit.",
+    edits: [{ kind: "modify", path: "src/new.ts", operations: [{ search: "const value = 1;", replace: "const value = 22;" }] }],
+  });
+  assert.equal(await readFile(wsFile, "utf8"), "const value = 22;\r\nconst tail = 0;\r\n");
+
+  await ws.resetToBase();
+  assert.equal(await readFile(wsFile, "utf8"), CRLF_BASE, "resetToBase leaves the base bytes the worker saw");
+  assert.equal(await ws.recoveryStateHash(), hashAtBase);
+  assert.equal(git(ws.workspaceDir, "diff", "--name-only", ws.baseCommit), "", "restored file is not reported as changed");
+});
+
+test("İz5 Codex P2: a failed apply (filter re-check after the write) rolls back to the normalized (CRLF) base bytes", async (t) => {
+  const fixture = await crlfUntrackedFixture(t);
+  const marker = await defineEvilFilter(fixture);
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repoRoot,
+    workspaceDir: path.join(fixture.root, "ws"),
+    sessionId: "rollback-1",
+    editablePaths: ["src/new.ts"],
+  });
+  t.after(() => ws.destroy().catch(() => undefined));
+  const wsFile = path.join(ws.workspaceDir, "src/new.ts");
+
+  await assert.rejects(
+    ws.applyPatchSet({ schemaVersion: 1, summary: "Edit.", edits: FAILING_EDITS }),
+    (e: unknown) => e instanceof WorkspaceError && e.kind === "invalid_repository",
+  );
+  assert.equal(await readFile(wsFile, "utf8"), CRLF_BASE, "rollback leaves the base bytes the worker saw");
+  assert.equal(existsSync(path.join(ws.workspaceDir, "src/.gitattributes")), false, "worker-created attribute file removed");
+  assert.equal(existsSync(marker), false, "the external filter never runs");
+});
+
+test("İz5 Codex P2 (uçtan uca): round-0 (needs_split) session + untracked CRLF editable — a refine failing after the write keeps the session (no session_recovery_failed), bytes stay CRLF, diff/close succeed", async (t) => {
+  const fixture = await crlfUntrackedFixture(t);
+  const marker = await defineEvilFilter(fixture);
+  const rt = await makeRuntime(t, fixture);
+  rt.backend.promptTokens = 999_999_999;
+  rt.backend.runBehavior = async () => {
+    throw new Error("inference must not run for needs_split");
+  };
+  const task = await call(rt, "splash_task", { task: "Change the value", files: ["src/new.ts"] });
+  assert.equal(task.isError, false, JSON.stringify(task.json));
+  assert.equal(task.json.status, "needs_split", JSON.stringify(task.json));
+  const sessionId = task.json.session_id as string;
+  const wsFile = path.join(fixture.sessionsDir, sessionId, "workspace/src/new.ts");
+  assert.equal(await readFile(wsFile, "utf8"), CRLF_BASE);
+
+  rt.backend.promptTokens = 1_000;
+  rt.backend.runBehavior = async () => ({
+    content: JSON.stringify({ schema_version: 1, summary: "Edit.", edits: FAILING_EDITS }),
+    usage: { inputTokens: 10, outputTokens: 5 },
+  });
+  const refine = await call(rt, "splash_refine", { session_id: sessionId, feedback: "implement it now" });
+  t.diagnostic(`refine → ${JSON.stringify(refine.json)}`);
+  assert.equal(refine.isError, true);
+  assert.notEqual(refine.json.kind, "session_recovery_failed", "round-0 restore (resetToBase) verifies the committed state");
+  assert.equal(refine.json.kind, "invalid_repository");
+  assert.equal(await readFile(wsFile, "utf8"), CRLF_BASE, "workspace is back on the base bytes");
+  assert.equal(existsSync(marker), false, "the external filter never runs");
+
+  const diff = await call(rt, "splash_diff", { session_id: sessionId, stat: true });
+  assert.equal(diff.isError, false, JSON.stringify(diff.json));
+  assert.deepEqual(diff.json.diff_stats, { files: 0, insertions: 0, deletions: 0 });
+  const close = await call(rt, "splash_close", { session_id: sessionId });
+  assert.equal(close.isError, false, JSON.stringify(close.json));
+  assert.equal(close.json.base_status, "fresh");
+  assert.deepEqual(close.json.files_changed, []);
 });
