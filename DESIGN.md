@@ -1,6 +1,6 @@
 # Splash — Architecture & Design (v2)
 
-Status: **Steps 1–8 implemented; rest design-only.**
+Status: **Steps 1–9 implemented; rest design-only.**
 
 Purpose: let a frontier orchestrator (Claude Code, OpenAI Codex) delegate
 *implementation* work to a **local LLM worker** to **significantly reduce
@@ -171,12 +171,14 @@ Seven components. Deliberately few; each is small.
   through the **canonical path-safety boundary** (the same
   `normalizeRepoPath` vocabulary as the Workspace): `.git` (case-insensitive),
   traversal (`..`), absolute / backslash / NUL paths are rejected
-  (`unsafe_path`), alias paths are deduplicated, and uncertain I/O (root
-  `realpath`, ancestor `lstat`) fails closed — so no private repo metadata can
-  leak into the context. (Known residual: the check-then-`readFile` chain is
-  not atomic, so an *active concurrent local writer* racing the read could in
-  principle swap a path for a symlink; a static hostile repo is fully covered.
-  This is latent in v1, which feeds no read-only paths.)
+   (`unsafe_path`), alias paths are deduplicated, and uncertain I/O (root
+   `realpath`, ancestor `lstat`) fails closed — so no private repo metadata can
+   leak into the context. The Step 8 residual regular-file leaf race is resolved
+   for content reads: production uses a shared `open(O_RDONLY | O_NOFOLLOW)`
+   handle, `fstat`s that same handle, and reads from it, so a final-component
+   symlink swap cannot redirect a regular-file read. Other filesystem races
+   remain subject to normal fail-closed handling; no broader no-race claim is
+   made.
 - Input: the file paths the orchestrator chose (Section 5) + the **resolved
   rules** (Section 6: a session-supplied payload, or — as fallback —
   `CLAUDE.md` / `AGENTS.md` read from the repo root; this read is the
@@ -1161,22 +1163,21 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
        only — the exact workspace files, no repository crawl, no adaptive
        budgeting, no redaction, no exact measurement, no `needs_split`.
        Step 7 replaced that layer with the Context Assembler below.
-       Retained-but-unfinished workspaces (in-memory registry) are
-       **process-local memory**: they live until `dispose()`/process exit and
-       are destroyed there — this is NOT Step 9's disk persistence (which
-       does not exist yet).
+        Retained-but-unfinished workspaces were process-local memory in Step 6.
+        Step 9 replaces that registry with durable sessions: `dispose()` waits
+        for in-flight work, clears RAM, and preserves the session directory +
+        worktree for later recovery.
    7. **Context Assembler + redaction + adaptive budget** — exact tokenization,
       tier selection, output headroom, rules soft budget, reduction priority,
       `needs_split` (Section 5).
       **Implementation-stage note (incremental Step 7, superseded for rules
       by Step 8):** the shipped step implements secret-file suppression,
       secret/PII redaction, exact token measurement, adaptive tier selection,
-      output-reserve negotiation, read-only context reduction, and
-      `needs_split`; the `splash_task` loop consumes its output (measured
-      messages == dispatched messages; `context.input_tokens` is the exact
-      preflight count). Refine history (Step 9) is still absent — the
-      assembler accepts it as a placeholder (`history: []`) — and production
-      passes no read-only reference paths yet.
+       output-reserve negotiation, read-only context reduction, and
+       `needs_split`; the `splash_task` loop consumes its output (measured
+       messages == dispatched messages; `context.input_tokens` is the exact
+       preflight count). Step 9 completes this layer with classified refine
+       history and cumulative read-only references.
    8. **Rules loading** — pinned into the worker prompt.
       **Implementation-stage note (incremental Step 8):** the shipped step
       resolves the rules **once per `splash_task`** with the deterministic
@@ -1192,17 +1193,54 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
       formatted rules against the 8,192-token soft budget, and compacts ONLY
       exact duplicates when over budget (unique rule material is never
       silently removed; a remaining over-budget is reported with a fixed
-      warning). The resolved rules + provenance are pinned in the in-memory
-      active-task registry for the process lifetime — Step 9 moves that pin
-      (and the rest of the session state) to disk persistence. The rules
-      content never appears on the wire; only `rules_source` does.
+       warning). The resolved rules + provenance are now durably pinned by Step
+       9 session persistence, not merely process-local. The rules content never
+       appears on the wire; only `rules_source` does.
 9. **Session Manager + `splash_refine`** — rounds, scoped reset + full
-   patch-set re-apply, **stale-base check** (content + existence/type/mode +
-   created-path collision, Section 7.5), read-only context on refine, history
-   eviction by reduction priority, **`max_rounds` guardrail** (Section 5),
-   **disk persistence + recovery** (source of truth; surviving worktree
-   reused if it matches, else recreated, Section 2), concurrent sessions
-   sharing the coordinator.
+    patch-set re-apply, **stale-base check** (content + existence/type/mode +
+    created-path collision, Section 7.5), read-only context on refine, history
+    eviction by reduction priority, **`max_rounds` guardrail** (Section 5),
+    **disk persistence + recovery** (source of truth; surviving worktree
+    reused if it matches, else recreated, Section 2), concurrent sessions
+    sharing the coordinator.
+    **Implementation-stage note (Step 9):** open sessions persist under
+    `outputRoot/sessions`, restore lazily by `session_id`, reuse a matching
+    surviving worktree or recreate the immutable base + latest validated full
+    patch, check the base before every refine, accumulate read-only references,
+    reduce history by the fixed priority, and keep `max_rounds`
+    acknowledgement durable. `dispose()` preserves durable sessions.
+    **Security-audit fixes (2026-10-03):** the persisted `workspaceRecovery`
+    has **two trust domains**. Self-captured tree data — `basePaths` (the
+    full `git ls-tree -r -z` map) and the `path` fields of
+    `immutableBaseEntries` (git's own names) — is validated
+    **structurally** on load: only escape / management-area forms (empty,
+    NUL, absolute, `..` segment, exact `.git` segment) fail closed with
+    `session_corrupt`; a backslash inside a file name is legal (POSIX), so a
+    session of an honest repository that merely *tracks* a backslash-named
+    file round-trips instead of being permanently unloadable. The
+    user/worker-selected fields (`editablePaths`, `readonlyPaths`,
+    `baseFingerprints`, `baseContents`, `currentCreatedPaths`) keep the
+    strict character-set rule (`normalizeRepoPath`) — no untrusted input is
+    ever relaxed. `restoreGitWorktreeWorkspace` emits the same stable
+    `unsafe_path` kind as creation when `canonicalizeOutside` rejects a
+    directory that falls inside the repository (the canonical-mismatch case
+    stays `invalid_input`).
+     **Accepted threat model (Threat Model A):** Splash is a local developer
+     tool running under the user's own OS account. Step 9 defends against a
+     malicious or tampered `session.json`, static symlink substitution,
+     stale temporary files, leaf-symlink races, invalid schemas, and unsafe
+     recovery paths using 0700 session directories, 0600 files, no-follow
+     leaf access, and exclusive temporary-file creation. Step 9 does NOT
+     defend against a malicious concurrent process running under the same
+     Unix user account that actively replaces an already-validated ancestor
+     directory during path resolution. This is an accepted **LOW residual
+     risk**, not a merge blocker; fully eliminating it would require
+     descriptor-relative traversal (`openat`/`openat2`-class APIs), which is
+      disproportionate for Step 9. A same-user tamper that remains schema-valid
+      in `repoRoot`/`baseCommit` can only cause recovery to materialize attacker
+      content inside the session's isolated workspace; the main checkout and
+      public leak surface are unchanged, so this remains the same accepted
+      same-user residual class.
 10. **`splash_diff` + `splash_close`** — on-demand diff; **complete
     `--binary --full-index`** patch export; destroy (stale never blocks; an
     export failure preserves the session).

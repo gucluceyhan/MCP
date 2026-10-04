@@ -27,8 +27,13 @@ export const SERVICE_VERSION = "0.1.0";
 export interface SplashRuntime {
   readonly server: McpServer;
   /**
-   * Step 6 runtime kapatımı: yeni görev reddedilir, tüm aktif worktree'ler
-   * imha edilir, boşalan session dizinleri temizlenir, kayıt defteri boşalır.
+   * Step 9 runtime kapatımı: yeni görev/refine reddedilir, in-flight
+   * çalışmalara güvenli terminal yollarına ulaşıncaya KADAR beklenir,
+   * RAM önbellek + kilit kayıtları temizlenir; KALICI OTURUMLARA
+   * DOKUNULMAZ — worktree'ler imha edilmez, session dizinleri silinmez
+   * (spec 128-130: süreç kapanışı implicit close DEĞİL; hayatta kalan
+   * geçerli worktree sonraki süreç tarafından reuse edilir; imha Step 10
+   * `splash_close`'a aittir).
    * (Transport kapatımı bu method'da YOK — giriş noktası sırayla yapar.)
    */
   dispose(): Promise<void>;
@@ -235,6 +240,71 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
         };
       } catch (err) {
         // Tip'li, güvenli hata metadata'sı — kaynak/cause/stderr YOK (spec 58-63).
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(serializeToolError(err)),
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // ── splash_refine (Step 9 — ikinci production aracı) ──────────────────────
+  // Bir AÇIK oturumu rafine eder: yalnız `session_id` + `feedback` (+ istekli
+  // salt-okunur referans yollar). Oturum kendi repository kökünü, kurallarını
+  // ve bütçe seçeneklerini göreve pin'lemiştir — bunlar ASLA yeniden kabul
+  // edilmez (spec 20/22/248).
+  //
+  // Şema (spec 19-20):
+  // - `session_id`: string (boş değil); manager güvenli kimliği dosya
+  //   sistemine ERİŞİMDEN ÖNCE yeniden doğrular (`invalid_input`).
+  // - `feedback`: boş-olmayan string (trim ile boşluk-tek denetimi).
+  // - `files`: İSTEKLİ açık repository-göreceli salt-okunur referans yollar —
+  //   BİRİKEN küme (cumulative); düzenlenebilir seti BÜZÜNMEZ (spec 24/26-28).
+  //   Eksik → boş küme (önceki küme aynen).
+  const splashRefineInputSchema = z.object({
+    session_id: z.string().min(1),
+    feedback: z
+      .string()
+      .refine((value) => value.trim().length > 0, "The feedback must be a non-empty string"),
+    files: z.array(z.string()).optional(),
+  });
+
+  server.registerTool(
+    "splash_refine",
+    {
+      title: "Splash refine",
+      description:
+        "Refine an open Splash session with correction feedback. The session keeps its pinned " +
+        "repository, rules, and budget; only the feedback and optional read-only reference files " +
+        "are accepted. The session base is re-verified before inference: if the main working tree " +
+        "drifted, a compact stale_base result is returned and the session stays open.",
+      inputSchema: splashRefineInputSchema,
+    },
+    async (args, extra) => {
+      try {
+        const result = await taskService.executeRefine({
+          sessionId: args.session_id,
+          feedback: args.feedback,
+          // Verilmediyse boş küme — önceki salt-okunur küme aynen (spec 26).
+          files: args.files ?? [],
+          // MCP SDK istek sinyali → dispatch `options.signal` (spec 35).
+          signal: extra.signal,
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(serializeCompactResult(result)),
+            },
+          ],
+        };
+      } catch (err) {
+        // Tip'li, güvenli hata metadata'sı — kaynak/cause/stderr YOK (spec 12/13/58).
         return {
           isError: true,
           content: [

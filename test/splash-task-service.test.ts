@@ -45,6 +45,7 @@ import {
   SplashTaskService,
   type SplashTaskServiceDeps,
 } from "../dist/task/SplashTaskService.js";
+import { SessionError } from "../dist/session/types.js";
 import {
   ContextAssembler,
   ABSENT_MARKER,
@@ -306,6 +307,10 @@ async function brokenDestroyWorkspace(input: WorkspaceCreateInput): Promise<Work
     diff: (options) => real.diff(options),
     stat: () => real.stat(),
     exportPatch: (outputRoot: string) => real.exportPatch(outputRoot),
+    snapshotRecoveryState: () => real.snapshotRecoveryState(),
+    recoveryStateHash: () => real.recoveryStateHash(),
+    currentCreatedPaths: () => real.currentCreatedPaths(),
+    setReadonlyPaths: (p: readonly string[]) => real.setReadonlyPaths(p),
     destroy: async () => {
       throw new Error("worktree removal blocked");
     },
@@ -403,7 +408,7 @@ test("93: end-to-end success — applied result, worktree written, MAIN CHECKOUT
 
   // Kayıt defteri: görev canlı (refine/close Step 9'da kullanacak) — spec 64/66:
   assert.equal(h.service.activeTasks().length, 1);
-  assert.equal(h.service.activeTasks()[0]?.latestResult.status, "applied");
+  assert.equal(h.service.activeTasks()[0]?.latestResult?.status, "applied");
   assert.ok(await pathExists(workspaceDir));
 
   // Tek dispatch; seçenekler (spec 34):
@@ -598,9 +603,11 @@ test("111/117: session id collision → session_conflict; no workspace, no dispa
   const first = await h.service.executeTask({ task: "First task", files: ["src/a.ts"] });
   assert.equal(first.sessionId, "fixed-id");
 
+  // Step 9: çakışma OTURUM katmanıdır — `SessionError(session_conflict)`
+  // (RAM kaydı + exclusive disk mkdir; mevcut oturum üst yazılmaz, spec 324).
   await assert.rejects(
     h.service.executeTask({ task: "Second task", files: ["src/a.ts"] }),
-    (err: unknown) => err instanceof SplashTaskError && err.kind === "session_conflict",
+    (err: unknown) => err instanceof SessionError && err.kind === "session_conflict",
   );
   // Çakışan deneme workspace OLUŞTURMADI (spec 117): tek workspace dizini.
   assert.deepEqual(await sessionIds(h.sessionsDir), ["fixed-id"]);
@@ -609,7 +616,7 @@ test("111/117: session id collision → session_conflict; no workspace, no dispa
   assert.equal(h.lock.acquireCount, 1);
   // Kayıt defterinde hâlâ yalnızca ilk görev (sessiz ezip-yazma YOK):
   assert.equal(h.service.activeTasks().length, 1);
-  assert.equal(h.service.activeTasks()[0]?.latestResult.summary, "Changed value to 2.");
+  assert.equal(h.service.activeTasks()[0]?.latestResult?.summary, "Changed value to 2.");
 });
 
 test("112: semantic rejection → `failed` (0 applied) is a NORMAL result; workspace retained", async (t) => {
@@ -799,7 +806,7 @@ test("4/124: process-wide shared coordinator serializes concurrent tasks (FIFO, 
   assert.deepEqual(h.backend.runCalls.map((c) => c.activeAtStart), [0, 0]);
 });
 
-test("69/119/120: dispose() — registry cleared, worktrees destroyed, session dirs removed, then shutting_down", async (t) => {
+test("69/119/120: dispose() — RAM cleared; PERSISTENT SESSIONS PRESERVED (Step 9); then shutting_down", async (t) => {
   let id = 0;
   const h = await makeHarness(t, { newSessionId: () => `dispose-${(id += 1)}` });
   h.backend.runBehavior = async () => ({ content: okWorkerJson(), usage: { inputTokens: 1, outputTokens: 1 } });
@@ -811,10 +818,13 @@ test("69/119/120: dispose() — registry cleared, worktrees destroyed, session d
   assert.ok(await pathExists(path.join(h.sessionsDir, b.sessionId, "workspace")));
 
   await h.service.dispose();
-  // Kayıt defteri boş; TÜM session dizinleri (boşalan) temizlendi (spec 69):
+  // Step 9 (spec 128-130): RAM kayıt defteri boş; KALICI OTURUMLARA
+  // DOKUNULMAZ — session dizinleri VE worktree'ler KALIR (imha Step 10):
   assert.equal(h.service.activeTasks().length, 0);
-  assert.ok(!(await pathExists(path.join(h.sessionsDir, a.sessionId))));
-  assert.ok(!(await pathExists(path.join(h.sessionsDir, b.sessionId))));
+  assert.ok(await pathExists(path.join(h.sessionsDir, a.sessionId)), "session dizini korunmalı");
+  assert.ok(await pathExists(path.join(h.sessionsDir, b.sessionId)), "session dizini korunmalı");
+  assert.ok(await pathExists(path.join(h.sessionsDir, a.sessionId, "workspace")), "worktree korunmalı");
+  assert.ok(await pathExists(path.join(h.sessionsDir, b.sessionId, "workspace")), "worktree korunmalı");
   // dispose IDEMPOTENT:
   await h.service.dispose();
   // Sonrası: yeni görev reddedilir (spec 69/71):
@@ -880,10 +890,10 @@ test("64/57: active registry exposes latestResult per session (diagnostic surfac
   const tasks = h.service.activeTasks();
   assert.equal(tasks.length, 2);
   const byId = new Map(tasks.map((task) => [task.workspace.sessionId, task]));
-  assert.equal(byId.get(a.sessionId)?.latestResult.summary, "Changed value to 2.");
-  assert.equal(byId.get(b.sessionId)?.latestResult.summary, "Changed value to 2.");
+  assert.equal(byId.get(a.sessionId)?.latestResult?.summary, "Changed value to 2.");
+  assert.equal(byId.get(b.sessionId)?.latestResult?.summary, "Changed value to 2.");
   // `latestResult` = compact result (wire'a birebir gider):
-  assert.equal(byId.get(a.sessionId)?.latestResult.status, "applied");
+  assert.equal(byId.get(a.sessionId)?.latestResult?.status, "applied");
 });
 
 test("69/120: dispose racing in-flight inference — awaited; task rejects shutting_down; no orphan worktree", async (t) => {
@@ -1067,6 +1077,9 @@ test("32: context assembly fails (fault-injected) → typed error propagates; no
           cause: Object.assign(new Error("EACCES (fault-injected)"), { code: "EACCES" }),
         });
       },
+      async captureLiveBase() {
+        throw new Error("captureLiveBase must not run during task creation");
+      },
     },
   });
   h.backend.runBehavior = async () => {
@@ -1095,6 +1108,9 @@ test("32: unsafe read-only path (fault-injected) → ContextAssemblyError(unsafe
     contextAssembler: {
       async assemble() {
         throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
+      },
+      async captureLiveBase() {
+        throw new Error("captureLiveBase must not run during task creation");
       },
     },
   });

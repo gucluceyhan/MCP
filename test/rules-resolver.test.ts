@@ -344,6 +344,30 @@ test("readFile failure (EIO) after a valid lstat fails closed — no fallback", 
   assert.equal(fs.lstatCalls.length, 1, "AGENTS.md must never be reached after a read failure");
 });
 
+// ── Step 9 TOCTOU hardening (spec 194): the no-follow content read ───────────
+
+test("race (spec 194): regular at lstat, ELOOP at the no-follow read → rules_resolution_failed; the target is never read", async () => {
+  const fs = new ScriptedRulesFs()
+    .setFile("CLAUDE.md", "TOP-SECRET") // lstat sees a regular file
+    .setReadError("CLAUDE.md", "ELOOP"); // the no-follow open fails: it's a symlink now
+  const resolver = new RulesResolver({ fs });
+
+  try {
+    await resolver.resolve({ repoRoot: "/repo" });
+    assert.fail("resolution must have failed");
+  } catch (err) {
+    assert.ok(err instanceof RulesResolutionError);
+    assert.equal(err.message, RULES_RESOLUTION_FAILED_MESSAGE);
+    assert.ok(!err.message.includes("TOP-SECRET"), "no rule material in the public message");
+    assert.ok(String((err.cause as Error)?.message ?? "").includes("ELOOP"), "the no-follow read failed with ELOOP");
+  }
+  // The content read was attempted exactly once (the seam `readFile` member the
+  // no-follow read rides on); the seam surface (lstat/readFile/realpath) is
+  // unchanged, so the Step 8 call-count / guard tests remain valid (spec 297).
+  assert.equal(fs.readFileCalls.length, 1, "the no-follow content read was attempted");
+  assert.equal(fs.lstatCalls.length, 1, "the lstat classification ran exactly once");
+});
+
 test("a broken canonical root (realpath EACCES) fails closed before any rule access", async () => {
   const fs = new ScriptedRulesFs().setFile("CLAUDE.md", "claude rule");
   fs.realpathError = "EACCES";

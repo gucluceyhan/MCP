@@ -18,6 +18,7 @@ import {
   hasSymlinkInPath,
   isPathInside,
   isSafeSessionId,
+  isTrustedTreePath,
   normalizeRepoPath,
   resolveContained,
 } from "../dist/workspace/pathSafety.js";
@@ -79,6 +80,77 @@ test("normalizeRepoPath: rejects empty / bare-dot / NUL", () => {
   assert.equal(normalizeRepoPath("."), null);
   assert.equal(normalizeRepoPath("a\0b.ts"), null);
   assert.equal(normalizeRepoPath("//"), null);
+});
+
+// ── isTrustedTreePath (Step 9 audit düzeltme A — güvenli/self-captured alan) ──
+//
+// Güvenli (git'in KENDİ ürettiği) ağaç yolları için YAPISEL kural — seçili/
+// worker (güvenilmez) yolların karakter-kümesi kuralı (`normalizeRepoPath`)
+// ile AYNI DEĞİLDİR. İki güven alanı:
+// - red (platform-bağımsız): boş, NUL, mutlak, `..` bileşeni, TAM `.git`
+//   bileşeni (büyük/küçük harf duyARLI — case varyantı yasal POSIX adıdır;
+//   downstream'da canonical worker yoluyla eşleşemez → fail-closed);
+// - kabul: backslash'li ad (POSIX'te yasal dosya adı), `.`/çift-slash
+//   alias'ları, `:` içeren ad, case-varyant `.git`.
+
+test("isTrustedTreePath: ordinary + alias + exotic-but-legal names are accepted", () => {
+  assert.equal(isTrustedTreePath("src/a.ts"), true);
+  assert.equal(isTrustedTreePath("a//b.ts"), true); // çift-slash alias — kaçış yok
+  assert.equal(isTrustedTreePath("a/./b.ts"), true); // nokta bileşeni — kaçış yok
+  assert.equal(isTrustedTreePath("a..b/c.ts"), true); // noktalar adın İÇİNDE — traversal değil
+  assert.equal(isTrustedTreePath("a\\b.ts"), true); // backslash'li AD — POSIX'te yasal dosya adı
+  assert.equal(isTrustedTreePath("src/weird\\name.ts"), true); // dürüst-repo senaryosu (audit A)
+  assert.equal(isTrustedTreePath(".gitignore"), true); // `.git` PREFIX'i — tam bileşen EŞLEŞMESİ değil
+  assert.equal(isTrustedTreePath("git.txt"), true);
+});
+
+test("isTrustedTreePath: .git case variants are legal names (exact, case-SENSITIVE match)", () => {
+  // `normalizeRepoPath`'ın duyARSIZ kuralı güvenilmez girdi için fail-safe
+  // aşırı redtir; kendi-ağaç verisinde `.GIT` yasal bir POSIX adıdır.
+  assert.equal(isTrustedTreePath(".GIT"), true);
+  assert.equal(isTrustedTreePath("src/.Git/config"), true);
+});
+
+test("isTrustedTreePath: colon-in-name is accepted on every platform (no separator semantics)", () => {
+  // `C:foo.ts` POSIX'te düz bir dosya adıdır; Windows'ta drive-göreceli
+  // ÇÖZÜMLEME potansiyeli taşır AMA hiçbir tüketim noktasında yol olarak
+  // çözülmez: canonical (slash-only, `:`'siz) worker yollarıyla eşleşemez,
+  // `mktree` adında `:` kabul eder → red YAPMAZSA dürüst (Windows'ta `C:`
+  // adlı dosyaları takip eden) repository'ların oturumları bozulurdu.
+  assert.equal(isTrustedTreePath("C:foo.ts"), true);
+  assert.equal(isTrustedTreePath("src/file:name.ts"), true);
+});
+
+test("isTrustedTreePath: escape / management-area forms are rejected", () => {
+  assert.equal(isTrustedTreePath(""), false); // boş
+  assert.equal(isTrustedTreePath("a\0b.ts"), false); // NUL
+  assert.equal(isTrustedTreePath("/absolute/evil.ts"), false); // mutlak POSIX (her platformda)
+  assert.equal(isTrustedTreePath(".."), false); // bare traversal
+  assert.equal(isTrustedTreePath("../evil.ts"), false);
+  assert.equal(isTrustedTreePath("a/../b.ts"), false); // ortadaki `..` bileşeni
+  assert.equal(isTrustedTreePath(".git"), false); // TAM yönetim alanı adı
+  assert.equal(isTrustedTreePath(".git/config"), false);
+  assert.equal(isTrustedTreePath("a/.git"), false);
+  assert.equal(isTrustedTreePath("a/.git/b"), false);
+});
+
+test("isTrustedTreePath: platform-absolute forms (Windows forms are platform-aware)", () => {
+  if (process.platform === "win32") {
+    // Windows: sürücülü mutlak + UNC platform mutlak formu → red.
+    assert.equal(isTrustedTreePath("C:\\evil.ts"), false);
+    assert.equal(isTrustedTreePath("C:/evil.ts"), false);
+    assert.equal(isTrustedTreePath("\\\\server\\share\\evil.ts"), false);
+  } else {
+    // POSIX: `C:\foo` gibi dizeler YASAL DOSYA ADIDIR (backslash = normal
+    // karakter) — mutlak DEĞİLDİR, kabul (bkz. `normalizeRepoPath` farkı).
+    assert.equal(isTrustedTreePath("C:\\evil.ts"), true);
+    // `C:/evil.ts` POSIX'te `C:` + `evil.ts` segmentlerine bölünür — ikisi de
+    // düz ad, göreceli yol asla mutlak olamaz → kabul.
+    assert.equal(isTrustedTreePath("C:/evil.ts"), true);
+    assert.equal(isTrustedTreePath("\\\\server\\share\\evil.ts"), true);
+  }
+  // Her platformda: `/` ile başlayan form mutlak → red.
+  assert.equal(isTrustedTreePath("/evil.ts"), false);
 });
 
 // ── isSafeSessionId ─────────────────────────────────────────────────────────

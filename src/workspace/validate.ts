@@ -299,6 +299,12 @@ export function validateWorkerResult(base: WorkspaceBase, workerResult: WorkerRe
     }
 
     // create
+    // Salt-okunur referans yola create red (Step 9 spec 213): read-only
+    // bağlam yalnız worker'a GÖSTERİLİR — create/modify/delete ile yazılamaz.
+    if (base.readonly.has(canonical)) {
+      reject(index, canonical, REJECTION_REASONS.readOnlyPath);
+      return;
+    }
     // Base'te HERHANGİ bir şey varsa (dosya, sembolik bağlantı, ya da bir dosyanın
     // altında türeyen implicit dizin) create red — base yolu overwrite EDİLEMEZ (spec 44).
     // `basePaths` yalnız dosya/sembolik girişleri taşır; "dir/x" varsa "dir" bir

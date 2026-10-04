@@ -150,16 +150,122 @@ export interface WorkspaceBaseInfo {
 
 /**
  * `applyPatchSet` sonucu (Step 5 spec 40) — kaynak kod taşımaz:
- * doğrulama kararı + git'ten hesaplanan değişen yollar + yapısal istatistik.
+ * doğrulama kararı + git'ten hesaplanan değişen yollar + yapısal istatistik +
+ * bu turda kabul edilen worker-oluşturulan yollar (Step 9: kalıcılık +
+ * kapsamlı sıfırlama + kurtarma yeniden-uygulama için).
  */
 export interface WorkspaceApplyResult {
   validation: ValidationResult;
   filesChanged: string[];
   diffStats: DiffStats;
+  /** Bu turda worker tarafından oluşturulan (create) kabul edilen yollar. */
+  createdPaths: string[];
 }
 
 /** Reddedilen düzenleme satırı — Step 4'ün compact tipini AYNEN kullanır. */
 export type { ValidationRejection, ValidationResult };
+
+// ── Kurtarma durumu (Step 9) ────────────────────────────────────────────────
+
+/**
+ * Immutable base ağacının tek `git ls-tree` girişi (Step 9 spec 112).
+ * `path` PARENT ağaca görecelidir. Giriş bir alt-ağaç (`mode "040000"`) ise
+ * `children` o alt-ağacın kendi `ls-tree` girişlerini (git sırasıyla) taşır —
+ * böylece base nesnesi yok sayıldığında ağaç `git mktree` ile alttan-üst
+ * BİREBİR (aynı `tree` SHA'sı) yeniden kurulur. İçerik YOK (yalnız git
+ * metadata) — session.json'ı boyut olarak dosya sayısı sınırlı tutar.
+ *
+ * `path` git'in KENDİ ürettiği bir adımdır (self-captured) — kalıcılık
+ * doğrulaması (SessionStore) YAPISEL güven alanı kuralıyla denetlenir
+ * (Step 9 audit düzeltme A): backslash'li yasal adlar kabul, yalnız
+ * kaçış/`.git` formları red.
+ */
+export interface BaseTreeEntry {
+  mode: string;
+  oid: string;
+  path: string;
+  /** Yalnız alt-ağaç girişlerinde (`040000`): alt-ağacın kendi girişleri. */
+  children?: BaseTreeEntry[];
+}
+
+/**
+ * Base commit'in kimlik alanları (Step 9 spec 112/122): `git commit-tree`
+ * ile AYNI SHA'nın yeniden kurulması için gereken tüm alanlar.
+ * `authorDate`/`committerDate` git'in ham tarih dizgisi (`"<unix-s> <tz>"`) —
+ * `git commit-tree`'e `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` olarak aynen
+ * verilir; deterministik commit SHA'sı bu alanlardan türetilir.
+ */
+export interface BaseCommitIdentity {
+  tree: string;
+  parents: string[];
+  authorName: string;
+  authorEmail: string;
+  authorDate: string;
+  committerName: string;
+  committerEmail: string;
+  committerDate: string;
+  message: string;
+}
+
+/**
+ * Bir seçili yolun immutable base içeriğinin BİREBİR, JSON-güvenli temsili
+ * (Step 9 spec 114/115/116/117):
+ * - `file` → base baytları base64 (working-tree ölçüsü; CRLF korur, spec 116).
+ * - `symlink` → hedef METNİ (dereferans YOK, spec 117) + 120000 modu.
+ * - `absent` → base'te yok (varlıksız seçili yol, spec 118).
+ *
+ * Bu alan `readBaseEntry`'nin yeniden kurulması + base blob'larının
+ * (varsa) `git hash-object` ile aynı OID'de yeniden yazılması için tek kaynak.
+ * Asla model/MCP yüzeyine taşınmaz — özel 0600 kalıcılık verisi.
+ */
+export type BaseContentValue =
+  | { type: "file"; base64: string }
+  | { type: "symlink"; target: string }
+  | { type: "absent" };
+
+/**
+ * Bir oturumun worktree'sinin BİREBİR yeniden kurulabilmesi için gereken
+ * immutable kurtarma durumu (Step 9 spec 112-122). `snapshotRecoveryState`
+ * üretilir; `restoreGitWorktreeWorkspace` tüketir. SessionManager bu
+ * yapıyı opak olarak taşır (spec 113: Git iç mantığını bilmez).
+ *
+ * İçerik (base64) özel kalıcılık verisidir; MCP/model yüzeyine ASLA gitmez
+ * (spec 114). `recoveryStateHash` = güncel base-göreceli tam diff'in SHA-256'ı
+ * (kaynaksız, spec 107/108).
+ */
+export interface WorkspaceRecoveryState {
+  readonly schemaVersion: 1;
+  /** Kanonik mutlak repository kökü — kimlik (spec 106: correct repo). */
+  readonly repoRoot: string;
+  /** Mutlak worktree dizini — kimlik (spec 106: correct workspace path). */
+  readonly workspaceDir: string;
+  /** Güvenli opak oturum kimliği — kimlik (spec 106: correct session). */
+  readonly sessionId: string;
+  /** Immutable base commit SHA (ASLA değişmez, spec 27) — kimlik (spec 106). */
+  readonly baseCommit: string;
+  /** Kanonik düzenlenebilir yollar. */
+  readonly editablePaths: string[];
+  /** Kanonik salt-okunur yollar. */
+  readonly readonlyPaths: string[];
+  /** Seçili yolların immutable base parmak izleri (path → fingerprint). */
+  readonly baseFingerprints: ReadonlyArray<readonly [string, PathFingerprint]>;
+  /**
+   * Base ağacının TAM yol → git modu haritası (create/varlık denetimi).
+   * Yollar `git ls-tree` çıktısıdır (self-captured) — kalıcılık doğrulaması
+   * yapısal güven alanı kuralıyla (Step 9 audit düzeltme A).
+   */
+  readonly basePaths: ReadonlyArray<readonly [string, string]>;
+  /** Base commit'in TAM ağacı (mode/oid/path) — `mktree` için. */
+  readonly immutableBaseEntries: BaseTreeEntry[];
+  /** Base commit kimlik alanları — `commit-tree` için (aynı SHA). */
+  readonly baseCommitIdentity: BaseCommitIdentity;
+  /** Düzenlenebilir yolların base içeriği (base64/hedef/yok) — JSON-güvenli. */
+  readonly baseContents: ReadonlyArray<readonly [string, BaseContentValue]>;
+  /** Son turun worker-oluşturulan yolları (kapsamlı sıfırlama + yeniden-uygulama). */
+  readonly currentCreatedPaths: string[];
+  /** Güncel base-göreceli tam diff'in SHA-256'ı (kaynaksız doğrulama). */
+  readonly recoveryStateHash: string;
+}
 
 // ── Workspace sözleşmesi ────────────────────────────────────────────────────
 
@@ -205,10 +311,53 @@ export interface Workspace {
    *   `invalid_input` ile reddedilir.
    * - İmha edilmiş workspace → `workspace_destroyed`.
    */
-  readBaseEntry(repoRelativePath: string): WorkspaceBaseEntry;
+   readBaseEntry(repoRelativePath: string): WorkspaceBaseEntry;
 
-  /** Worker sonuç tablosunu uygular (tam ikame; yukarıdaki yaşam döngüsü). */
-  applyPatchSet(result: WorkerResult): Promise<WorkspaceApplyResult>;
+   /**
+    * Bu workspace'in BİREBİR yeniden kurulabilmesi için immutable kurtarma
+    * durumunu yakalar (Step 9 spec 112-115): base commit kimliği + tam
+    * ağaç + seçili yolların base içeriği + parmak izleri + güncel state hash.
+    *
+    * - Saf-okunur: base'in bellekteki immutable snapshot'ı + salt-okunur git
+    *   sorguları (ls-tree, cat-file, diff). Worker'ın MUTABLE yazıları, ana
+    *   checkout ve içerik asla kurtarma durumuna girmEZ (base + hash ölçülür).
+    * - İmha edilmiş workspace → `workspace_destroyed`.
+    * - Ürün JSON-güvenlidir (Buffer'lar base64) — özel 0600 kalıcığa yazılır.
+    */
+   snapshotRecoveryState(): Promise<WorkspaceRecoveryState>;
+
+   /**
+    * Güncel base-göreceli TAM state'in içeriksiz parmak izi (Step 9
+    * spec 107/108): `git diff --binary --full-index <base>` (filter re-check
+    * sonrası) SHA-256'sı. Kaynak/diff içeriği ASLA dönmEZ — yalnız hash.
+    * Worker-oluşturulan dosyaları içerir (intent-to-add). İmha → red.
+    */
+   recoveryStateHash(): Promise<string>;
+
+    /**
+     * Son başarılı turda worker tarafından oluşturulan yollar (Step 9:
+     * kapsamlı sıfırlama + kurtarma yeniden-uygulaması için bilinen küme).
+     * İmha → red.
+     */
+    currentCreatedPaths(): readonly string[];
+
+    /**
+     * Salt-okunur bağlam yol SETİNİ günceller (Step 9, spec 24-28/166-168).
+     *
+     * Step 6/7'de salt-okunur referans production v1'de her zaman `[]`'dı;
+     * Step 9 refine'ı BİRİKEN (cumulative) salt-okunur yollar taşır — bunlar
+     * worker'a READ-ONLY REFERENCE olarak gösterilir VE düzenleme denetiminde
+     * (modify/delete) `readOnlyPath` ile reddedilir. Bu mutator, refine
+     * turunun BİLENMİŞ salt-okunur kümesini doğrulamaya taşır; düzenlenebilir
+     * allow-list'i (immutable base) ASLA değişmez (spec 24/28).
+     *
+     * Saf bellek mutasyonu: git YOK, I/O YOK, immutable base snapshot'ına
+     * dokunmaz. Kanonik (normalize) yollarla çağrılır. İmha → red.
+     */
+    setReadonlyPaths(paths: readonly string[]): void;
+
+   /** Worker sonuç tablosunu uygular (tam ikame; yukarıdaki yaşam döngüsü). */
+   applyPatchSet(result: WorkerResult): Promise<WorkspaceApplyResult>;
 
   /** Tracked durumu base'e sıfırlar + önceki worker-oluşturulan yolları kapsamlı kaldırır. */
   resetToBase(): Promise<void>;

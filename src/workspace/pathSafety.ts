@@ -95,6 +95,67 @@ export function normalizeRepoPath(raw: string): string | null {
 }
 
 /**
+ * Güvenli git-tree yoluna YAPISEL doğrulama (Step 9 audit düzeltme A):
+ * tam git ağacından KENDİ tarafından yakalanan (self-captured) yollar —
+ * `workspaceRecovery.basePaths` (tam `git ls-tree -r -z` haritası) ve
+ * `immutableBaseEntries`'in `path` alanları — kullanıcı/worker GİRDİSİ
+ * değildir; bunlar için KÜME (character-set) doğrulaması DEĞİL, yapısal
+ * doğrulama uygulanır.
+ *
+ * Gerekçe: `normalizeRepoPath` seçili/worker (güvenilmez) yolları için doğru
+ * katkisız kuraldır, ama karakter-kümesi kuralı (backslash'ı her yerde
+ * reddetme) POSIX'te backslash'li bir adı takip EDEN dürüst repository'ların
+ * oturumlarını kalıcı olarak yüklenemez (`session_corrupt`) yapardı — git,
+ * POSIX'te backslash'li dosya adlarını takip edebilir (ölçüldü: `ls-tree`
+ * aynen basar, `mktree` birebir aynı `tree` SHA'sını yeniden kurar).
+ *
+ * Yapısal kural yalnızca repository dışına kaçış ya da git yönetim alanına
+ * müdahale potansiyeli taşıyan formları reddeder:
+ * - boş string, NUL byte
+ * - mutlak yol — platform mutlak formu (`path.isAbsolute`: POSIX `/...`;
+ *   Windows `X:\...` / `X:/...` / UNC) + her platformda POSIX `/...` formu
+ *   (Windows'ta sürücü-kökü göreceli çözümlenir = workspace dışı). NOT:
+ *   POSIX'te `C:\foo` gibi bir dize YASAL bir dosya adındır (backslash =
+ *   normal karakter) — mutlak DEĞİLDİR, kabul edilir. (`normalizeRepoPath`'ın
+ *   platform-bağımsız red kuralı GÜVENİLMEZ girdi güvenliği içindir; bu
+ *   yapısal kural KENDİ-agacı güvenliği içindir — iki güven alanı.)
+ * - `..` yolu bileşeni (repository dışı kaçış; tam bileşen eşleşmesi)
+ * - `.git` yolu bileşeni (tam, BÜYÜK/KÜÇÜK harf DUYARLI — tam yönetim alanı
+ *   adı; bir bileşenin İÇİNDE backslash ya da başka dosya-adı karakteri
+ *   taşıması RED sebebi DEĞİLDİR. `normalizeRepoPath`'ın duyarsız kuralı
+ *   güvenilmez girdi için fail-safe aşırı rettir; kendi-agaç verisinde bir
+ *   `.GIT` dosyası yasal bir POSIX adıdır ve downstream'da (validate.ts)
+ *   asla canonical worker yoluyla eşleşemez → fail-closed korunur)
+ *
+ * Geri kalan formlar (örn. `.`/boş bileşen alias'ları, backslash'li adlar)
+ * yapısal olarak güvendedir: kaçış imkânsızdır; downstream'da canonical
+ * (normalize) worker yollarıyla eşleşemez, `mktree` ad kuralı slash'li
+ * tek-adı reddeder (ölçüldü) → her tüketim fail-closed. Değer AYNEN kabul
+ * edilir — alias normalizasyonu YOK (sessiz yeniden yazım fail-closed
+ * disiplinine aykırıdır).
+ */
+export function isTrustedTreePath(raw: string): boolean {
+  if (typeof raw !== "string" || raw.length === 0) {
+    return false;
+  }
+  if (raw.includes("\0")) {
+    return false;
+  }
+  if (path.isAbsolute(raw) || raw.startsWith("/")) {
+    return false;
+  }
+  for (const segment of raw.split("/")) {
+    if (segment === "..") {
+      return false;
+    }
+    if (segment === ".git") {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Oturum kimliği güvenliği (spec 12): kimlik ileride base commit mesajı,
  * patch dosya adı ve workspace metadata'sı olarak kullanılır —
  * dizinden kaçışa izin veren hiçbir form kabul edilmez, SESSİZCE yeniden
