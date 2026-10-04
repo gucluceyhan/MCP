@@ -1187,6 +1187,52 @@ test("restart under a changed diff-format config: restore (surviving + recreated
   await ws.destroy().catch(() => undefined);
 });
 
+test("Step 9 state hash recorded under a non-default diff config is still accepted: matchesRecoveryStateHash + surviving-worktree reuse; a wrong hash is not (Step 10 hardening e)", async () => {
+  const { fixture, orderFile } = await buildFormatRepo("hash-legacy");
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-legacy"),
+    sessionId: "s-legacy",
+    editablePaths: FORMAT_FILES.map(([file]) => file),
+  });
+  await ws.applyPatchSet(formatRewrite());
+  const state = await ws.snapshotRecoveryState(); // güncel formül
+  const sentinel = path.join(ws.workspaceDir, "sentinel.txt");
+  await writeFile(sentinel, "keep\n"); // untracked — reuse kanıtı
+  const exists = (p: string): Promise<boolean> => stat(p).then(() => true, () => false);
+  const legacyConfig = `${allFormatSettings(orderFile)}[diff]\n\tnoprefix = true\n[color]\n\tui = always\n`;
+
+  await withGlobalGitConfig(fixture.out, legacyConfig, async () => {
+    // Step 9 sürecinin bu config'te kalıcılaştırdığı hash (pin'siz eski formül).
+    const legacyHash = sha256(
+      (await runGit([...LEGACY_FULL_DIFF_ARGS, ws.baseCommit], { cwd: ws.workspaceDir, config: ["core.hooksPath=/dev/null"] })).stdout,
+    );
+    assert.notEqual(legacyHash, state.recoveryStateHash, "fixture: the legacy formula differs under this config");
+    assert.equal(await ws.matchesRecoveryStateHash(state.recoveryStateHash), true, "current formula");
+    assert.equal(await ws.matchesRecoveryStateHash(legacyHash), true, "Step 9 formula accepted");
+    assert.equal(await ws.matchesRecoveryStateHash("0".repeat(64)), false, "wrong hash rejected");
+
+    // (a) Hayatta worktree + kalıcı ESKİ hash → REUSE; yeniden-uygulama sonrası da eşleşir.
+    const reused = await restoreGitWorktreeWorkspace({ ...state, recoveryStateHash: legacyHash }, { expectedWorkspaceDir: state.workspaceDir });
+    assert.ok(await exists(sentinel), "legacy hash matched → surviving worktree reused");
+    await reused.applyPatchSet(formatRewrite());
+    assert.equal(await reused.matchesRecoveryStateHash(legacyHash), true, "reuse + reapply → legacy hash");
+
+    // (b) Yanlış hash → güvenilmez → yeniden kurulum; eşleşme YOK.
+    const wrong = "f".repeat(64);
+    const recreated = await restoreGitWorktreeWorkspace({ ...state, recoveryStateHash: wrong }, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      assert.ok(!(await exists(sentinel)), "wrong hash → worktree recreated");
+      await recreated.applyPatchSet(formatRewrite());
+      assert.equal(await recreated.matchesRecoveryStateHash(wrong), false);
+      assert.equal(await recreated.matchesRecoveryStateHash(legacyHash), true, "recreate + reapply → legacy hash");
+    } finally {
+      await recreated.destroy();
+    }
+  });
+  await ws.destroy().catch(() => undefined);
+});
+
 // ── 12) imha (spec 73) ──────────────────────────────────────────────────────
 
 test("destroy: worktree removed, subsequent ops reject, patch file remains (spec 73)", async () => {
@@ -3980,6 +4026,96 @@ test("K4: create beneath a symlink that appeared in the workspace still fails wi
     await expectWorkspaceError("unsafe_path", () =>
       ws.applyPatchSet(workerResult([{ kind: "create", path: "stray-link/x.js", content: "1\n" }])),
     );
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("M3: a self-ignoring new `tmp/.gitignore` (`*`) + `tmp/x` → both rejected AFTER the write, removed; other edits apply", async () => {
+  const fixture = await buildFixture("k4-post-write");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "tmp/.gitignore", content: "*\n" },
+        { kind: "create", path: "tmp/x", content: "x\n" },
+        { kind: "modify", path: "src/a.ts", operations: [{ search: "alpha-USER", replace: "alpha-WORKER" }] },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, [
+      { file: "tmp/.gitignore", edit: 0, reason: "path is ignored" },
+      { file: "tmp/x", edit: 1, reason: "path is ignored" },
+    ]);
+    assert.deepEqual(result.filesChanged, ["src/a.ts"]);
+    assert.deepEqual(result.createdPaths, []);
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "tmp", ".gitignore")));
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "tmp", "x")));
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("L1: `--no-index` — `[a].log` create is judged on its own name, not via a glob over tracked `a.log`", async () => {
+  const fixture = await buildFixture("k4-no-index");
+  await writeFile(path.join(fixture.repo, "a.log"), "tracked\n");
+  await gitOk(fixture.repo, ["add", "a.log"]);
+  await writeFile(path.join(fixture.repo, ".gitignore"), "ignored.txt\n*.log\n");
+  await gitOk(fixture.repo, ["add", ".gitignore"]);
+  await gitOk(fixture.repo, ["commit", "-m", "track a.log, ignore *.log"]);
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(workerResult([{ kind: "create", path: "[a].log", content: "y\n" }]));
+    assert.deepEqual(result.validation.rejected, [{ file: "[a].log", edit: 0, reason: "path is ignored" }]);
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("L2: root-level `:(exclude)run.log` create is passed literally (`./` prefix) → `path is ignored`", async () => {
+  const fixture = await buildFixture("k4-root-magic");
+  await writeFile(path.join(fixture.repo, ".git", "info", "exclude"), "*.log\n");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(workerResult([{ kind: "create", path: ":(exclude)run.log", content: "y\n" }]));
+    assert.deepEqual(result.validation.rejected, [{ file: ":(exclude)run.log", edit: 0, reason: "path is ignored" }]);
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("L6: an explicitly selected (editable) absent path that is git-ignored is created (`add -N -f`); unselected ignored create still rejected", async () => {
+  const fixture = await buildFixture("k4-selected-ignored");
+  const input = createInput(fixture);
+  const ws = await createGitWorktreeWorkspace({ ...input, editablePaths: [...input.editablePaths, "gen/ignored.txt"] });
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "gen/ignored.txt", content: "selected\n" },
+        { kind: "create", path: "other/ignored.txt", content: "unselected\n" },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, [{ file: "other/ignored.txt", edit: 1, reason: "path is ignored" }]);
+    assert.deepEqual(result.filesChanged, ["gen/ignored.txt"]);
+    assert.deepEqual(result.createdPaths, ["gen/ignored.txt"]);
+    assert.ok((await ws.diff()).includes("+selected"));
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("M3: when the plan edits `.gitignore`, the decision uses the NEW rules (un-ignored path is created)", async () => {
+  const fixture = await buildFixture("k4-unignore");
+  const input = createInput(fixture);
+  const ws = await createGitWorktreeWorkspace({ ...input, editablePaths: [...input.editablePaths, ".gitignore"] });
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "modify", path: ".gitignore", operations: [{ search: "ignored.txt\n", replace: "*.tmp\n" }] },
+        { kind: "create", path: "deep/ignored.txt", content: "now tracked\n" },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, []);
+    assert.deepEqual([...result.filesChanged].sort(), [".gitignore", "deep/ignored.txt"]);
   } finally {
     await ws.destroy();
   }

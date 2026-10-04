@@ -309,6 +309,7 @@ async function brokenDestroyWorkspace(input: WorkspaceCreateInput): Promise<Work
     exportPatch: (outputRoot: string) => real.exportPatch(outputRoot),
     snapshotRecoveryState: () => real.snapshotRecoveryState(),
     recoveryStateHash: () => real.recoveryStateHash(),
+    matchesRecoveryStateHash: (expected: string) => real.matchesRecoveryStateHash(expected),
     currentCreatedPaths: () => real.currentCreatedPaths(),
     setReadonlyPaths: (p: readonly string[]) => real.setReadonlyPaths(p),
     destroy: async () => {
@@ -1534,4 +1535,30 @@ test("K4: create into a git-ignored path → that edit rejected (`path is ignore
   const workspaceDir = path.join(h.sessionsDir, "k4-id", "workspace");
   assert.ok(await pathExists(workspaceDir));
   assert.equal(await pathExists(path.join(workspaceDir, "dist/x.js")), false);
+});
+
+test("M3: worker adds `local.yml` to `.gitignore` AND creates `local.yml` → post-write ignore decision; `partial`, session survives", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "m3-id" });
+  await writeFile(path.join(h.fixture.repoRoot, ".gitignore"), "dist/\n");
+  git(h.fixture.repoRoot, "add", ".gitignore");
+  git(h.fixture.repoRoot, "commit", "-m", "ignore dist");
+  h.backend.runBehavior = async () => ({
+    content: workerJson({
+      summary: "Local config.",
+      edits: [
+        { kind: "modify", path: ".gitignore", operations: [{ search: "dist/\n", replace: "dist/\nlocal.yml\n" }] },
+        { kind: "create", path: "local.yml", content: "debug: true\n" },
+      ],
+    }),
+    usage: { inputTokens: 100, outputTokens: 60 },
+  });
+
+  const result = await h.service.executeTask({ task: "Add local config", files: [".gitignore"] });
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.validation.rejected, [{ file: "local.yml", edit: 1, reason: "path is ignored" }]);
+  assert.deepEqual(result.filesChanged, [".gitignore"]);
+  assert.equal(h.service.activeTasks().length, 1);
+  const workspaceDir = path.join(h.sessionsDir, "m3-id", "workspace");
+  assert.ok(await pathExists(workspaceDir));
+  assert.equal(await pathExists(path.join(workspaceDir, "local.yml")), false);
 });

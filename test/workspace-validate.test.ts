@@ -395,3 +395,16 @@ test("K3: placeholder literally present in the same file's base → modify accep
   );
   assert.deepEqual(other.result.rejected.map((r) => r.reason), [REJECTION_REASONS.redactionPlaceholder]);
 });
+
+test("L5b: a placeholder in `search` (absent from that base) → placeholder reason, not 'search text not found'", () => {
+  const base = baseFrom({ "src/a.ts": 'const pw = "hunter2";\n' });
+  assert.deepEqual(reasons(base, modify("src/a.ts", [`const pw = "${REDACTED_SECRET}";`, "const pw = env();"])), [
+    REJECTION_REASONS.redactionPlaceholder,
+  ]);
+});
+
+test("L5c: a placeholder present only in ANOTHER file's base is not an exception", () => {
+  const base = baseFrom({ "src/redact.ts": `export const S = "${REDACTED_SECRET}";\n`, "src/b.ts": "b\n" });
+  assert.deepEqual(reasons(base, modify("src/b.ts", ["b", `b // ${REDACTED_SECRET}`])), [REJECTION_REASONS.redactionPlaceholder]);
+  assert.deepEqual(reasons(base, create("src/new.ts", `x = "${REDACTED_SECRET}"`)), [REJECTION_REASONS.redactionPlaceholder]);
+});

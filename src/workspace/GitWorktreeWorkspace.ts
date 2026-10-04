@@ -466,11 +466,32 @@ export class GitWorktreeWorkspace implements Workspace {
     // filter re-check (PR #24 audit F-6): diff, içerik değiştirmiş tracked
     // dosyaları worktree attribute yüzeyiyle okur → içerikten ÖNCE.
     await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    return this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+  }
+
+  /**
+   * Güncel state kalıcı hash'le eşleşiyor mu? Önce güncel formül; eşleşmezse
+   * Step 9 formülü (biçim bayrağı/pin YOK, kullanıcının config'i altında):
+   * Step 9 ile varsayılan-DIŞI config'te kaydedilmiş açık oturumların hash'i
+   * yükseltme sonrası da tanınır (Codex P2 — PR #34). Kalıcı durum yeniden
+   * YAZILMAZ; sonraki üretilmiş tur güncel formülle yazar. İmha → red.
+   */
+  async matchesRecoveryStateHash(expected: string): Promise<boolean> {
+    this.assertUsable();
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    const current = await this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+    if (current === expected) {
+      return true;
+    }
+    return (await this.stateDiffHash([], [])) === expected; // Step 9 (e746e8f) formülü
+  }
+
+  /** Base-göreceli tam diff'in SHA-256'sı (filter re-check ÇAĞIRANDA). */
+  private async stateDiffHash(formatArgs: readonly string[], config: readonly string[]): Promise<string> {
     const result = await this.git(
       [
         "diff",
-        ...PATCH_FORMAT_ARGS,
-        ...STATE_HASH_DIFF_ARGS,
+        ...formatArgs,
         "--binary",
         "--full-index",
         "--no-ext-diff",
@@ -478,7 +499,7 @@ export class GitWorktreeWorkspace implements Workspace {
         "--no-renames",
         this.baseCommit,
       ],
-      { config: STATE_HASH_DIFF_CONFIG },
+      { config },
     );
     return createHash("sha256").update(result.stdout).digest("hex");
   }
@@ -799,14 +820,21 @@ export class GitWorktreeWorkspace implements Workspace {
 
     // (3) TÜM seti immutable base'e karşı doğrula — yazmadan ÖNCE (spec 39).
     // (3a) K4: git-ignored yola create → `git add -N` exit 1 ile TÜM turu
-    // düşürürdü. Karar YAZMADAN önce worktree'de (base durumu) alınır;
-    // eşleşen create'ler sabit nedenle reddedilir, diğer düzenlemeler sürer.
+    // düşürürdü; eşleşen create'ler sabit nedenle reddedilir, diğer
+    // düzenlemeler sürer. Plan bir `.gitignore`'a dokunmuyorsa karar
+    // YAZMADAN önce (base durumu) alınır; dokunuyorsa kurallar turla
+    // değişir → karar yazımdan SONRA, `add -N`'den ÖNCE (aşağıda 4c).
     const validated = validateWorkerResult(this.validationBase, workerResult);
-    const validation = rejectCreatePlans(
-      validated,
-      await this.ignoredCreatePaths(validated.plan),
-      REJECTION_REASONS.pathIgnored,
-    );
+    const touchesIgnoreRules = validated.plan.some((entry) => path.posix.basename(entry.canonical) === ".gitignore");
+    let validation = touchesIgnoreRules
+      ? validated
+      : rejectCreatePlans(
+          validated,
+          await this.ignoredCreatePaths(
+            validated.plan.filter((entry) => entry.action === "create").map((entry) => entry.canonical),
+          ),
+          REJECTION_REASONS.pathIgnored,
+        );
 
     // (3b) PR #24 SB-1: bu turda worker'ın modify/delete ettiği ve base'te
     // TRACKED olan `.gitattributes` yollarını SB-1 kümesine yaz — turun
@@ -927,8 +955,26 @@ export class GitWorktreeWorkspace implements Workspace {
       // worker yol dizgeleri pathspec magic'i olarak ASLA yorumlanamaz
       // (audit CRITICAL-1) — yoksa `:(exclude)X` gibi bir ad index'i
       // SESSİZ mass-add'e sokar.
-      if (createdThisRound.length > 0) {
-        await this.git(["add", "-N", "--", ...createdThisRound.map(literalPathspec)]);
+      // (4c) K4 yazım-sonrası karar (plan `.gitignore`'a dokunduysa): bu turun
+      // create'larından yoksayılanlar saf-fs ile kaldırılır + reddedilir.
+      if (touchesIgnoreRules) {
+        const ignored = await this.ignoredCreatePaths(createdThisRound);
+        if (ignored.size > 0) {
+          await this.removeWorkerCreatedPaths(ignored);
+          createdThisRound.splice(0, createdThisRound.length, ...createdThisRound.filter((p) => !ignored.has(p)));
+          validation = rejectCreatePlans(validation, ignored, REJECTION_REASONS.pathIgnored);
+        }
+      }
+      // L6: açıkça seçilmiş (editable) ama base'te olmayan yol yoksayılmış
+      // olabilir — base yakalamanın seçili ignored dosyaları `add -f` ile
+      // almasıyla tutarlı olarak `-f`; diğer create'ler `-f`'siz.
+      const selected = createdThisRound.filter((p) => this.validationBase.editable.has(p));
+      const unselected = createdThisRound.filter((p) => !this.validationBase.editable.has(p));
+      if (unselected.length > 0) {
+        await this.git(["add", "-N", "--", ...unselected.map(literalPathspec)]);
+      }
+      if (selected.length > 0) {
+        await this.git(["add", "-N", "-f", "--", ...selected.map(literalPathspec)]);
       }
       // (6) Bilinen küme = bu turun kabul edilen create'ları (spec 59).
       this.workerCreatedPaths = new Set<string>(createdThisRound);
@@ -996,30 +1042,33 @@ export class GitWorktreeWorkspace implements Workspace {
   }
 
   /**
-   * K4: kabul edilen create yollarından git'in yoksaydıkları (.gitignore,
+   * K4: verilen create yollarından git'in yoksaydıkları (.gitignore,
    * `info/exclude`, `core.excludesFile` — `git add`'in kullandığı aynı
    * kaynaklar). `check-ignore` `:(literal)`/`--literal-pathspecs`'i
    * desteklemez (ölçüldü, Git 2.50: "pathspec magic not supported");
-   * `./` öneki `:(…)`/`:x` adlarının magic yorumlanmasını engeller, glob
-   * karakterleri zaten literaldir. Çıkış 1 = hiçbiri yoksayılmıyor.
-   * Yolunda sembolik bağlantı olan create sorulmaz (`check-ignore` onda
-   * 128 ile ölür); uygulama döngüsü onu `unsafe_path` ile reddeder.
+   * `./` öneki `:(…)`/`:x` adlarının magic yorumlanmasını engeller.
+   * `--no-index`: index'e bakılmaz — aksi halde `[a].log` gibi bir ad
+   * tracked `a.log`'a glob olarak eşleşip "yoksayılmıyor" sayılırdı
+   * (ölçüldü). Çıkış 1 = hiçbiri yoksayılmıyor.
+   * Muaf: açıkça seçilmiş (editable) yollar (L6 — `add -N -f`) ve yolunda
+   * sembolik bağlantı olanlar (`check-ignore` onda 128 ile ölür; uygulama
+   * döngüsü onları `unsafe_path` ile reddeder).
    */
-  private async ignoredCreatePaths(plan: readonly EditPlan[]): Promise<Set<string>> {
+  private async ignoredCreatePaths(paths: readonly string[]): Promise<Set<string>> {
     const creates: string[] = [];
-    for (const entry of plan) {
-      if (entry.action !== "create") {
+    for (const canonical of paths) {
+      if (this.validationBase.editable.has(canonical)) {
         continue;
       }
-      const abs = resolveContained(this.workspaceDir, entry.canonical);
+      const abs = resolveContained(this.workspaceDir, canonical);
       if (abs !== null && !(await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: true }))) {
-        creates.push(entry.canonical);
+        creates.push(canonical);
       }
     }
     if (creates.length === 0) {
       return new Set<string>();
     }
-    const result = await this.git(["check-ignore", "--stdin", "-z"], {
+    const result = await this.git(["check-ignore", "--no-index", "--stdin", "-z"], {
       stdin: creates.map((p) => `./${p}\0`).join(""),
       allowedExitCodes: [1],
     });
@@ -2476,8 +2525,8 @@ async function materializeWorkspace(
   if (dirExists) {
     // Hayatta worktree: kimlik (HEAD==base + toplevel) + state hash.
     if (await worktreeIdentityMatches(workspaceDir, state.baseCommit)) {
-      const hash = await workspace.recoveryStateHash().catch(() => null);
-      if (hash !== null && hash === state.recoveryStateHash) {
+      // Step 9 formülüyle kaydedilmiş hash de kabul (matchesRecoveryStateHash).
+      if (await workspace.matchesRecoveryStateHash(state.recoveryStateHash).catch(() => false)) {
         // spec 109/126: BİREBİR eşleşme → REUSE (imha/yeniden kurma YOK).
         return;
       }

@@ -145,6 +145,9 @@ function fakeWorkspace(
     recoveryStateHash: async () => {
       throw new Error("fake workspace: no recovery in this test");
     },
+    matchesRecoveryStateHash: async () => {
+      throw new Error("fake workspace: no recovery in this test");
+    },
     currentCreatedPaths: () => [],
     setReadonlyPaths: () => undefined,
     destroy: async () => undefined,

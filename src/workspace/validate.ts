@@ -233,6 +233,13 @@ export function validateWorkerResult(base: WorkspaceBase, workerResult: WorkerRe
         return;
       }
 
+      // K3: `search`/`replace`'te bu dosyanın base'inde olmayan bir yer
+      // tutucu → eşleşmeden ÖNCE red (worker gizli değeri kopyalamış).
+      if (introducesPlaceholder(edit.operations.flatMap((op) => [op.search, op.replace]), text)) {
+        reject(index, canonical, REJECTION_REASONS.redactionPlaceholder);
+        return;
+      }
+
       // Her operasyonun base aralığını çözümler; 0 → red, 2+ → red (spec 51).
       const ranges: Range[] = [];
       let failed = false;
@@ -277,10 +284,6 @@ export function validateWorkerResult(base: WorkspaceBase, workerResult: WorkerRe
         .map((op, i) => ({ replace: op.replace, range: ranges[i] }))
         .filter((entry): entry is { replace: string; range: Range } => entry.range !== undefined)
         .sort((a, b) => b.range.start - a.range.start);
-      if (introducesPlaceholder(edit.operations.map((op) => op.replace), text)) {
-        reject(index, canonical, REJECTION_REASONS.redactionPlaceholder);
-        return;
-      }
       let output = text;
       for (const { replace, range } of withRanges) {
         output = output.slice(0, range.start) + replace + output.slice(range.end);

@@ -53,7 +53,8 @@ test("redactText: PEM certificate block → placeholder", () => {
 });
 
 test("redactText: AWS access key + secret pair → placeholder", () => {
-  const out = redactText("aws_access_key_id = AKIAABCDEFGHIJKLMNOP\naws_secret_access_key = wJalrXUtnFEMI/abcdef0123456789");
+  // İz 3 / M2: boşluklu `KEY = value` yalnız yapılandırma dosyasında → `.ini` yol ipucu.
+  const out = redactText("aws_access_key_id = AKIAABCDEFGHIJKLMNOP\naws_secret_access_key = wJalrXUtnFEMI/abcdef0123456789", { path: "deploy/aws.ini" });
   assert.ok(!out.includes("AKIAABCDEFGHIJKLMNOP"));
   assert.ok(!out.includes("wJalrXUtnFEMI/abcdef0123456789"));
   assert.ok(out.includes(REDACTED_SECRET));
@@ -243,6 +244,8 @@ test("A: code that merely NAMES a credential is untouched (no literal value)", (
     "const strip = (token) => token.trim();",
     "access_token = create_access_token(data)",
     "TOKEN = None",
+    "token=get_token()",
+    'ACCESS_TOKEN=os.getenv("TOKEN")',
     "API_TOKEN = null  # set at runtime",
     "def verify_password(plain_password: str, hashed_password: str) -> bool:",
     "    api_key=api_key,",
@@ -264,7 +267,6 @@ test("A: literal credential values are redacted (typed, quoted-key, dotenv, expo
     ["PASSWORD=hunter2", `PASSWORD=${REDACTED_SECRET}`],
     ["PASSWORD=hunter2\nDEBUG=1", `PASSWORD=${REDACTED_SECRET}\nDEBUG=1`],
     ["PASSWORD=abc;def # rotated", `PASSWORD=${REDACTED_SECRET} # rotated`],
-    ["aws_secret_access_key = wJalr/abc0123", `aws_secret_access_key = ${REDACTED_SECRET}`],
     ["export API_KEY=x", `export API_KEY=${REDACTED_SECRET}`],
     ['token := "abc"', `token := "${REDACTED_SECRET}"`],
     ['private static final String API_KEY = "abc";', `private static final String API_KEY = "${REDACTED_SECRET}";`],
@@ -398,5 +400,118 @@ test("ReDoS: config-hinted redaction stays linear", () => {
     redactText(input, { path: "docker-compose.yml" });
     const elapsed = Date.now() - start;
     assert.ok(elapsed < 1_000, `config redaction took ${elapsed}ms (possible ReDoS)`);
+  }
+});
+
+// ── İz 3 / audit: noktalı anahtar, çapalı ek biçimler, string önekleri ───────
+
+/** [girdi, beklenen, yol ipucu?] — beklenen için idempotans da denetlenir. */
+type Row = [string, string, string?];
+function assertRows(rows: Row[]): void {
+  for (const [input, expected, hint] of rows) {
+    const options = hint === undefined ? {} : { path: hint };
+    assert.equal(redactText(input, options), expected, `input (${hint ?? "no hint"}): ${input}`);
+    assert.equal(redactText(expected, options), expected, `idempotent (${hint ?? "no hint"}): ${expected}`);
+  }
+}
+const S = REDACTED_SECRET;
+
+test("H1: dotted keys on line-anchored forms are redacted", () => {
+  assertRows([
+    ["spring.datasource.password=secret", `spring.datasource.password=${S}`, "src/main/resources/application.properties"],
+    ["spring.datasource.password=secret", `spring.datasource.password=${S}`],
+    ["db.password: x", `db.password: ${S}`, "config/app.yml"],
+    ["  db.password: x", `  db.password: ${S}`, "config/app.yml"],
+    ["mail.smtp.password = x # c", `mail.smtp.password = ${S} # c`, "mail.properties"],
+  ]);
+});
+
+test("H2: indented export, Dockerfile ENV/ARG, commented-out lines, CLI flags are redacted", () => {
+  assertRows([
+    ["    export API_KEY=abc", `    export API_KEY=${S}`],
+    ["ENV DB_PASSWORD=secret", `ENV DB_PASSWORD=${S}`, "Dockerfile"],
+    ["  ARG GITHUB_TOKEN=abc", `  ARG GITHUB_TOKEN=${S}`],
+    ["# PASSWORD=hunter2", `# PASSWORD=${S}`],
+    ["  // API_KEY=abc", `  // API_KEY=${S}`],
+    ["; db.password=x", `; db.password=${S}`],
+    ["! secret=x", `! secret=${S}`],
+    ["# export API_KEY=abc", `# export API_KEY=${S}`],
+    ["# password: hunter2", `# password: ${S}`, "docker-compose.yml"],
+    ["    # db_password = x", `    # db_password = ${S}`, "setup.cfg"],
+    ["mysql --password=hunter2 -u root", `mysql --password=${S} -u root`],
+    ["run --db-password=pw1 --verbose", `run --db-password=${S} --verbose`],
+    ["docker run -e POSTGRES_PASSWORD=secret -d postgres", `docker run -e POSTGRES_PASSWORD=${S} -d postgres`],
+  ]);
+  for (const line of ["    api_key=api_key,", "        token=token)", 'args = ["--password=" + pw]', "x-e PASSWORD=y"]) {
+    assert.equal(redactText(line), line, line);
+    assert.equal(redactText(line, { path: "app/main.py" }), line, line);
+  }
+});
+
+test("M1: string-prefixed and backtick literals are redacted (prefix + quote preserved)", () => {
+  assertRows([
+    ["app.secret_key = b'dev-secret'", `app.secret_key = b'${S}'`],
+    ["token = r\"x\\y\"", `token = r"${S}"`],
+    ["password = f\"{base}-pw\"", `password = f"${S}"`],
+    ["SECRET = rb'abc'", `SECRET = rb'${S}'`],
+    ["api_key = u'abc'", `api_key = u'${S}'`],
+    ['string password = @"p@ss";', `string password = @"${S}";`],
+    ['var token = $"tok-{n}";', `var token = $"${S}";`],
+    ['const wchar_t* token = L"abc";', `const wchar_t* token = L"${S}";`],
+    ['auto password = u8"abc";', `auto password = u8"${S}";`],
+    ["const API_KEY = `abc123`;", "const API_KEY = `" + S + "`;"],
+  ]);
+  assert.equal(redactText("const token = `multi\nline`;"), "const token = `multi\nline`;"); // tek satır kuralı
+});
+
+test("M2: spaced `KEY = value` is config-only; code and unhinted text keep it", () => {
+  const code = ["ACCESS_TOKEN_EXPIRE_MINUTES = 30", "MAX_TOKENS = 4096", "DB_PASSWORD = settings.x"];
+  for (const line of code) {
+    assert.equal(redactText(line), line, line);
+    assert.equal(redactText(line, { path: "app/core/config.py" }), line, line);
+  }
+  assertRows([["aws_secret_access_key = wJalr/abc0123", `aws_secret_access_key = ${S}`, "deploy/aws.ini"]]);
+});
+
+test("L3: config references are kept; quoted list items keep their closing quote", () => {
+  const yml = "docker-compose.yml";
+  for (const line of [
+    "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}",
+    "  token: ${{ secrets.GH_TOKEN }}",
+    "password: $DB_PASS",
+    '  - "API_TOKEN=${TOKEN}"',
+    "password: ${DB_PASS} # from env",
+  ]) {
+    assert.equal(redactText(line, { path: yml }), line, line);
+  }
+  assertRows([
+    ['      - "CLIENT_SECRET=abc"', `      - "CLIENT_SECRET=${S}"`, yml],
+    ["      - 'CLIENT_SECRET=abc' # c", `      - 'CLIENT_SECRET=${S}' # c`, yml],
+  ]);
+});
+
+test("ReDoS: dotted / commented / CLI anchors stay linear on long runs", () => {
+  const inputs = [
+    "spring.".repeat(30_000) + "password=x",
+    "# " + "a.".repeat(50_000),
+    "#" + " ".repeat(100_000) + "x",
+    "// " + "a-".repeat(50_000),
+    "ENV " + "a.".repeat(50_000),
+    "-- ".repeat(30_000),
+    "--password".repeat(20_000),
+    "-e ".repeat(30_000),
+    "--" + "a.".repeat(50_000),
+    "x = `" + "a".repeat(100_000),
+    "token = b" + "'a".repeat(50_000),
+    "token: ${{" + " a".repeat(50_000),
+    "  - \"" + "a.".repeat(50_000),
+  ];
+  for (const input of inputs) {
+    for (const hint of [undefined, "docker-compose.yml"]) {
+      const start = Date.now();
+      redactText(input, hint === undefined ? {} : { path: hint });
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 1_000, `redaction took ${elapsed}ms (possible ReDoS): ${input.slice(0, 20)}`);
+    }
   }
 });

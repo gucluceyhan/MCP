@@ -14,8 +14,8 @@
  *
  * Sıralama (kaba → ince): PEM blokları (iç base64 token desenleriyle
  * çift-çevrime girmez) → token aileleri → Bearer → URL kimliği →
- * credential ataması (literal → satır başı dotenv → yalnız yapılandırma
- * dosyasında çıplak `KEY: value`) → e-posta → telefon.
+ * credential ataması (literal → satır başı dotenv → CLI bayrağı → yalnız
+ * yapılandırma dosyasında çıplak `KEY: value`) → e-posta → telefon.
  */
 
 import path from "node:path";
@@ -73,52 +73,75 @@ const BEARER = /\b(Bearer\s+)[A-Za-z0-9_\-._~+/]+=*/gi;
 const URL_PASSWORD = /\b([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@?#:]*:[^\s/@?#]+@/gi;
 /** HTTP(S) URL gömülü kimlik — parolasız token biçimi de (`https://TOKEN@host`). */
 const URL_USERINFO = /\b(https?:\/\/)[^\s/@?#]+@/gi;
+/** Secret'vari anahtar kelimeleri. */
+const SECRET_WORDS =
+  "password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|client[_-]?secret|private[_-]?key";
 /**
  * Credential anahtarı: secret'vari kelime İÇEREN tam kimlik (`aws_`/`my_`
  * önekleri dahil). Önek/sonek sınırlı + başlangıç yalnız koşu başında
  * (`(?<![\w-])`) → uzun `[\w-]` koşularında doğrusal.
  */
-const SECRET_KEY =
-  "[\\w-]{0,64}(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|client[_-]?secret|private[_-]?key)[\\w-]{0,64}";
+const SECRET_KEY = `[\\w-]{0,64}(?:${SECRET_WORDS})[\\w-]{0,64}`;
+/** Satıra/bayrağa sabitli biçimlerde noktalı anahtar (`spring.datasource.password`). */
+const DOTTED_SECRET_KEY = `[\\w.-]{0,128}(?:${SECRET_WORDS})[\\w-]{0,64}`;
+/** Satır başı yorum işareti (yorumlanmış secret satırları): `#`, `//`, `;`, `!`. */
+const COMMENT_MARK = "(?:#|//|;|!)";
+/** Bildirim anahtar sözcüğü: `export` (shell), Dockerfile `ENV`/`ARG`. */
+const DECLARE = "(?:export|env|arg)";
+/** Değer sonu: opsiyonel kapanış tırnağı + boşluklu `# yorum` ya da satır sonu. */
+const VALUE_END = `["']?(?:[ \\t]+#|[ \\t]*$)`;
 /**
- * Credential ataması — değer yalnız LİTERAL (tırnaklı string; kaçışlı tırnak
- * dahil). Anahtar opsiyonel tırnaklı (JSON `"password": "x"`), anahtar ile
- * ayraç arasında opsiyonel tip anotasyonu (`jwt_secret: str = "x"`,
- * `apiKey: string = "x"`; anotasyon TEK sınırlı niceleyici — boşluk koşusunda
- * karesel geri izleme yok). Ayraç `:`/`=`/`:=`; literal ayraçtan (+ boşluk)
- * HEMEN sonra başlamalı → `==`/`===`/`=>`/`::` yapısal olarak eşleşmez.
- * Grup 1 (anahtar + ayraç) korunur; grup 2 (literal) placeholder'a gider.
+ * Credential ataması — değer yalnız LİTERAL: tırnaklı string (kaçışlı tırnak
+ * dahil; opsiyonel `b`/`r`/`f`/`u`/`rb`/`@`/`$`/`L`/`u8` öneki korunur) ya da
+ * tek satırlık backtick. Anahtar opsiyonel tırnaklı (JSON `"password": "x"`),
+ * anahtar ile ayraç arasında opsiyonel tip anotasyonu (`jwt_secret: str =
+ * "x"`; anotasyon TEK sınırlı niceleyici — boşluk koşusunda karesel geri
+ * izleme yok). Ayraç `:`/`=`/`:=`; literal ayraçtan (+ boşluk) HEMEN sonra
+ * başlamalı → `==`/`===`/`=>`/`::` yapısal olarak eşleşmez.
+ * Grup 1 (anahtar + ayraç) + grup 2 (önek) korunur; grup 3 placeholder'a.
  */
 const CREDENTIAL_LITERAL = new RegExp(
   `(?<![\\w-])(["']?${SECRET_KEY}["']?[ \\t]*` +
     `(?::[\\w.\\[\\]<>|? \\t]{1,64}?=|:=|:|=)[ \\t]*)` +
-    `("(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)*')`,
+    "((?:rb|u8|[brful@$])?)" +
+    "(\"(?:[^\"\\\\\\n]|\\\\.)*\"|'(?:[^'\\\\\\n]|\\\\.)*'|`(?:[^`\\\\\\n]|\\\\.)*`)",
   "gi",
 );
 /**
- * Çıplak değer YALNIZ satır başı `KEY=value` biçiminde (dotenv/ini/
- * properties; opsiyonel `export `): değer satırın geri kalanıdır (boşluklu
- * `# yorum` hariç) ve kod ifadesi değildir (tırnak/parantez/köşeli/süslü
- * yok; `None`/`null`/`true`/`false`… değil). Girintili satır (çağrı
- * argümanı) eşleşmez.
+ * Çıplak değer — her metinde YALNIZ satır başı, BOŞLUKSUZ `KEY=value`
+ * (dotenv/properties; noktalı anahtar serbest). Girinti yalnız bir yorum
+ * işareti (`#`/`//`/`;`/`!`) ya da `export`/`ENV`/`ARG` ile birlikte —
+ * girintili çağrı argümanı (`    api_key=api_key,`) eşleşmez. Değer satırın
+ * geri kalanıdır (boşluklu `# yorum` hariç) ve kod ifadesi değildir
+ * (tırnak/parantez/köşeli/süslü yok; `None`/`null`/`true`/`false`… değil).
+ * Boşluklu `KEY = value` yalnız yapılandırma dosyalarında (CONFIG).
  */
 const CREDENTIAL_DOTENV = new RegExp(
-  `^((?:export[ \\t]+)?${SECRET_KEY}[ \\t]*=[ \\t]*)` +
+  `^((?:[ \\t]*(?:${COMMENT_MARK}[ \\t]*(?:${DECLARE}[ \\t]+)?|${DECLARE}[ \\t]+))?${DOTTED_SECRET_KEY}=)` +
     `(?!(?:none|null|nil|undefined|true|false)(?:[ \\t]|$))` +
-    "([^\\s\"'`()\\[\\]{}]+)(?=[ \\t]+#.*$|[ \\t]*$)",
+    "([^\\s\"'`()\\[\\]{}]+)(?=[ \\t]+#|[ \\t]*$)",
   "gim",
 );
 /**
+ * CLI bayrağı: `--…password…=VALUE` ve `-e KEY=VALUE` (yalnız boşluk/satır
+ * başından sonra). Değer boşluğa kadar; tırnaklı değer literal geçişinindir.
+ */
+const CREDENTIAL_CLI = new RegExp(`(?<!\\S)((?:--|-e[ \\t]+)${DOTTED_SECRET_KEY}=)([^\\s"'\`]+)`, "gi");
+/**
  * Yapılandırma dosyalarında (yol ipucu, `isConfigFilePath`) çıplak değer:
- * satır başı (girinti + YAML `- ` öğesi + `export ` serbest) `KEY: value` /
- * `KEY = value`; değer satır sonuna kadar (boşluklu `# yorum` hariç).
- * Tırnaklı (literal geçişi), `[`/`{` (yer tutucu/akış), `|`/`>` (YAML blok)
- * ve `null`/`~`/`true`… değerler dokunulmaz. Kod dosyaları bu geçişi ALMAZ.
+ * satır başı (girinti, yorum işareti, YAML `- ` öğesi, `export`/`ENV`/`ARG`
+ * serbest; anahtar noktalı/tırnaklı olabilir) `KEY: value` / `KEY = value`;
+ * değer satır sonuna kadar (boşluklu `# yorum` ve kapanış tırnağı hariç).
+ * Tırnakla başlayan (literal geçişi), `[`/`{` (yer tutucu/akış), `|`/`>`
+ * (YAML blok), `null`/`~`/`true`… ve saf referans (`${VAR}`,
+ * `${{ secrets.X }}`, `$VAR`) değerler dokunulmaz. Kod dosyaları bu geçişi
+ * ALMAZ. Boşluk niceleyicileri bitişik değil → doğrusal.
  */
 const CREDENTIAL_CONFIG = new RegExp(
-  `^([ \\t]*(?:-[ \\t]+)?(?:export[ \\t]+)?["']?${SECRET_KEY}["']?[ \\t]*[:=][ \\t]*)` +
-    `(?!(?:none|null|nil|undefined|true|false|~)(?:[ \\t]|$))` +
-    `([^\\s"'\\[{|>](?:[^\\n\\r]*?[^\\s])?)(?=[ \\t]+#|[ \\t]*$)`,
+  `^([ \\t]*(?:${COMMENT_MARK}[ \\t]*)?(?:-[ \\t]+)?(?:${DECLARE}[ \\t]+)?["']?${DOTTED_SECRET_KEY}["']?[ \\t]*[:=][ \\t]*)` +
+    `(?!(?:none|null|nil|undefined|true|false|~)${VALUE_END})` +
+    `(?!(?:\\$\\{\\{[^\\n]*?\\}\\}|\\$\\{[^}\\n]*\\}|\\$[A-Za-z_]\\w*)${VALUE_END})` +
+    `([^\\s"'\\[{|>](?:[^\\n\\r]*?[^\\s])??)(?=${VALUE_END})`,
   "gim",
 );
 /** Çıplak-değer kuralının uygulandığı yapılandırma uzantıları. */
@@ -190,14 +213,15 @@ export function redactText(text: string, options: RedactOptions = {}): string {
   // Credential ataması: anahtar adı + ayraç (+ tip anotasyonu) korunur;
   // yalnız literal değer placeholder'a. Boş tırnak çifti (`""`) secret
   // DEĞİLDİR — dokunulmaz.
-  out = out.replace(CREDENTIAL_LITERAL, (whole: string, prefix: string, literal: string) => {
+  out = out.replace(CREDENTIAL_LITERAL, (whole: string, prefix: string, stringPrefix: string, literal: string) => {
     if (literal.length === 2) {
       return whole;
     }
     const quote = literal.charAt(0);
-    return `${prefix}${quote}${REDACTED_SECRET}${quote}`;
+    return `${prefix}${stringPrefix}${quote}${REDACTED_SECRET}${quote}`;
   });
   out = out.replace(CREDENTIAL_DOTENV, (_whole: string, prefix: string) => `${prefix}${REDACTED_SECRET}`);
+  out = out.replace(CREDENTIAL_CLI, (_whole: string, prefix: string) => `${prefix}${REDACTED_SECRET}`);
   if (options.path !== undefined && isConfigFilePath(options.path)) {
     out = out.replace(CREDENTIAL_CONFIG, (_whole: string, prefix: string) => `${prefix}${REDACTED_SECRET}`);
   }

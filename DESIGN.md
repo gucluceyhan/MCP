@@ -447,13 +447,21 @@ the orchestrator asks for it.
 - `validation` in v1 is **structural only** (schema + allow-list +
   unique search-match + overlap rejection). Two content/path guards add
   fixed reasons (no new wire field): `edit contains a redaction placeholder`
-  — a `modify.replace` / `create.content` carries a redaction placeholder
-  (`[REDACTED_*]`, `[SECRET FILE CONTENT OMITTED]`) that is not literally in
-  that file's base (the worker never saw the hidden value; writing the
-  placeholder would destroy it); `path is ignored` — a `create` targets a
-  path Git ignores (`.gitignore` / `info/exclude` / `core.excludesFile`,
-  decided by `git check-ignore` in the workspace before any write); only
-  that edit is rejected, the round continues. No test/lint execution in v1 — the workspace is a *real,
+  — a `modify` `search`/`replace` or `create.content` carries a redaction
+  placeholder (`[REDACTED_*]`, `[SECRET FILE CONTENT OMITTED]`) that is not
+  literally in **that same file's** base (the worker never saw the hidden
+  value; writing the placeholder would destroy it); `path is ignored` — a
+  `create` targets a path Git ignores (`.gitignore` / `info/exclude` /
+  `core.excludesFile`, decided by `git check-ignore --no-index` in the
+  workspace). The decision is taken **before any write** when the plan does
+  not touch a `.gitignore`; when it creates/modifies/deletes one, the rules
+  change with the round, so the decision is taken **after the writes and
+  before `add -N`** — ignored new files are removed again (pure fs) and
+  rejected. Exempt: a path the orchestrator explicitly selected in `files`
+  that does not exist yet is created even if ignored (`add -N -f`,
+  consistent with base capture force-adding selected ignored files); only
+  the worker's unselected new paths are rejected. Only that edit is
+  rejected, the round continues. No test/lint execution in v1 — the workspace is a *real,
   valid checkout*, which makes a future `splash_verify` (or the orchestrator
   running tests in the workspace dir with its own tools) a natural extension,
   not a redesign.
@@ -1058,13 +1066,18 @@ automatically — only when it genuinely cannot fit.
 - **Secrets & credentials** — `.env`, keys, tokens, passwords, certs:
   redacted (pattern pass: `sk-...`, `AKIA...`, private-key blocks,
   passworded URL credentials of any scheme, credential assignments whose
-  value is a **literal** — a quoted string, or a bare value only on a
-  line-start `KEY=value` / `export KEY=value` line; in **configuration
+  value is a **literal** — a quoted/backtick string, string prefixes such
+  as `b'…'`/`@"…"` kept — or a bare value only in explicitly anchored forms:
+  a line-start, space-free `KEY=value` (dotted keys allowed; indentation
+  only after a comment mark `#`/`//`/`;`/`!` or `export`/`ENV`/`ARG`) and
+  CLI flags `--…password…=VALUE` / `-e KEY=VALUE`. In **configuration
   files** (by path: `.yml`/`.yaml`/`.ini`/`.toml`/`.properties`/`.conf`/
-  `.cfg`/`.env` and `.env.*` templates) also any (indented) bare
-  `KEY: value` / `KEY = value` to end of line; in code files, code that
-  merely names a credential is left intact) and secret files skipped
-  entirely.
+  `.cfg`/`.env`, `.env.*`/`.env-*`/`.env_*` templates) additionally any
+  indented, commented, YAML `- ` list-item bare `KEY: value` /
+  `KEY = value` to end of line, except pure references (`${VAR}`,
+  `${{ secrets.X }}`, `$VAR`). Code files, `.md`, the task, rules, and
+  history get only the literal + anchored forms, so code that merely names
+  a credential is left intact) and secret files skipped entirely.
 - **The orchestrator's system prompt / internal reasoning** — never proxied.
 - **Unrelated code** — only the orchestrator-selected `files`; no repo crawl.
 - **Editability labels** — files added on refine are presented to the worker
@@ -1172,7 +1185,9 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
    selected untracked, incl. allowed git-ignored; base-commit hygiene: hooks
    off, deterministic Splash identity) + **fingerprint (existence + type +
    mode + content)** + validate (unique match, overlap rejection) + apply
-   (+`add -N` intent-to-add) + **scoped reset cleanup** + diff/stat +
+   (+`add -N` intent-to-add; ignored creates rejected via `git check-ignore`
+   before the write, or after it when the plan touches a `.gitignore`;
+   explicitly selected absent paths exempt — Section 3) + **scoped reset cleanup** + diff/stat +
    **complete `--binary --full-index` export**/destroy. *(The safety core.)*
    6. **`splash_task` end-to-end** (context simple) — task → worker → patch →
       validated-apply → **compact result**. *(First real loop.)*
@@ -1192,8 +1207,9 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
       by Step 8):** the shipped step implements secret-file suppression,
       secret/PII redaction, exact token measurement, adaptive tier selection,
        output-reserve negotiation, read-only context reduction, and
-       `needs_split` (credential redaction targets literal values only; every
-       pattern is linear-time on long separator-joined runs); the
+       `needs_split` (credential redaction targets literal values plus the
+       anchored bare forms of Section 9, with a path hint for configuration
+       files; every pattern is linear-time on long separator-joined runs); the
        `splash_task` loop consumes its output (measured
        messages == dispatched messages; `context.input_tokens` is the exact
        preflight count). Step 9 completes this layer with classified refine
@@ -1340,7 +1356,15 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
     `diff.suppressBlankEmpty=false`), so user porcelain config can neither
     corrupt the patch nor invalidate a persisted session; output under the
     default config is byte-identical to before. The export itself keeps the
-    configured diff context (Section 7.6).
+    configured diff context (Section 7.6). A persisted hash computed with
+    the Step 9 formula (unpinned, under that config) is still accepted
+    (reuse decision + recovery verification; persisted state is not
+    rewritten — the next generated round writes the current formula).
+    Before `splash_diff` / `splash_close` use a RAM-cached workspace, its
+    state is checked against the committed hash; on drift (an external
+    edit after the last round) the committed state is re-applied and
+    verified, and on failure RAM is evicted with `session_recovery_failed`
+    (nothing exported or deleted).
 11. **End-to-end** on a real repo + real local model: verify compact
     responses, on-demand diff, `git apply` merge into the main checkout,
     refine-loop convergence with bounded token growth, the stale-base path
