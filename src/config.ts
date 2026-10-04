@@ -91,6 +91,22 @@ function readOptionalString(env: NodeJS.ProcessEnv, key: string): string | undef
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * `SPLASH_API_KEY` (İz 2 / L5): kırpılmış değer YALNIZ görünür ASCII
+ * (0x21-0x7E) olabilir — CR/LF/NUL/boşluk/kontrol ya da ASCII dışı karakter
+ * header enjeksiyonu (`\r\n`) ya da header kurulumunda anahtarı yansıtan
+ * bir hata üretir. Hata mesajı anahtarı ASLA içermez.
+ */
+function readApiKey(env: NodeJS.ProcessEnv): string | undefined {
+  const key = readOptionalString(env, "SPLASH_API_KEY");
+  if (key !== undefined && !/^[\x21-\x7e]+$/.test(key)) {
+    throw new Error(
+      "Invalid SPLASH_API_KEY: expected visible ASCII characters only (no whitespace or control characters)",
+    );
+  }
+  return key;
+}
+
 function readPositiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
   const trimmed = env[key]?.trim();
   if (!trimmed) {
@@ -251,7 +267,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SplashConfig {
     backend: {
       baseUrl: readUrl(env, "SPLASH_BACKEND_BASE_URL", CONFIG_DEFAULTS.backend.baseUrl),
       model: readString(env, "SPLASH_BACKEND_MODEL", CONFIG_DEFAULTS.backend.model),
-      apiKey: readOptionalString(env, "SPLASH_API_KEY"),
+      apiKey: readApiKey(env),
     },
     repoRoot: repoRoot !== "" ? path.resolve(expandHome(repoRoot)) : undefined,
     outputRoot: path.resolve(

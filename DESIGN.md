@@ -283,7 +283,8 @@ Seven components. Deliberately few; each is small.
   - **Optional API key (final):** `api_key` from the `SPLASH_API_KEY`
     environment variable (trimmed; blank = unset). When set it is sent as
     `Authorization: Bearer <key>`; it is never logged and never part of any
-    error message.
+    error message. The key must be visible ASCII (0x21–0x7E): whitespace,
+    CR/LF, NUL, control or non-ASCII characters are rejected at config load.
 - **Runtime capacity (authoritative, final):** at startup / backend
   readiness, query the runtime's status endpoint for
   `maximum_context_tokens` (it depends on the current model, hardware, and
@@ -296,7 +297,25 @@ Seven components. Deliberately few; each is small.
 - **Single-flight by construction (final):** the adapter serves exactly one
   request at a time and **implements no parallel scheduling of its own** —
   all serialization is the Inference Coordinator's job (Section 2.7); the
-  adapter is a leaf, reached only through the coordinator.
+  adapter is a leaf. **Generation** reaches it only through the coordinator's
+  FIFO; the Context Assembler's **measurement** traffic (`/status`,
+  `/v1/models`, `/apply-template`, `/tokenize`) is not serialized, but every
+  round first passes the coordinator's lock-free **probe** (Section 2.7): if
+  the lock is busy the runtime is not contacted at all; otherwise only the
+  identity refresh (`/status` + `/v1/models`) needed for the host scan runs —
+  no tokenize/template measurement. A busy host returns `inference_busy`
+  before any measurement.
+  - **No timeout for generation (final):** a non-stream generation may take
+    longer than any fixed limit (the built-in `fetch` would abort after 300 s
+    while the runtime keeps generating), so the adapter uses `node:http(s)`
+    and `/v1/chat/completions` has no timeout; the caller's `AbortSignal` is
+    the only cancellation. Control and measurement calls are bounded by fixed
+    socket-idle limits (not configurable): `/status`, `/v1/models` 60 s;
+    `/tokenize`, `/apply-template` 300 s — a hung runtime can never hold the
+    coordinator lock indefinitely; the expiry is the honest "timed out"
+    `network` error. Redirects are never followed (a 3xx is a typed `http`
+    error — the prompt never reaches another origin), and response bodies are
+    capped (64 MiB).
   - **Core independence:** no Splash core component references the concrete
     engine or the model name — those are config data consumed only by the
     backend adapter.
@@ -306,7 +325,10 @@ Seven components. Deliberately few; each is small.
     response content (Section 9 boundary). The configured API key is redacted
     to `[REDACTED]` inside any stored detail: even if the runtime or a proxy
     reflects the key in an error body, the key never appears in `message` NOR
-    `cause`.
+    `cause`. A `network` error's `cause` is only the error code (e.g.
+    `ECONNREFUSED`); a timeout code maps to an honest "timed out" message. A
+    completion that ends with `finish_reason: "length"` is the typed
+    `output_truncated` error (output budget exhausted), not "invalid JSON".
 - Carries `usage` (tokens in/out) back; `run()` accepts the selected context
   tier (and output reserve) as options.
 
@@ -362,12 +384,16 @@ Seven components. Deliberately few; each is small.
   inference dispatch**, and Splash **refuses to compete** rather than assume
   exclusivity. The coordinator identifies the *configured* Splash runtime
   from the backend's `/status` `instance.pid` (read on every refresh, never
-  assumed) and excludes that PID **and all of its descendants** (e.g. the
-  native `serve-native` child runtime) from the conflict scan, so the
-  intentional backend process tree is never reported as a conflict.
+  assumed; only a safe integer > 1 is trusted) and excludes that PID, **all of
+  its descendants** (e.g. the native `serve-native` child runtime) **and its
+  ancestor chain** (e.g. a `uv`/`uvx` launcher; never an ancestor's other
+  subtrees) from the conflict scan, so the intentional backend process tree is
+  never reported as a conflict.
   Detection signatures are token-based: MLX counts an `mlx_lm`/`mlx_vlm`
   entry point invoked through any CPython interpreter form (including
-  versioned interpreters such as `python3.13` and virtualenv paths);
+  versioned interpreters such as `python3.13`, virtualenv paths, interpreter
+  paths containing spaces, and the macOS framework executable
+  `Python.app/Contents/MacOS/Python`);
   Ollama counts only the actual serving/runner daemon processes
   (`ollama serve` / `ollama runner`) — administrative CLI commands
   (`ollama list`, `ollama ps`, ...) are not conflicts.
@@ -377,7 +403,23 @@ Seven components. Deliberately few; each is small.
   concurrent *Splash* inference; the external-runtime detection is the
   additional guard against other known runtimes. The lock is released after
   every dispatch; a failed release is surfaced as a typed lock-cleanup error
-  — never silently reported as success.
+  — never silently reported as success. Stale-lock recovery is bound to the
+  inspected lock instance (inode, re-verified under an `inference.lock.reclaim`
+  guard); a lock that vanished during inspection is never "reclaimed".
+  **Remaining heuristic bound:** a reclaim guard older than the 5 s grace is
+  treated as abandoned (crashed reclaimer) and removed; a reclaimer that is
+  merely *paused* for ≥ 5 s inside its microsecond critical section (e.g.
+  SIGSTOP) could therefore overlap a second reclaimer. The same grace bound
+  already governs incomplete owner records; it is a documented limit, not a
+  guarantee.
+- **Pre-measurement probe:** before a round's context is measured, the
+  coordinator runs a lock-free probe. If the lock has a live foreign owner (or
+  cannot be verified) it answers immediately without contacting the runtime;
+  otherwise it performs only the identity refresh needed for the host
+  conflict check — no tokenize/template measurement. A same-process dispatch
+  is never a conflict, and an aborted request is rejected as aborted. Busy →
+  immediate `inference_busy` with no measurement traffic; the dispatch still
+  re-checks everything (the probe is advisory).
 - **On a detected conflict** — do **not** start another model and do **not**
   send the request: preserve the Splash session and **immediately return a
   compact `inference_busy` status** (Section 3) — the metadata names the
@@ -491,12 +533,15 @@ the orchestrator asks for it.
   session is **preserved** (persisted, Section 2): the orchestrator can
   continue explicitly, inspect via `splash_diff`, close, or start a new task.
 - **`inference_busy`** — a **conflicting external** local inference runtime
-  was detected at dispatch (the host inference resource is occupied;
-  Section 2.7). The request is **not** enqueued for hidden background work
+  was detected at the pre-measurement probe or at dispatch (the host
+  inference resource is occupied; Section 2.7). The request is **not** enqueued for hidden background work
   and no inference is run — the status is returned **immediately**; the
   session, workspace, and all persisted state are **preserved** (nothing is
   destroyed, nothing is re-routed to another engine); the `inference`
   metadata names the detected conflict and Claude Code may **retry later**.
+  When the pre-measurement probe detects it, no context was measured: the
+  `context` metadata is the last known one (`input_tokens` 0), or zeros if the
+  session has no round yet.
   **No source-code content** is part of this status. (If instead *another
   Splash session* owns inference — same process — the request simply **waits
   in the FIFO queue** and the call returns the normal result; that is not

@@ -1378,12 +1378,16 @@ export class SessionManager {
     return this.#generatedResult(sessionId, round, outcome);
   }
 
-  /** `inference_busy` sonucu (spec 37/137): model çağrılmadı, workspace değişmedi. */
+  /**
+   * `inference_busy` sonucu (spec 37/137): model çağrılmadı, workspace değişmedi.
+   * `assembly` `null` → ön-kapıda (İz 2 / M4) yakalandı, ölçüm YAPILMADI:
+   * 1. turda bağlam telemetrisi sıfırdır (icat edilmez).
+   */
   #busyResult(
     sessionId: string,
     round: number,
     conflict: InferenceConflict,
-    assembly: Extract<AssembledContext, { status: "ready" }>,
+    assembly: Extract<AssembledContext, { status: "ready" }> | null,
     rulesSource: RulesSource,
   ): CompactResult {
     return {
@@ -1392,18 +1396,12 @@ export class SessionManager {
       status: "inference_busy",
       baseStatus: "fresh",
       rulesSource,
-      context: {
-        runtimeMaxTokens: assembly.runtimeMaxTokens,
-        inputTokens: 0, // model çağrılmadı — hakediş icat edilmez
-        outputReserveTokens: assembly.outputReserveTokens,
-        selectedContextTier: assembly.selectedContextTier,
-        truncatedReadonlyContext: assembly.truncatedReadonlyContext,
-      },
+      context: busyContext(assembly, undefined),
       summary: INFERENCE_BUSY_SUMMARY,
       filesChanged: [],
       diffStats: { files: 0, insertions: 0, deletions: 0 },
       validation: { editsRequested: 0, editsApplied: 0, rejected: [] },
-      warnings: [...assembly.warnings],
+      warnings: assembly !== null ? [...assembly.warnings] : [],
       usage: { in: 0, out: 0 },
       inference: { conflict },
     };
@@ -1495,7 +1493,7 @@ export class SessionManager {
     session: PersistedSession,
     round: number,
     conflict: InferenceConflict,
-    assembly: Extract<AssembledContext, { status: "ready" }>,
+    assembly: Extract<AssembledContext, { status: "ready" }> | null,
     rulesSource: RulesSource,
   ): CompactResult {
     const previous = previousOutcomeFields(session);
@@ -1505,18 +1503,13 @@ export class SessionManager {
       status: "inference_busy",
       baseStatus: "fresh",
       rulesSource,
-      context: {
-        runtimeMaxTokens: assembly.runtimeMaxTokens,
-        inputTokens: 0, // model çağrılmadı
-        outputReserveTokens: assembly.outputReserveTokens,
-        selectedContextTier: assembly.selectedContextTier,
-        truncatedReadonlyContext: assembly.truncatedReadonlyContext,
-      },
+      // `assembly` `null` (ön-kapı, İz 2 / M4): son bilinen kalıcı telemetri.
+      context: busyContext(assembly, session.latestResult),
       summary: INFERENCE_BUSY_SUMMARY,
       filesChanged: previous.filesChanged,
       diffStats: previous.diffStats,
       validation: previous.validation,
-      warnings: [...assembly.warnings],
+      warnings: assembly !== null ? [...assembly.warnings] : [],
       usage: { in: 0, out: 0 },
       inference: { conflict },
     };
@@ -1652,6 +1645,37 @@ function previousOutcomeFields(session: PersistedSession): {
       editsApplied: last.validation.editsApplied,
       rejected: last.validation.rejected.map((rejection) => ({ ...rejection })),
     },
+  };
+}
+
+/**
+ * `inference_busy` bağlam telemetrisi: dispatch'te yakalandıysa ölçülen
+ * bütçe (`input_tokens` 0 — prompt gönderilmedi); ön-kapıda (İz 2 / M4)
+ * yakalandıysa ölçüm YOKTUR → son bilinen kalıcı telemetri (input 0) ya da
+ * hiç tur yoksa sıfır metadata (`stale_base`/`max_rounds` ile aynı kural).
+ */
+function busyContext(
+  assembly: Extract<AssembledContext, { status: "ready" }> | null,
+  last: CompactResult | undefined,
+): CompactContextMetadata {
+  if (assembly !== null) {
+    return {
+      runtimeMaxTokens: assembly.runtimeMaxTokens,
+      inputTokens: 0, // model çağrılmadı — hakediş icat edilmez
+      outputReserveTokens: assembly.outputReserveTokens,
+      selectedContextTier: assembly.selectedContextTier,
+      truncatedReadonlyContext: assembly.truncatedReadonlyContext,
+    };
+  }
+  if (last !== undefined) {
+    return { ...last.context, inputTokens: 0 };
+  }
+  return {
+    runtimeMaxTokens: 0,
+    inputTokens: 0,
+    outputReserveTokens: 0,
+    selectedContextTier: "runtime_max",
+    truncatedReadonlyContext: false,
   };
 }
 
