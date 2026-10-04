@@ -2549,7 +2549,7 @@ test("failed-rollback residue (EACCES seam): the planted attribute is never exec
 //
 // Düzeltme (bu testler): her `git reset --hard` (3 nokta) ÖNCESİ,
 // worker-çıkışlı tracked attr yüzeyi saf-fs ile BİREBİR immutable base'e
-// restore edilir (`workerTouchedAttributePaths` + `restoreBaseAttributeFiles`);
+// restore edilir (`workerTouchedAttributePaths` + `restoreBaseFiles`);
 // restore başarısız → reset YÜRÜTÜLMEZ. F-6 re-check'leri bu restore'u
 // İKAME ETMEZ — ikisi de devrededir (restore ≠ dedektör).
 

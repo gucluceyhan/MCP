@@ -496,6 +496,20 @@ export class SessionManager {
       throw err;
     }
 
+    // ── K1 stale referansı: oluşturmada ANA working dosyası ölçümü ──────────
+    // (fabrika iki okumayla yakalar). Yoksa ya da yol kümesi düzenlenebilir
+    // yollarla BİREBİR değilse stale doğru ölçülemez → fail-closed.
+    const liveBase = workspace.base.liveFingerprints;
+    if (
+      liveBase === undefined ||
+      liveBase.size !== workspace.editablePaths.length ||
+      workspace.editablePaths.some((canonical) => !liveBase.has(canonical))
+    ) {
+      const err = sessionError("session_operation_failed", "missing live base fingerprints");
+      await this.#cleanupCreatedSession(workspace, sessionDir, err);
+      throw err;
+    }
+
     // ── İLK KALICILIK (spec 157/336): oturum kullanılır olmadan ÖNCE disk ──
     const session: PersistedSession = {
       schemaVersion: SESSION_SCHEMA_VERSION,
@@ -508,6 +522,7 @@ export class SessionManager {
       editablePaths: [...workspace.editablePaths].sort(), // deterministik (spec 268)
       readonlyPaths: [],
       workspaceRecovery: recovery,
+      liveBaseFingerprints: [...liveBase.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
       round: 0,
       maxRoundsAcknowledged: false,
       rounds: [],
@@ -1025,7 +1040,9 @@ export class SessionManager {
     return decideStale({
       repoRoot: session.repoRoot,
       editablePaths: session.workspaceRecovery.editablePaths,
-      baseFingerprints: new Map(session.workspaceRecovery.baseFingerprints),
+      // K1: v2 referansı ana dosyadan yakalanmıştır (canlı↔canlı); v1
+      // oturumu bu alanı taşımaz → eski davranış (worktree parmak izi).
+      baseFingerprints: new Map(session.liveBaseFingerprints ?? session.workspaceRecovery.baseFingerprints),
       createdPaths: session.currentCreatedPaths,
       live,
     });
