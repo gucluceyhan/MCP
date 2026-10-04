@@ -4,8 +4,11 @@
  *
  * SORUMLULUK (spec 53/363): canlı okuma YAPMAZ — `ContextAssembler
  * .captureLiveBase` (strict no-follow yakalama; spec 45-52) canlı durumu
- * ölçer, BU fonksiyon yalnızca persisted immutable taban ile ölçülen canlı
- * durumu karşılaştırıp stale yolu listesini üretir. Git YOK (spec 265:
+ * ölçer, BU fonksiyon yalnızca persisted immutable taban referansı ile
+ * ölçülen canlı durumu karşılaştırıp stale yolu listesini üretir. Referans
+ * (K1, oturum şeması v2): oluşturmada ANA working dosyasından AYNI strict
+ * yakalamayla alınan parmak izi → canlı↔canlı, aynı ölçek; v1 oturumu
+ * worktree parmak izini taşır (eski davranış). Git YOK (spec 265:
  * working-file baytları ölçü birimidir — `git diff`/`git status` KULLANILMAZ),
  * I/O YOK, saat YOK (mtime ASLA — spec 429/430).
  *
@@ -43,8 +46,8 @@ import type { LiveBaseState } from "../context/types.js";
  * - `repoRoot`: ana repository'nin KANONİK mutlak kökü (persisted).
  * - `editablePaths`: oturumun BİTMEZ düzenlenebilir taban yolları (kanonik,
  *   repository-göreceli).
- * - `baseFingerprints`: canonical yol → base yakalama anındaki parmak izi
- *   (persisted immutable snapshot).
+ * - `baseFingerprints`: canonical yol → taban referans parmak izi (persisted
+ *   immutable snapshot; v2: oluşturmadaki canlı ana-dosya ölçümü).
  * - `createdPaths`: son doğrulanmış turun worker-oluşturduğu yollar (kanonik).
  * - `live`: `captureLiveBase` çıktısı (strict canlı ölçüm — absolute anahtarlar).
  */

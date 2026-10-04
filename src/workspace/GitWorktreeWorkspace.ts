@@ -31,9 +31,12 @@
  *   7.  base SHA kaydedilir → immutable (spec 27); base AĞAÇ HARİTASI
  *       (`basePaths`) base commit'in `ls-tree`'inden; parmak izlerinin
  *       tip/mod/içeriği worktree'nin ÇALIŞMA DOSYALARINDAN (lstat +
- *       dosya baytları / link hedef metni) — canlı parmak iziyle BİREBİR
- *       aynı alan (PR #24: `text`/`eol` normalizasyonu blob ile working
- *       tree'yi farklı baytlara sokabilir; iki alan karıştırılmaz)
+ *       dosya baytları / link hedef metni) — worker görünümü + doğrulama
+ *       ölçeği (PR #24: `text`/`eol` normalizasyonu blob ile working
+ *       tree'yi farklı baytlara sokabilir; iki alan karıştırılmaz).
+ *       Stale REFERANSI ayrıdır (K1): düzenlenebilir yolların ANA working
+ *       dosyasından, çalışma ağacı deltası yakalanmadan ÖNCE ve base commit'ten SONRA iki
+ *       kez strict yakalanır (fark → yarış → red; `base.liveFingerprints`)
  *
  * v1 güvenlik politikası (PR #24 — tamamı SABİT mesajlı fail-closed red):
  * - seçili yol, sembolik-bağlantı ATALI üzerinden izlenemez — ne ana
@@ -120,8 +123,16 @@ import {
   resolveContained,
   symlinkTargetStaysInside,
 } from "./pathSafety.js";
-import { errnoIs } from "./SafeRepoReader.js";
-import { captureLiveFingerprint, gitModeType, normalizeGitFileMode, sha256Hex } from "./fingerprint.js";
+import { errnoIs, noFollowReadFile } from "./SafeRepoReader.js";
+import {
+  captureLiveFingerprint,
+  captureStrictLiveFingerprint,
+  fingerprintsEqual,
+  gitModeType,
+  normalizeGitFileMode,
+  sha256Hex,
+  type StrictReadSeams,
+} from "./fingerprint.js";
 import { validateWorkerResult, type EditPlan, type WorkspaceBase } from "./validate.js";
 
 /** Deterministik Splash commit kimliği (spec 25 — kullanıcının git kimliği GEREKMEZ). */
@@ -138,7 +149,7 @@ const SPLASH_GIT_IDENTITY: NodeJS.ProcessEnv = {
  * Worker-oluşturulan yol temizliğinin (PR #24 Fix 4) + worker-takmış
  * `.gitattributes` restore'unun (PR #24 SB-1) fs arayüzü: `lstat` +
  * `unlink` (temizlik) ve `mkdir` + `writeFile` + `chmod` (restore).
- * `removeWorkerCreatedPaths` ve `restoreBaseAttributeFiles` bu aktif fs
+ * `removeWorkerCreatedPaths` ve `restoreBaseFiles` bu aktif fs
  * üzerinden çalışır — testler `setWorkspaceFs` ile arıza senaryoları
  * (ENOENT/EACCES/...) enjekte eder; `null` gerçek fs'e döner. Modülün geri
  * kalanı node:fs'i doğrudan kullanır.
@@ -166,6 +177,18 @@ let activeFs: WorkspaceFs = realFs;
 /** Test enjeksiyonu seam'i: `null` → gerçek node:fs. */
 export function setWorkspaceFs(ops: WorkspaceFs | null): void {
   activeFs = ops === null ? realFs : ops;
+}
+
+/**
+ * K1 canlı taban yakalamasının (oluşturmada ANA working dosyası) okuma
+ * dikişi — test: iki okuma arasına yarış enjeksiyonu. `null` → production
+ * (`lstat` / `readlink` / no-follow okuma — stale denetimiyle aynı).
+ */
+let liveCaptureSeams: StrictReadSeams = {};
+
+/** Test enjeksiyonu seam'i: `null` → gerçek okuma. */
+export function setLiveCaptureSeams(seams: StrictReadSeams | null): void {
+  liveCaptureSeams = seams ?? {};
 }
 
 /**
@@ -209,6 +232,9 @@ const STATE_HASH_DIFF_ARGS: readonly string[] = [
 ];
 /** `STATE_HASH_DIFF_ARGS`'ın bayrağı olmayan ayarları (komut-bazlı `-c`). */
 const STATE_HASH_DIFF_CONFIG: readonly string[] = ["core.quotePath=true", "diff.suppressBlankEmpty=false"];
+
+/** SB-1 attribute restore'unun SABİT hata mesajı (`restoreBaseFiles` varsayılanı). */
+const RESTORE_ATTRIBUTES_FAILED = "Restoring the attribute files failed";
 
 /** `err`'ın `NodeJS.ErrnoException.code`'u verilen errno'ya eşit mi? */
 function isErrnoCode(err: unknown, code: string): boolean {
@@ -757,7 +783,7 @@ export class GitWorktreeWorkspace implements Workspace {
     // filter'ı host'ta yürütür; yüzey git komutundan ÖNCE base'in birebir
     // attribute haliyle geri yazılır. Hata → yöntem RED, reset YÜRÜTÜLMEZ.
     try {
-      await this.restoreBaseAttributeFiles(this.workerTouchedAttributePaths);
+      await this.restoreBaseFiles(this.workerTouchedAttributePaths);
     } catch (err) {
       if (err instanceof WorkspaceError) {
         throw err;
@@ -783,6 +809,9 @@ export class GitWorktreeWorkspace implements Workspace {
     // temizlenir.
     this.workerCreatedPaths = new Set<string>();
     this.workerTouchedAttributePaths = new Set<string>();
+    // (2b) W-M6: reset'in EOL-normalize ettiği düzenlenebilir dosyalar →
+    // base baytları (worker'ın gördüğü ölçek); hata → güvenli tip'li red.
+    await this.restoreNormalizedEditableFiles();
 
     // (3) TÜM seti immutable base'e karşı doğrula — yazmadan ÖNCE (spec 39).
     const validation = validateWorkerResult(this.validationBase, workerResult);
@@ -937,7 +966,7 @@ export class GitWorktreeWorkspace implements Workspace {
         // --hard`'ın racy içerik doğrulaması bu yüzeyi CLEAN filter'la
         // yürütür; yüzey worker'ınki değil, base'in olmalı.
         try {
-          await this.restoreBaseAttributeFiles(this.workerTouchedAttributePaths);
+          await this.restoreBaseFiles(this.workerTouchedAttributePaths);
         } catch (restoreErr) {
           rollback = { error: restoreErr, message: "Restoring the attribute files failed" };
         }
@@ -1009,7 +1038,7 @@ export class GitWorktreeWorkspace implements Workspace {
     // attr kümesi aynen kalır (kalıntı unutulmaz — sonraki çağrı yeniden
     // restore'u dener).
     try {
-      await this.restoreBaseAttributeFiles(this.workerTouchedAttributePaths);
+      await this.restoreBaseFiles(this.workerTouchedAttributePaths);
     } catch (err) {
       if (err instanceof WorkspaceError) {
         throw err;
@@ -1298,9 +1327,63 @@ export class GitWorktreeWorkspace implements Workspace {
   }
 
   /**
-   * Worker'ın modify/delete ettiği tracked `.gitattributes` yollarını
-   * (PR #24 SB-1) saf-fs ile BİREBİR immutable base haliyle geri yazar:
-   * base'in yakalanma anındaki working-tree baytları + git modu.
+   * W-M6: `reset --hard` SONRASI, git'in `text`/`eol` normalizasyonuyla
+   * blob'tan YENİDEN yazdığı düzenlenebilir düzenli dosyaları immutable base
+   * baytlarına döndürür (ör. `text=auto` + untracked CRLF taban: blob LF →
+   * reset LF yazar ≠ worker'ın gördüğü CRLF → modify drift denetimi turu ve
+   * kurtarmayı düşürürdü). Yalnız worktree'de atal-symlink'siz DÜZENLİ dosya
+   * olan ve baytları base'ten farklı yollar `restoreBaseFiles`'a gider (aynı
+   * atal/hedef symlink güvenliği + mod aynası); yokluk/tip sapması
+   * DOKUNULMAZ — mevcut drift denetimleri raporlar. Git açısından no-op:
+   * base baytları base commit'in kendi clean normalizasyonundan geçmiştir.
+   */
+  private async restoreNormalizedEditableFiles(): Promise<void> {
+    const failure = "Restoring the base files failed";
+    const drifted: string[] = [];
+    for (const [canonical, fingerprint] of this.validationBase.editable) {
+      const baseContent = this.validationBase.editableContent.get(canonical);
+      const abs = resolveContained(this.workspaceDir, canonical);
+      if (!fingerprint.exists || fingerprint.type !== "file" || baseContent === undefined || abs === null) {
+        continue;
+      }
+      try {
+        if (await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: true })) {
+          continue;
+        }
+        const stat = await lstat(abs).catch(() => null);
+        if (stat === null || !stat.isFile() || (await readFile(abs)).equals(baseContent)) {
+          continue;
+        }
+      } catch (err) {
+        throw new WorkspaceError("workspace_operation_failed", failure, { cause: err });
+      }
+      drifted.push(canonical);
+    }
+    if (drifted.length === 0) {
+      return;
+    }
+    await this.restoreBaseFiles(drifted, failure);
+    // LOW-2 (ölçüldü, Apple Git 2.50.1): `diff.autoRefreshIndex=false` iken
+    // geri yazılan dosya stat-kirli kalır ve `diff --name-only` onu sahte
+    // "değişti" listeler. `update-index --refresh` YETMEZ (boyut farkı içerik
+    // karşılaştırmasız "değişti" sayılır) → yollar index'e yeniden kaydedilir:
+    // base baytlarının clean'i base blob'udur, yalnız stat güncellenir. Index
+    // base'ten saparsa (beklenmez) → fail-closed.
+    try {
+      await this.git(["update-index", "--", ...drifted]);
+      await this.git(["diff", "--cached", "--quiet", this.baseCommit, "--", ...drifted.map(literalPathspec)]);
+    } catch (err) {
+      throw new WorkspaceError("workspace_operation_failed", failure, { cause: err });
+    }
+  }
+
+  /**
+   * Verilen base yollarını saf-fs ile BİREBİR immutable base haliyle geri
+   * yazar: base'in yakalanma anındaki working-tree baytları + git modu.
+   * Kullanımlar: worker'ın modify/delete ettiği tracked `.gitattributes`
+   * yolları (PR #24 SB-1, `reset --hard` ÖNCESİ) ve git'in EOL
+   * normalizasyonuyla yeniden yazdığı düzenlenebilir dosyalar (W-M6,
+   * `reset --hard` SONRASI — `restoreNormalizedEditableFiles`).
    *
    * GEREKÇE (ölçüldü, Apple Git 2.50.1): `git reset --hard <base>` bir
    * tracked dosyanın stat'ı (boyut + mtime saniyesi) index'le "aynı"
@@ -1333,18 +1416,18 @@ export class GitWorktreeWorkspace implements Workspace {
    *
    * Adım 5–7 `activeFs` seam'i üzerinden (test: arıza/enjeksiyonu).
    */
-  private async restoreBaseAttributeFiles(paths: Iterable<string>): Promise<void> {
+  private async restoreBaseFiles(paths: Iterable<string>, failure: string = RESTORE_ATTRIBUTES_FAILED): Promise<void> {
     for (const canonical of paths) {
       const abs = resolveContained(this.workspaceDir, canonical);
       if (abs === null) {
-        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+        throw new WorkspaceError("workspace_operation_failed", failure);
       }
       const fingerprint = this.validationBase.editable.get(canonical);
       if (fingerprint === undefined || !fingerprint.exists) {
         // Restore edilecek base hali temsil edilemiyor → fail-closed.
         // (validate modify/delete → `editable` zorlar; yapısal olarak
         // beklenmez — bilinmeyen hal git'ten asla geçirilmez.)
-        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+        throw new WorkspaceError("workspace_operation_failed", failure);
       }
       if (fingerprint.type !== "file") {
         // symlink (120000) / gitlink (160000): base'in link hedef metni /
@@ -1352,27 +1435,27 @@ export class GitWorktreeWorkspace implements Workspace {
         // yazılamaz (link'in kendisi `unlink` + `symlink` ister; mod
         // aynası anlamsız). Fail-closed: reset YÜRÜTÜLMEZ (PR #24 SB-1
         // kararı).
-        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+        throw new WorkspaceError("workspace_operation_failed", failure);
       }
       const baseContent = this.validationBase.editableContent.get(canonical);
       if (baseContent === undefined) {
         // Parmak izi "file" diyor ama içerik yakalanmamış — tutarsızlık.
-        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+        throw new WorkspaceError("workspace_operation_failed", failure);
       }
       if (await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: true })) {
         // Atal/hedef link → bayt-yazımı workspace dışına kaçar (Fix 1-B
         // ile aynı gerekçe). Denetim GERÇEK fs'tir (yukarıda).
-        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+        throw new WorkspaceError("workspace_operation_failed", failure);
       }
       try {
         await activeFs.mkdir(path.dirname(abs), { recursive: true });
         await activeFs.writeFile(abs, baseContent);
-        await activeFs.chmod(abs, attributeBaseMode(fingerprint.mode));
+        await activeFs.chmod(abs, baseFileMode(fingerprint.mode, failure));
       } catch (err) {
         if (err instanceof WorkspaceError) {
           throw err;
         }
-        throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed", {
+        throw new WorkspaceError("workspace_operation_failed", failure, {
           cause: err,
         });
       }
@@ -1448,14 +1531,14 @@ export class GitWorktreeWorkspace implements Workspace {
  * olarak beklenmez (`file` tipi yalnız bu ikisini taşır) → fail-closed:
  * restore, bilinmeyen modda yürütülmez.
  */
-function attributeBaseMode(mode: string): number {
+function baseFileMode(mode: string, failure: string): number {
   if (mode === "100755") {
     return 0o755;
   }
   if (mode === "100644") {
     return 0o644;
   }
-  throw new WorkspaceError("workspace_operation_failed", "Restoring the attribute files failed");
+  throw new WorkspaceError("workspace_operation_failed", failure);
 }
 
 // ── Oluşturma ───────────────────────────────────────────────────────────────
@@ -1831,6 +1914,12 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
   // → temiz çıkış, geriye hiçbir şey kalmaz.
   await assertNoExternalFilters(repoRoot, [...editable, ...readonly], headSha);
 
+  // ── (K1) canlı taban ölçeği — 1. okuma, çalışma ağacı deltasından ÖNCE ──
+  // Stale denetimi ANA working dosyasını ölçer; referans da aynı ölçekten
+  // alınır (worktree baytı/modu değil — git'in EOL/mod/skip-worktree
+  // yorumu iki tarafı kalıcı ayırıyordu). Worktree henüz yok → temiz çıkış.
+  const liveBefore = await captureMainLiveFingerprints(repoRoot, editable);
+
   // ── (1) tracked delta: staged + unstaged, binary, tam index (spec 19) ────
   // `git diff` (düz) KULLANILMAZ — yalnızca staged değişiklikleri kaçırır.
   let trackedDelta: Buffer;
@@ -1919,6 +2008,11 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
       }
     }
 
+    // ── (4b) DESIGN §7.3 invariantı (base == ana working tree): git'in
+    // gizlediği yerel hâl (assume-unchanged / skip-worktree / sparse) tabana
+    // ana dosyadan alınır ya da oluşum reddedilir — iki okuma aralığında.
+    await reconcileEditableWithMain(repoRoot, workspaceDir, editable, liveBefore);
+
     // ── (5/6) base'i stage'le: add -A + seçilen ignored tekil -f (spec 22/24) ──
     try {
       await runGit(["add", "-A"], { cwd: workspaceDir, config: [HOOKS_DISABLED_CONFIG] });
@@ -1995,13 +2089,26 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
       readonly,
     );
 
+    // ── (K1) 2. okuma — base commit'ten SONRA. Fark = yakalama sırasında
+    // ana ağaç değişti; taban hangi hâlden kurulduğu bilinemez → red (yarış).
+    const liveAfter = await captureMainLiveFingerprints(repoRoot, editable);
+    for (const [canonical, before] of liveBefore) {
+      const after = liveAfter.get(canonical);
+      if (after === undefined || !fingerprintsEqual(before, after)) {
+        throw new WorkspaceError(
+          "workspace_operation_failed",
+          "The repository changed while the session base was being captured",
+        );
+      }
+    }
+
     return new GitWorktreeWorkspace(
       repoRoot,
       workspaceDir,
       baseCommit,
       input.sessionId,
       [...editable],
-      publicBase,
+      { ...publicBase, liveFingerprints: liveBefore },
       validationBase,
     );
   } catch (err) {
@@ -2062,6 +2169,141 @@ function workspaceEntryPath(workspaceDir: string, gitPath: string): string | nul
 }
 
 /**
+ * K1: düzenlenebilir yolların ANA working dosyasından strict canlı parmak
+ * izi — `ContextAssembler.captureLiveBase` ile AYNI zincir (containment →
+ * fail-closed atal symlink taraması → `captureStrictLiveFingerprint`), yani
+ * stale denetimiyle birebir aynı ölçek. Atal symlink'te canlı ölçüm
+ * sentinel olurdu (kalıcı tabanda yasak) → seçili yol güvensiz. Belirsiz
+ * I/O → fail-closed işletim hatası.
+ */
+async function captureMainLiveFingerprints(
+  repoRoot: string,
+  editable: ReadonlySet<string>,
+): Promise<Map<string, PathFingerprint>> {
+  const out = new Map<string, PathFingerprint>();
+  for (const canonical of editable) {
+    const abs = resolveContained(repoRoot, canonical);
+    if (abs === null) {
+      throw new WorkspaceError("unsafe_path", "A selected path is unsafe");
+    }
+    let symlinkedAncestor: boolean;
+    try {
+      symlinkedAncestor = await hasSymlinkInPath(abs, repoRoot, {
+        includeTarget: false,
+        lstatFn: liveCaptureSeams.lstat,
+        failClosed: true,
+      });
+    } catch (err) {
+      throw new WorkspaceError("workspace_operation_failed", "Capturing the repository state failed", { cause: err });
+    }
+    if (symlinkedAncestor) {
+      throw new WorkspaceError("unsafe_path", "A selected path is unsafe");
+    }
+    try {
+      out.set(canonical, await captureStrictLiveFingerprint(abs, liveCaptureSeams));
+    } catch (err) {
+      throw new WorkspaceError("workspace_operation_failed", "Capturing the repository state failed", { cause: err });
+    }
+  }
+  return out;
+}
+
+/** Ana referans ile worktree tabanı uzlaştırılamadı (sabit, içeriksiz mesaj). */
+const MAIN_VIEW_MISMATCH = "A selected file differs from Git's view of it";
+
+/** Bir içeriğin git'in göreceği blob oid'i: `hash-object --stdin --path` (salt-okunur, `-w` YOK). */
+async function blobOidFor(gitRoot: string, canonical: string, bytes: Buffer): Promise<string> {
+  try {
+    const result = await runGit(["hash-object", "--stdin", `--path=${canonical}`], {
+      cwd: gitRoot,
+      stdin: bytes,
+      config: [HOOKS_DISABLED_CONFIG],
+    });
+    return result.stdout.toString("utf8").trim();
+  } catch (err) {
+    throw new WorkspaceError("git_operation_failed", "Capturing the repository state failed", { cause: err });
+  }
+}
+
+/**
+ * DESIGN §7.3 invariantı ("base == ana working tree"), oluşturmada her
+ * düzenlenebilir yol için — delta + seçili untracked kopyası SONRASI,
+ * `add -A` ÖNCESİ (iki K1 okuması arasında). Ana referans = 1. okuma.
+ * - varlık/tip eşit olmalı (yok⇔yok, dosya⇔dosya, link⇔link); aksi (ör.
+ *   sparse: ana ağaçta yok, HEAD'de var; dizin/özel) → `invalid_repository`.
+ * - link: hedef metni eşit olmalı; aksi → aynı red.
+ * - düzenli dosya: bayt eşitse tamam; değilse iki tarafın git blob oid'i
+ *   (`hash-object --path` — clean normalizasyonu dahil; dış filtreler
+ *   oluşumda reddedildi) karşılaştırılır. Eşit = yalnız git normalizasyonu
+ *   (`text=auto` CRLF, `fileMode=false`) → worktree baytı AYNEN kalır.
+ *   Farklı = git yerel değişikliği gizliyor (`assume-unchanged` /
+ *   `skip-worktree`) → ana bayt (no-follow) + mod worktree'ye yazılır;
+ *   worker gerçek hâli görür, `add -A` tabana alır.
+ */
+async function reconcileEditableWithMain(
+  repoRoot: string,
+  workspaceDir: string,
+  editable: ReadonlySet<string>,
+  mainReference: ReadonlyMap<string, PathFingerprint>,
+): Promise<void> {
+  const mismatch = (): WorkspaceError => new WorkspaceError("invalid_repository", MAIN_VIEW_MISMATCH);
+  for (const canonical of editable) {
+    const main = mainReference.get(canonical);
+    const mainAbs = resolveContained(repoRoot, canonical);
+    const wsAbs = resolveContained(workspaceDir, canonical);
+    if (main === undefined || mainAbs === null || wsAbs === null) {
+      throw new WorkspaceError("unsafe_path", "A selected path is unsafe");
+    }
+    if (await hasSymlinkInPath(wsAbs, workspaceDir, { includeTarget: false })) {
+      throw new WorkspaceError("unsafe_path", "A selected path is unsafe");
+    }
+    let wsStat: Stats | null;
+    try {
+      wsStat = await lstat(wsAbs);
+    } catch (err) {
+      if (!errnoIs(err, "ENOENT") && !errnoIs(err, "ENOTDIR")) {
+        throw new WorkspaceError("workspace_operation_failed", "Capturing the repository state failed", { cause: err });
+      }
+      wsStat = null;
+    }
+    const wsType = wsStat === null ? "absent" : wsStat.isFile() ? "file" : wsStat.isSymbolicLink() ? "symlink" : "other";
+    const mainType = main.exists ? main.type : "absent";
+    if (wsType !== mainType || wsType === "other") {
+      throw mismatch();
+    }
+    if (!main.exists || wsType === "absent") {
+      continue;
+    }
+    if (wsType === "symlink") {
+      if (sha256Hex(Buffer.from(await readlink(wsAbs), "utf8")) !== main.contentSha256) {
+        throw mismatch();
+      }
+      continue;
+    }
+    let mainBytes: Buffer;
+    let wsBytes: Buffer;
+    try {
+      mainBytes = await noFollowReadFile(mainAbs);
+      wsBytes = await noFollowReadFile(wsAbs);
+    } catch (err) {
+      throw new WorkspaceError("workspace_operation_failed", "Capturing the repository state failed", { cause: err });
+    }
+    if (mainBytes.equals(wsBytes)) {
+      continue;
+    }
+    if ((await blobOidFor(repoRoot, canonical, mainBytes)) === (await blobOidFor(workspaceDir, canonical, wsBytes))) {
+      continue; // yalnız git normalizasyonu — worker görünümü worktree ölçeğinde kalır
+    }
+    try {
+      await writeFile(wsAbs, mainBytes);
+      await chmod(wsAbs, main.mode === "100755" ? 0o755 : 0o644);
+    } catch (err) {
+      throw new WorkspaceError("workspace_operation_failed", "Copying the selected context failed", { cause: err });
+    }
+  }
+}
+
+/**
  * Base parmak izi + içerik yakalama (spec 29/30/31 + PR #24 Fix 2):
  * - seçili yollar: `git ls-tree -r -z <base> -- <yollar>` → varlık + git modu
  * - base ağacı:    `git ls-tree -r -z <base>` → tam yol→mod haritası
@@ -2074,9 +2316,10 @@ function workspaceEntryPath(workspaceDir: string, gitPath: string): string | nul
  * İKİ ALAN KARIŞTIRILMAZ: parmak izi/tam-eşleşme içeriği = working-tree
  * baytları (worker'a gösterilen); geçici base commit = diff/reset/export
  * tabanı. `text`/`eol` normalizasyonu blob ile working tree'yi farklı
- * baytlara sokabilir (ör. CRLF vs LF) — bu beklenen; base parmak izi
- * working-tree tarafında kaldığı için tam eşleşme ve Step 9'un
- * canlı↔base karşılaştırması aynı ölçekte çalışır.
+ * baytlara sokabilir (ör. CRLF vs LF) — bu beklenen; tam eşleşme worker'ın
+ * gördüğü ölçekte çalışır. Stale karşılaştırması BU parmak izlerini değil
+ * (v1 oturumları hariç), ana dosyadan yakalanan canlı referansı kullanır
+ * (K1 — `captureMainLiveFingerprints`).
  *
  * Çalışan dosya okunamıyorsa (commit ile yakalama arasındaki race/izin —
  * yapısal olarak neredeyse imkânsız) → güvenli işletimsel hata (capture

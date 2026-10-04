@@ -47,9 +47,10 @@
  *      worker-oluşturulan yol çakışması için varlık yeterli, spec 171/266).
  *      ÇAKIŞMA semantiği: `ENOTDIR` → `true` (önekteki bileşen dizin değil →
  *      worker'ın `create`'i main'e uygulanamaz).
- *    İki varyantın ALANLARI aynı ölçektedir: base YENİDEN aynı alandan
- *    yakalandığı (PR #24) için karşılaştırma (`fingerprintsEqual`) iki
- *    tarafta da aynı ölçekte çalışır.
+ *    Stale karşılaştırması (`fingerprintsEqual`) canlı↔canlı çalışır (K1):
+ *    referans, oturum oluşturulurken ANA working dosyasından AYNI strict
+ *    yakalamayla alınır (`PersistedSession.liveBaseFingerprints`); worktree
+ *    parmak izi yalnız v1 oturumlarında referanstır.
  *
  * Sembolik bağlantılar ASLA takip edilmez: link'in parmak izi = hedef metin.
  */

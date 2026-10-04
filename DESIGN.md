@@ -724,6 +724,12 @@ create(task):
       # (never the user's git name/email), detached HEAD, no branch/tag/ref
   record the base fingerprint of every editable base file:
     existence + type + relevant mode + content        (Section 7.5)
+    (stale reference: the MAIN working file, read before the working-tree
+     delta is captured and again after the base commit — a difference
+     fails creation; before staging, each editable file must match the
+     main file: a local change Git hides — assume-unchanged/skip-worktree —
+     is copied from the main file, an existence/type mismatch — e.g.
+     sparse — fails creation)
   → HEAD of <wsDir> is now the BASE (== the exact main working-tree state
     visible to Claude Code at session start)
   → the BASE IS IMMUTABLE from here on (Section 7.5)
@@ -871,18 +877,47 @@ first round is fresh by construction (the base is captured from the live
 tree at that moment); the check is what matters from round 2 on, and at
 close.
 
-**Fingerprint scale (final).** The captured fingerprint — and the
-exact-match content used for search/replace validation — is taken from
-the worktree's **working files** (existence from the base tree; type/mode
-from `lstat`; content = the file's bytes, or the link's target text for a
-symbolic link). This is the *same scale* as the live fingerprint recorded
-by stale-base detection, so the two sides compare like for like. The
-transient base commit is a different field: it is the diff/reset/export
-base. Git's `text` / `eol` normalization can make the *blob* and the
-*working file* differ (e.g. CRLF vs. LF); that is expected and harmless —
-the worker is shown the working-file bytes, so an edit copied from what it
-saw round-trips exactly, while a normalized (LF) search against a CRLF
-base is rejected deterministically rather than applied with corruption.
+**Fingerprint scale (final).** Two scales, never mixed.
+*Stale reference = the main working file.* At creation every editable path
+is fingerprinted (existence; type/mode from `lstat`; content = file bytes or
+link target text) in the **main working tree** with the same strict
+no-follow capture the stale check uses — once before the working-tree
+delta is captured and again after the base commit. If the two reads differ,
+the main tree changed during capture and creation fails
+(`workspace_operation_failed`); an
+editable path reached through a symlinked ancestor is rejected
+(`unsafe_path`). Between the two reads every editable file of the base must
+match the main file: when Git hides a local change (`assume-unchanged` /
+`skip-worktree`; the blob ids of the two sides differ) the main bytes and
+mode are copied into the base, so the worker edits what Claude Code sees and
+the patch applies to it; an existence/type mismatch (e.g. a sparse path
+absent from the main tree) fails creation (`invalid_repository`). Mere
+normalization (`text=auto` CRLF, `core.fileMode=false`; equal blob ids)
+leaves the base as Git wrote it. The reference is persisted as
+`liveBaseFingerprints` (session schema v2) and the check compares live with
+live, so Git's own view of a file can no longer cause a permanent false
+`stale_base`; any byte or mode change of the main file (including an
+EOL-only rewrite) is drift. `fresh` confirms that the main file's bytes and
+mode did not change; for normalized files a clean apply additionally
+assumes the `text`/`eol` attributes and config did not change. v1 sessions
+(persisted before this change) have no live reference and keep the old
+worktree-scale comparison until closed.
+*Worker view + validation = the worktree's working files* (unchanged): the
+exact-match content shown to the worker and used for search/replace
+validation is the worktree file's bytes (an edit copied from what the
+worker saw round-trips exactly; a normalized LF search against a CRLF base
+is rejected deterministically); the transient base commit stays the
+diff/reset/export base. `text`/`eol` normalization can make the blob and
+the working file differ (CRLF vs. LF); when a round's `git reset --hard`
+rewrites an editable file in normalized form, Splash writes the captured
+base bytes back (pure fs, same symlink/ancestor checks as the attribute
+restore) and re-records the file in the index (stat only — so even
+`diff.autoRefreshIndex=false` reports no phantom change), so the worker's
+view survives later rounds and recovery. The
+exported patch is in the blob (normalized) scale: measured (Apple Git
+2.50.1, `text=auto`), `git apply` against a CRLF working copy applies and
+rewrites the touched file in the checkout EOL (whole-file CRLF→LF churn) —
+review line endings before committing.
 
 **Created-path collision (final).** Once the worker patch contains a
 `create` operation for a path, that path has an **expected base state of

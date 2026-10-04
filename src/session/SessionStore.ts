@@ -33,6 +33,7 @@ import path from "node:path";
 import { computeRepoId } from "../workspace/git.js";
 import { isSafeSessionId, isTrustedTreePath, normalizeRepoPath } from "../workspace/pathSafety.js";
 import {
+  LEGACY_SESSION_SCHEMA_VERSION,
   RULES_SOURCES,
   SESSION_SCHEMA_VERSION,
   SessionError,
@@ -905,6 +906,40 @@ function validateStringTupleArray(value: unknown, field: string): Array<readonly
 }
 
 /**
+ * K1 `liveBaseFingerprints` (v2) fail-closed doğrulaması: `[yol, parmak izi]`
+ * dizisi; yol STRICT kanonik (güvenilmez seçili yol), parmak izi
+ * `validatePathFingerprint` (canlı sentinel modu RED — tamper atal-symlink
+ * sürüklenmesini `fresh` gösteremez); yol kümesi düzenlenebilir yollarla
+ * BİREBİR (yinelenen/eksik/fazla RED — eksik bir yol stale denetiminde
+ * sessizce atlanırdı).
+ */
+function validateLiveBaseFingerprints(
+  value: unknown,
+  editablePaths: readonly string[],
+): Array<readonly [string, PathFingerprint]> {
+  if (!Array.isArray(value)) {
+    corruptFail("liveBaseFingerprints:array");
+  }
+  const seen = new Set<string>();
+  const out = (value as unknown[]).map((entry, index) => {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      corruptFail(`liveBaseFingerprints[${index}]`);
+    }
+    const canonical = validateCanonicalRepoPath(entry[0], `liveBaseFingerprints[${index}].path`);
+    if (seen.has(canonical)) {
+      corruptFail(`liveBaseFingerprints[${index}]:duplicate`);
+    }
+    seen.add(canonical);
+    return [canonical, validatePathFingerprint(entry[1], `liveBaseFingerprints[${index}]`)] as const;
+  });
+  const editable = new Set(editablePaths);
+  if (seen.size !== editable.size || [...seen].some((canonical) => !editable.has(canonical))) {
+    corruptFail("liveBaseFingerprints:paths");
+  }
+  return out;
+}
+
+/**
  * `workspaceRecovery` durumunun fail-closed doğrulaması.
  *
  * İki güven alanı (Step 9 audit düzeltme A):
@@ -1183,8 +1218,12 @@ export class SessionStore {
     if (!isSafeSessionId(session.sessionId)) {
       throw sessionError("session_operation_failed", "unsafe session id");
     }
-    if (session.schemaVersion !== SESSION_SCHEMA_VERSION) {
+    if (session.schemaVersion !== SESSION_SCHEMA_VERSION && session.schemaVersion !== LEGACY_SESSION_SCHEMA_VERSION) {
       throw sessionError("session_operation_failed", "unsupported schema version");
+    }
+    // K1: v2 ⇔ `liveBaseFingerprints` — load'un reddedeceği durum YAZILMAZ.
+    if ((session.schemaVersion === SESSION_SCHEMA_VERSION) !== (session.liveBaseFingerprints !== undefined)) {
+      throw sessionError("session_operation_failed", "schema version and live base fingerprints disagree");
     }
     const dir = this.#sessionDirFor(session.sessionId);
     const file = path.join(dir, SESSION_FILE);
@@ -1362,17 +1401,21 @@ export class SessionStore {
       "rounds",
       "currentCreatedPaths",
     ];
+    // K1: v2 `liveBaseFingerprints`'i ZORUNLU taşır; v1 (eski, okunabilir)
+    // taşıyamaz — anahtar kümesi sürüme bağlı (fail-closed).
+    const schemaVersion = raw["schemaVersion"];
+    if (schemaVersion !== SESSION_SCHEMA_VERSION && schemaVersion !== LEGACY_SESSION_SCHEMA_VERSION) {
+      corruptFail("schemaVersion");
+    }
     const expectedKeys = [
       ...requiredKeys,
+      ...(schemaVersion === SESSION_SCHEMA_VERSION ? ["liveBaseFingerprints"] : []),
       ...(raw["latestResult"] !== undefined ? ["latestResult"] : []),
       ...(raw["latestWorkerResult"] !== undefined ? ["latestWorkerResult"] : []),
       ...(raw["latestWorkspaceStateHash"] !== undefined ? ["latestWorkspaceStateHash"] : []),
     ];
     if (!hasExactKeySet(raw, expectedKeys)) {
       corruptFail("root:keys");
-    }
-    if (raw["schemaVersion"] !== SESSION_SCHEMA_VERSION) {
-      corruptFail("schemaVersion");
     }
 
     const sessionId = raw["sessionId"];
@@ -1417,6 +1460,10 @@ export class SessionStore {
     if (workspaceRecovery.repoRoot !== repoRoot) {
       corruptFail("workspaceRecovery:repoRoot-mismatch");
     }
+    const liveBaseFingerprints =
+      schemaVersion === SESSION_SCHEMA_VERSION
+        ? validateLiveBaseFingerprints(raw["liveBaseFingerprints"], workspaceRecovery.editablePaths)
+        : undefined;
 
     const round = raw["round"];
     if (typeof round !== "number" || !Number.isInteger(round) || round < 0) {
@@ -1460,7 +1507,7 @@ export class SessionStore {
     }
 
     const session: PersistedSession = {
-      schemaVersion: SESSION_SCHEMA_VERSION,
+      schemaVersion,
       sessionId,
       repoRoot,
       repoId,
@@ -1475,6 +1522,9 @@ export class SessionStore {
       rounds,
       currentCreatedPaths,
     };
+    if (liveBaseFingerprints !== undefined) {
+      session.liveBaseFingerprints = liveBaseFingerprints;
+    }
 
     // İsteğe bağlı son-durum alanları — yalnız var olduğunda (boşta `undefined`
     // değil). Her biri yapısal olarak doğrulanır (spec 317).
