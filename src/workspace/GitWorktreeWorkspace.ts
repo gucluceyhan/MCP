@@ -141,7 +141,13 @@ import {
   sha256Hex,
   type StrictReadSeams,
 } from "./fingerprint.js";
-import { validateWorkerResult, type EditPlan, type WorkspaceBase } from "./validate.js";
+import {
+  REJECTION_REASONS,
+  rejectCreatePlans,
+  validateWorkerResult,
+  type EditPlan,
+  type WorkspaceBase,
+} from "./validate.js";
 
 /** Deterministik Splash commit kimliği (spec 25 — kullanıcının git kimliği GEREKMEZ). */
 const SPLASH_GIT_IDENTITY: NodeJS.ProcessEnv = {
@@ -374,7 +380,13 @@ export class GitWorktreeWorkspace implements Workspace {
    */
   private async git(
     args: readonly string[],
-    options: { cwd?: string; config?: readonly string[]; stdin?: Buffer | string; env?: NodeJS.ProcessEnv } = {},
+    options: {
+      cwd?: string;
+      config?: readonly string[];
+      stdin?: Buffer | string;
+      env?: NodeJS.ProcessEnv;
+      allowedExitCodes?: readonly number[];
+    } = {},
   ): Promise<GitRunResult> {
     const config: string[] = [HOOKS_DISABLED_CONFIG, ...(options.config ?? [])];
     try {
@@ -383,6 +395,7 @@ export class GitWorktreeWorkspace implements Workspace {
         config,
         stdin: options.stdin,
         env: options.env,
+        allowedExitCodes: options.allowedExitCodes,
       });
     } catch (err) {
       if (err instanceof WorkspaceError) {
@@ -857,7 +870,22 @@ export class GitWorktreeWorkspace implements Workspace {
     this.workerTouchedAttributePaths = new Set<string>();
 
     // (3) TÜM seti immutable base'e karşı doğrula — yazmadan ÖNCE (spec 39).
-    const validation = validateWorkerResult(this.validationBase, workerResult);
+    // (3a) K4: git-ignored yola create → `git add -N` exit 1 ile TÜM turu
+    // düşürürdü; eşleşen create'ler sabit nedenle reddedilir, diğer
+    // düzenlemeler sürer. Plan bir `.gitignore`'a dokunmuyorsa karar
+    // YAZMADAN önce (base durumu) alınır; dokunuyorsa kurallar turla
+    // değişir → karar yazımdan SONRA, `add -N`'den ÖNCE (aşağıda 4c).
+    const validated = validateWorkerResult(this.validationBase, workerResult);
+    const touchesIgnoreRules = validated.plan.some((entry) => path.posix.basename(entry.canonical) === ".gitignore");
+    let validation = touchesIgnoreRules
+      ? validated
+      : rejectCreatePlans(
+          validated,
+          await this.ignoredCreatePaths(
+            validated.plan.filter((entry) => entry.action === "create").map((entry) => entry.canonical),
+          ),
+          REJECTION_REASONS.pathIgnored,
+        );
 
     // (3b) PR #24 SB-1: bu turda worker'ın modify/delete ettiği ve base'te
     // TRACKED olan `.gitattributes` yollarını SB-1 kümesine yaz — turun
@@ -978,8 +1006,26 @@ export class GitWorktreeWorkspace implements Workspace {
       // worker yol dizgeleri pathspec magic'i olarak ASLA yorumlanamaz
       // (audit CRITICAL-1) — yoksa `:(exclude)X` gibi bir ad index'i
       // SESSİZ mass-add'e sokar.
-      if (createdThisRound.length > 0) {
-        await this.git(["add", "-N", "--", ...createdThisRound.map(literalPathspec)]);
+      // (4c) K4 yazım-sonrası karar (plan `.gitignore`'a dokunduysa): bu turun
+      // create'larından yoksayılanlar saf-fs ile kaldırılır + reddedilir.
+      if (touchesIgnoreRules) {
+        const ignored = await this.ignoredCreatePaths(createdThisRound);
+        if (ignored.size > 0) {
+          await this.removeWorkerCreatedPaths(ignored);
+          createdThisRound.splice(0, createdThisRound.length, ...createdThisRound.filter((p) => !ignored.has(p)));
+          validation = rejectCreatePlans(validation, ignored, REJECTION_REASONS.pathIgnored);
+        }
+      }
+      // L6: açıkça seçilmiş (editable) ama base'te olmayan yol yoksayılmış
+      // olabilir — base yakalamanın seçili ignored dosyaları `add -f` ile
+      // almasıyla tutarlı olarak `-f`; diğer create'ler `-f`'siz.
+      const selected = createdThisRound.filter((p) => this.validationBase.editable.has(p));
+      const unselected = createdThisRound.filter((p) => !this.validationBase.editable.has(p));
+      if (unselected.length > 0) {
+        await this.git(["add", "-N", "--", ...unselected.map(literalPathspec)]);
+      }
+      if (selected.length > 0) {
+        await this.git(["add", "-N", "-f", "--", ...selected.map(literalPathspec)]);
       }
       // (6) Bilinen küme = bu turun kabul edilen create'ları (spec 59).
       this.workerCreatedPaths = new Set<string>(createdThisRound);
@@ -1050,6 +1096,46 @@ export class GitWorktreeWorkspace implements Workspace {
     // (8) Bilinen worker-oluşturulan küme (spec 59) — Step 9 kalıcılık +
     // kurtarma yeniden-uygulaması + kapsamlı sıfırlama için döndürülür.
     return { validation: validation.result, filesChanged, diffStats, createdPaths: [...this.workerCreatedPaths] };
+  }
+
+  /**
+   * K4: verilen create yollarından git'in yoksaydıkları (.gitignore,
+   * `info/exclude`, `core.excludesFile` — `git add`'in kullandığı aynı
+   * kaynaklar). `check-ignore` `:(literal)`/`--literal-pathspecs`'i
+   * desteklemez (ölçüldü, Git 2.50: "pathspec magic not supported");
+   * `./` öneki `:(…)`/`:x` adlarının magic yorumlanmasını engeller.
+   * `--no-index`: index'e bakılmaz — aksi halde `[a].log` gibi bir ad
+   * tracked `a.log`'a glob olarak eşleşip "yoksayılmıyor" sayılırdı
+   * (ölçüldü). Çıkış 1 = hiçbiri yoksayılmıyor.
+   * Muaf: açıkça seçilmiş (editable) yollar (L6 — `add -N -f`) ve yolunda
+   * sembolik bağlantı olanlar (`check-ignore` onda 128 ile ölür; uygulama
+   * döngüsü onları `unsafe_path` ile reddeder).
+   */
+  private async ignoredCreatePaths(paths: readonly string[]): Promise<Set<string>> {
+    const creates: string[] = [];
+    for (const canonical of paths) {
+      if (this.validationBase.editable.has(canonical)) {
+        continue;
+      }
+      const abs = resolveContained(this.workspaceDir, canonical);
+      if (abs !== null && !(await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: true }))) {
+        creates.push(canonical);
+      }
+    }
+    if (creates.length === 0) {
+      return new Set<string>();
+    }
+    const result = await this.git(["check-ignore", "--no-index", "--stdin", "-z"], {
+      stdin: creates.map((p) => `./${p}\0`).join(""),
+      allowedExitCodes: [1],
+    });
+    const ignored = new Set<string>();
+    for (const entry of result.stdout.toString("utf8").split("\0")) {
+      if (entry.startsWith("./")) {
+        ignored.add(entry.slice(2));
+      }
+    }
+    return ignored;
   }
 
   /**

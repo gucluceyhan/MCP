@@ -10,7 +10,8 @@
  * İKİ FAZ (spec 39):
  * - Faz A — düzenleme başına bağımsız denetimler: yol güvenliği, allow-list
  *   (editable/readonly/base), varlık/tip, UTF-8 round-trip, tam eşleşme
- *   (benzersizlik + örtüşme), create varlıksızlığı/önek zinciri.
+ *   (benzersizlik + örtüşme), create varlıksızlığı/önek zinciri, base'te
+ *   olmayan redaksiyon yer tutucusu (K3).
  *   Bir modify düzenlemesinin HERHANGİ bir operasyonu geçmezse TÜMÜ
  *   reddedilir (yarım operasyon asla uygulanmaz).
  * - Faz B — düzenleme-ler arası (order-bağımsız) çakışmalar: kanonik alias
@@ -34,6 +35,7 @@ import type {
 } from "../worker/result.js";
 import type { PathFingerprint } from "./Workspace.js";
 import { normalizeRepoPath } from "./pathSafety.js";
+import { REDACTION_PLACEHOLDERS } from "../context/redact.js";
 
 /** Path-güvenliğini geçememiş worker yolunun güvenli yer tutucusu (spec 42). */
 export const INVALID_PATH_PLACEHOLDER = "<invalid-path>";
@@ -96,6 +98,8 @@ export const REJECTION_REASONS = {
   pathConflict: "target conflicts with another edit",
   unsafeSymlink: "unsafe symlink traversal",
   overlappingEdits: "overlapping edits",
+  redactionPlaceholder: "edit contains a redaction placeholder",
+  pathIgnored: "path is ignored",
   searchNotFound: (operation: number): string => `search text not found at operation ${operation}`,
   matchNotUnique: (operation: number): string => `match not unique at operation ${operation}`,
 } as const;
@@ -103,6 +107,17 @@ export const REJECTION_REASONS = {
 interface Range {
   start: number;
   end: number;
+}
+
+/**
+ * K3: worker'ın yazdığı metin, `baseText`'te literal olarak BULUNMAYAN bir
+ * redaksiyon yer tutucusu içeriyor mu? (Worker gizlenmiş değeri göremez;
+ * yer tutucuyu dosyaya yazması gerçek secret'ı bozar.)
+ */
+function introducesPlaceholder(written: readonly string[], baseText: string): boolean {
+  return REDACTION_PLACEHOLDERS.some(
+    (placeholder) => !baseText.includes(placeholder) && written.some((text) => text.includes(placeholder)),
+  );
 }
 
 /**
@@ -218,6 +233,13 @@ export function validateWorkerResult(base: WorkspaceBase, workerResult: WorkerRe
         return;
       }
 
+      // K3: `search`/`replace`'te bu dosyanın base'inde olmayan bir yer
+      // tutucu → eşleşmeden ÖNCE red (worker gizli değeri kopyalamış).
+      if (introducesPlaceholder(edit.operations.flatMap((op) => [op.search, op.replace]), text)) {
+        reject(index, canonical, REJECTION_REASONS.redactionPlaceholder);
+        return;
+      }
+
       // Her operasyonun base aralığını çözümler; 0 → red, 2+ → red (spec 51).
       const ranges: Range[] = [];
       let failed = false;
@@ -330,6 +352,10 @@ export function validateWorkerResult(base: WorkspaceBase, workerResult: WorkerRe
       }
       return;
     }
+    if (introducesPlaceholder([edit.content], "")) {
+      reject(index, canonical, REJECTION_REASONS.redactionPlaceholder);
+      return;
+    }
     plans.push({
       editIndex: index,
       action: "create",
@@ -414,5 +440,34 @@ export function validateWorkerResult(base: WorkspaceBase, workerResult: WorkerRe
       rejected,
     },
     plan: finalPlans,
+  };
+}
+
+/**
+ * K4: doğrulanmış sonuçtaki verilen kanonik yollara düşen `create`
+ * planlarını sabit nedenle reddeder (saf; I/O'lu son-kontrolün — örn.
+ * `git check-ignore` — kararı burada uygulanır). Diğer planlar aynen kalır.
+ */
+export function rejectCreatePlans(
+  validation: WorkspaceValidation,
+  paths: ReadonlySet<string>,
+  reason: string,
+): WorkspaceValidation {
+  if (paths.size === 0) {
+    return validation;
+  }
+  const rejected = [...validation.result.rejected];
+  const plan: EditPlan[] = [];
+  for (const entry of validation.plan) {
+    if (entry.action === "create" && paths.has(entry.canonical)) {
+      rejected.push({ file: entry.canonical, edit: entry.editIndex, reason });
+    } else {
+      plan.push(entry);
+    }
+  }
+  rejected.sort((a, b) => a.edit - b.edit);
+  return {
+    result: { editsRequested: validation.result.editsRequested, editsApplied: plan.length, rejected },
+    plan,
   };
 }

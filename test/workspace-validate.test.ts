@@ -20,6 +20,7 @@ import {
   validateWorkerResult,
   type WorkspaceBase,
 } from "../dist/workspace/validate.js";
+import { REDACTED_EMAIL, REDACTED_SECRET, REDACTION_PLACEHOLDERS } from "../dist/context/redact.js";
 
 // ── base kurma yardımcıları ─────────────────────────────────────────────────
 
@@ -350,4 +351,60 @@ test("rejection reasons never contain the search/replace content or source bytes
   );
   const dump = JSON.stringify(v.result.rejected) + JSON.stringify(v2.result);
   assert.ok(!dump.includes(marker), `marker leaked into validation metadata: ${dump}`);
+});
+
+// ── İz 3 / K3: redaksiyon yer tutucusu taşıyan düzenleme reddedilir ──────────
+
+test("K3: placeholder in modify.replace / create.content (absent from base) → rejected; other edits proceed", () => {
+  const base = baseFrom({ "src/a.ts": 'const pw = "hunter2";\nconst n = 1;\n', "src/b.ts": "b\n" });
+  for (const placeholder of REDACTION_PLACEHOLDERS) {
+    const v = validateWorkerResult(
+      base,
+      resultOf(
+        modify("src/a.ts", ["const n = 1;", `const n = 2; // ${placeholder}`]),
+        create("src/new.ts", `export const pw = "${placeholder}";\n`),
+        modify("src/b.ts", ["b", "c"]),
+      ),
+    );
+    assert.deepEqual(
+      v.result.rejected,
+      [
+        { file: "src/a.ts", edit: 0, reason: REJECTION_REASONS.redactionPlaceholder },
+        { file: "src/new.ts", edit: 1, reason: REJECTION_REASONS.redactionPlaceholder },
+      ],
+      placeholder,
+    );
+    assert.deepEqual(v.plan.map((p) => p.canonical), ["src/b.ts"]);
+    assert.equal(v.result.editsApplied, 1);
+  }
+  assert.equal(REJECTION_REASONS.redactionPlaceholder, "edit contains a redaction placeholder");
+});
+
+test("K3: placeholder literally present in the same file's base → modify accepted", () => {
+  const base = baseFrom({ "src/redact.ts": `export const S = "${REDACTED_SECRET}";\n` });
+  const v = validateWorkerResult(
+    base,
+    resultOf(modify("src/redact.ts", ["export const S", `// keep ${REDACTED_SECRET}\nexport const S`])),
+  );
+  assert.equal(v.result.rejected.length, 0);
+  assert.equal(v.result.editsApplied, 1);
+  // Base'te YALNIZ başka bir yer tutucu varsa → yine red (yer tutucu bazında).
+  const other = validateWorkerResult(
+    base,
+    resultOf(modify("src/redact.ts", ["export const S", `// ${REDACTED_EMAIL}\nexport const S`])),
+  );
+  assert.deepEqual(other.result.rejected.map((r) => r.reason), [REJECTION_REASONS.redactionPlaceholder]);
+});
+
+test("L5b: a placeholder in `search` (absent from that base) → placeholder reason, not 'search text not found'", () => {
+  const base = baseFrom({ "src/a.ts": 'const pw = "hunter2";\n' });
+  assert.deepEqual(reasons(base, modify("src/a.ts", [`const pw = "${REDACTED_SECRET}";`, "const pw = env();"])), [
+    REJECTION_REASONS.redactionPlaceholder,
+  ]);
+});
+
+test("L5c: a placeholder present only in ANOTHER file's base is not an exception", () => {
+  const base = baseFrom({ "src/redact.ts": `export const S = "${REDACTED_SECRET}";\n`, "src/b.ts": "b\n" });
+  assert.deepEqual(reasons(base, modify("src/b.ts", ["b", `b // ${REDACTED_SECRET}`])), [REJECTION_REASONS.redactionPlaceholder]);
+  assert.deepEqual(reasons(base, create("src/new.ts", `x = "${REDACTED_SECRET}"`)), [REJECTION_REASONS.redactionPlaceholder]);
 });

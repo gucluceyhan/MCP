@@ -4018,6 +4018,145 @@ test("recovery: expected workspaceDir inside the repo fails with the stable unsa
   }
 });
 
+// ── İz 3 / K4: git-ignored yola create → yalnız o düzenleme reddedilir ───────
+
+test("K4: create into ignored paths (.gitignore / info/exclude, magic-looking name) → `path is ignored`; others apply; workspace stays usable", async () => {
+  const fixture = await buildFixture("k4-ignored");
+  // `info/exclude` ortak git dizinindedir → worktree de görür (git add ile aynı kaynak).
+  await writeFile(path.join(fixture.repo, ".git", "info", "exclude"), "*.log\n");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "nested/ignored.txt", content: "x\n" }, // .gitignore: ignored.txt
+        { kind: "modify", path: "src/a.ts", operations: [{ search: "alpha-USER", replace: "alpha-WORKER" }] },
+        { kind: "create", path: "logs/:(exclude)run.log", content: "y\n" }, // info/exclude: *.log (magic adı literal)
+        { kind: "create", path: "src/fresh.ts", content: "fresh\n" },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, [
+      { file: "nested/ignored.txt", edit: 0, reason: "path is ignored" },
+      { file: "logs/:(exclude)run.log", edit: 2, reason: "path is ignored" },
+    ]);
+    assert.equal(result.validation.editsApplied, 2);
+    assert.deepEqual([...result.filesChanged].sort(), ["src/a.ts", "src/fresh.ts"]);
+    assert.deepEqual(result.createdPaths, ["src/fresh.ts"]);
+    // Reddedilen create'ler worktree'ye YAZILMADI.
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "nested")));
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "logs")));
+
+    // Sonraki tur aynı workspace'te normal çalışır.
+    const next = await ws.applyPatchSet(workerResult([{ kind: "create", path: "src/fresh2.ts", content: "f2\n" }]));
+    assert.deepEqual(next.validation.rejected, []);
+    assert.deepEqual(next.filesChanged, ["src/fresh2.ts"]);
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("K4: create beneath a symlink that appeared in the workspace still fails with `unsafe_path` (check-ignore never sees it)", async () => {
+  const fixture = await buildFixture("k4-symlink");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    await symlink(tmp, path.join(ws.workspaceDir, "stray-link"));
+    await expectWorkspaceError("unsafe_path", () =>
+      ws.applyPatchSet(workerResult([{ kind: "create", path: "stray-link/x.js", content: "1\n" }])),
+    );
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("M3: a self-ignoring new `tmp/.gitignore` (`*`) + `tmp/x` → both rejected AFTER the write, removed; other edits apply", async () => {
+  const fixture = await buildFixture("k4-post-write");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "tmp/.gitignore", content: "*\n" },
+        { kind: "create", path: "tmp/x", content: "x\n" },
+        { kind: "modify", path: "src/a.ts", operations: [{ search: "alpha-USER", replace: "alpha-WORKER" }] },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, [
+      { file: "tmp/.gitignore", edit: 0, reason: "path is ignored" },
+      { file: "tmp/x", edit: 1, reason: "path is ignored" },
+    ]);
+    assert.deepEqual(result.filesChanged, ["src/a.ts"]);
+    assert.deepEqual(result.createdPaths, []);
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "tmp", ".gitignore")));
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "tmp", "x")));
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("L1: `--no-index` — `[a].log` create is judged on its own name, not via a glob over tracked `a.log`", async () => {
+  const fixture = await buildFixture("k4-no-index");
+  await writeFile(path.join(fixture.repo, "a.log"), "tracked\n");
+  await gitOk(fixture.repo, ["add", "a.log"]);
+  await writeFile(path.join(fixture.repo, ".gitignore"), "ignored.txt\n*.log\n");
+  await gitOk(fixture.repo, ["add", ".gitignore"]);
+  await gitOk(fixture.repo, ["commit", "-m", "track a.log, ignore *.log"]);
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(workerResult([{ kind: "create", path: "[a].log", content: "y\n" }]));
+    assert.deepEqual(result.validation.rejected, [{ file: "[a].log", edit: 0, reason: "path is ignored" }]);
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("L2: root-level `:(exclude)run.log` create is passed literally (`./` prefix) → `path is ignored`", async () => {
+  const fixture = await buildFixture("k4-root-magic");
+  await writeFile(path.join(fixture.repo, ".git", "info", "exclude"), "*.log\n");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(workerResult([{ kind: "create", path: ":(exclude)run.log", content: "y\n" }]));
+    assert.deepEqual(result.validation.rejected, [{ file: ":(exclude)run.log", edit: 0, reason: "path is ignored" }]);
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("L6: an explicitly selected (editable) absent path that is git-ignored is created (`add -N -f`); unselected ignored create still rejected", async () => {
+  const fixture = await buildFixture("k4-selected-ignored");
+  const input = createInput(fixture);
+  const ws = await createGitWorktreeWorkspace({ ...input, editablePaths: [...input.editablePaths, "gen/ignored.txt"] });
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "gen/ignored.txt", content: "selected\n" },
+        { kind: "create", path: "other/ignored.txt", content: "unselected\n" },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, [{ file: "other/ignored.txt", edit: 1, reason: "path is ignored" }]);
+    assert.deepEqual(result.filesChanged, ["gen/ignored.txt"]);
+    assert.deepEqual(result.createdPaths, ["gen/ignored.txt"]);
+    assert.ok((await ws.diff()).includes("+selected"));
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("M3: when the plan edits `.gitignore`, the decision uses the NEW rules (un-ignored path is created)", async () => {
+  const fixture = await buildFixture("k4-unignore");
+  const input = createInput(fixture);
+  const ws = await createGitWorktreeWorkspace({ ...input, editablePaths: [...input.editablePaths, ".gitignore"] });
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "modify", path: ".gitignore", operations: [{ search: "ignored.txt\n", replace: "*.tmp\n" }] },
+        { kind: "create", path: "deep/ignored.txt", content: "now tracked\n" },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, []);
+    assert.deepEqual([...result.filesChanged].sort(), [".gitignore", "deep/ignored.txt"]);
+  } finally {
+    await ws.destroy();
+  }
+});
+
 // ── İnceleme düzeltmeleri — İz 1: workspace/git (W-H1, W-M5, L3, L4, L6) ────
 
 /** Basit tek-dosyalı repo (`f.txt` committed) + repo DIŞI çıktı kökü. */

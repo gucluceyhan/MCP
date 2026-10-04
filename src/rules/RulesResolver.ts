@@ -22,7 +22,9 @@
  *   canonicalization fails closed (no lexical fallback after EACCES/EIO);
  * - each rule path is `lstat`'d (never `stat` — symlinks are NOT regular
  *   files): symlink / directory / FIFO / socket / device → failure,
- *   never "absent" and never followed;
+ *   never "absent" and never followed — sole exception (K2): an
+ *   `AGENTS.md` leaf symlink whose canonical target is exactly
+ *   `<root>/CLAUDE.md` is an alias and is skipped without being read;
  * - ONLY `ENOENT` means "this source does not exist"; every other errno
  *   (EACCES/EPERM/EIO/ELOOP/ENOTDIR/...) fails the whole resolution —
  *   there is no silent fallback to the other file after an operational
@@ -178,6 +180,12 @@ export class RulesResolver {
       }
       throw this.#failed(err);
     }
+    if (stat.isSymbolicLink() && name === "AGENTS.md" && (await this.#isClaudeAlias(canonicalRoot, abs))) {
+      // K2: `AGENTS.md -> CLAUDE.md` is a common alias — the same content is
+      // already covered by the CLAUDE.md source, so it is skipped WITHOUT
+      // reading. Every other symlink still fails closed below.
+      return null;
+    }
     if (!stat.isFile()) {
       // directory / fifo / socket / device / symlink — fail closed,
       // never treated as absent (spec 20).
@@ -202,6 +210,20 @@ export class RulesResolver {
     // text is the EXACT decoded bytes — no trim, no rewrite (spec 180).
     const text = bytes.toString("utf8");
     return text.trim() === "" ? null : text;
+  }
+
+  /**
+   * K2: is the leaf symlink's canonical target exactly `<root>/CLAUDE.md`?
+   * A canonicalization error (dangling, ELOOP, EACCES, ...) fails closed.
+   */
+  async #isClaudeAlias(canonicalRoot: string, linkPath: string): Promise<boolean> {
+    let target: string;
+    try {
+      target = await this.#fs.realpath(linkPath);
+    } catch (err) {
+      throw this.#failed(err);
+    }
+    return target === path.join(canonicalRoot, "CLAUDE.md");
   }
 
   /** Fixed safe message + developer-channel `cause` (never on the wire). */

@@ -314,6 +314,11 @@ export interface GitRunOptions {
   env?: NodeJS.ProcessEnv;
   /** ms; aşılırsa çocuk süreç öldürülür. Varsayılan 5 dk. */
   timeoutMs?: number;
+  /**
+   * 0 dışında BAŞARI sayılan çıkış kodları (örn. `check-ignore`: 1 =
+   * "hiçbiri yoksayılmıyor"). Varsayılan: yalnız 0.
+   */
+  allowedExitCodes?: readonly number[];
 }
 
 export interface GitRunResult {
@@ -407,7 +412,7 @@ export function runGit(args: readonly string[], options: GitRunOptions): Promise
       // `settled` yalnız burada (success) veya `fail` içinde (error) ayarlanır —
       // `fail` çağrısından ÖNCE set edilirse `fail`'in kendi `settled` koruması
       // early-return yapar ve Promise asla settle olmazdı.
-      if (code === 0) {
+      if (code === 0 || (code !== null && (options.allowedExitCodes ?? []).includes(code))) {
         settled = true;
         resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
       } else {

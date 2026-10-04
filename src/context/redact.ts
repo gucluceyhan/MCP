@@ -28,6 +28,18 @@ export const REDACTED_EMAIL = "[REDACTED_EMAIL]";
 export const REDACTED_PHONE = "[REDACTED_PHONE]";
 /** Secret dosya içeriğinin TAMAMEN bırakıldığı yer tutucu. */
 export const SECRET_FILE_MARKER = "[SECRET FILE CONTENT OMITTED]";
+/**
+ * Redaksiyonun ürettiği TÜM sabit yer tutucular — doğrulayıcı, worker'ın
+ * yazdığı içerikte (base'te literal olarak yoksa) bunları reddeder (K3).
+ */
+export const REDACTION_PLACEHOLDERS: readonly string[] = [
+  REDACTED_SECRET,
+  REDACTED_PRIVATE_KEY,
+  REDACTED_CERTIFICATE,
+  REDACTED_EMAIL,
+  REDACTED_PHONE,
+  SECRET_FILE_MARKER,
+];
 
 // ── Desenler ─────────────────────────────────────────────────────────────────
 

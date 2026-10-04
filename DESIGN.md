@@ -481,13 +481,29 @@ the orchestrator asks for it.
   "diff_stats": { "files": 2, "insertions": 34, "deletions": 12 },
   "validation": { "edits_requested": 5, "edits_applied": 5,
                   "rejected": [ { "file": "...", "edit": 2,
-                                  "reason": "search text not found | match not unique | overlapping edits" } ] },
+                                  "reason": "search text not found | match not unique | overlapping edits | edit contains a redaction placeholder | path is ignored" } ] },
   "warnings": ["..."],
   "usage": { "in": 0, "out": 0 }
 }
 ```
 - `validation` in v1 is **structural only** (schema + allow-list +
-  unique search-match + overlap rejection). No test/lint execution in v1 — the workspace is a *real,
+  unique search-match + overlap rejection). Two content/path guards add
+  fixed reasons (no new wire field): `edit contains a redaction placeholder`
+  — a `modify` `search`/`replace` or `create.content` carries a redaction
+  placeholder (`[REDACTED_*]`, `[SECRET FILE CONTENT OMITTED]`) that is not
+  literally in **that same file's** base (the worker never saw the hidden
+  value; writing the placeholder would destroy it); `path is ignored` — a
+  `create` targets a path Git ignores (`.gitignore` / `info/exclude` /
+  `core.excludesFile`, decided by `git check-ignore --no-index` in the
+  workspace). The decision is taken **before any write** when the plan does
+  not touch a `.gitignore`; when it creates/modifies/deletes one, the rules
+  change with the round, so the decision is taken **after the writes and
+  before `add -N`** — ignored new files are removed again (pure fs) and
+  rejected. Exempt: a path the orchestrator explicitly selected in `files`
+  that does not exist yet is created even if ignored (`add -N -f`,
+  consistent with base capture force-adding selected ignored files); only
+  the worker's unselected new paths are rejected. Only that edit is
+  rejected, the round continues. No test/lint execution in v1 — the workspace is a *real,
   valid checkout*, which makes a future `splash_verify` (or the orchestrator
   running tests in the workspace dir with its own tools) a natural extension,
   not a redesign. `rejected[].file` is worker-chosen text: on the wire it is
@@ -649,6 +665,9 @@ fallback chain:
    discovery rule — no crawling of unrelated directories). If both exist,
    they are **combined in a deterministic order** (`CLAUDE.md` first, then
    `AGENTS.md`) and **labeled with their source** in the context block.
+   A root `AGENTS.md` that is a symlink whose canonical target is exactly
+   `<root>/CLAUDE.md` is an alias of the same rules and is skipped (not
+   read); every other symlink fails closed.
 3. **`none`.** If neither source yields rules, the session proceeds with no
    pinned rules and records it; the worker prompt simply omits the rules
    block.
@@ -1292,7 +1311,9 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
    selected untracked, incl. allowed git-ignored; base-commit hygiene: hooks
    off, deterministic Splash identity) + **fingerprint (existence + type +
    mode + content)** + validate (unique match, overlap rejection) + apply
-   (+`add -N` intent-to-add) + **scoped reset cleanup** + diff/stat +
+   (+`add -N` intent-to-add; ignored creates rejected via `git check-ignore`
+   before the write, or after it when the plan touches a `.gitignore`;
+   explicitly selected absent paths exempt — Section 3) + **scoped reset cleanup** + diff/stat +
    **complete `--binary --full-index` export**/destroy. *(The safety core.)*
    6. **`splash_task` end-to-end** (context simple) — task → worker → patch →
       validated-apply → **compact result**. *(First real loop.)*
@@ -1326,7 +1347,10 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
       with fail-closed semantics (symlink/non-regular entry, any I/O error
       other than `ENOENT`, invalid UTF-8, or an uncertain root
       canonicalization all fail the request before any workspace/session
-      exists, with one fixed safe error). The Context Assembler then redacts
+      exists, with one fixed safe error). Sole symlink exception: a root
+      `AGENTS.md` leaf symlink whose canonical target (`realpath`; an error
+      fails closed) is exactly `<root>/CLAUDE.md` is skipped without being
+      read — an alias of rules already loaded. The Context Assembler then redacts
       every rule document before any measurement, exact-measures the
       formatted rules against the 8,192-token soft budget, and compacts ONLY
       exact duplicates when over budget (unique rule material is never
