@@ -792,8 +792,12 @@ export class SessionManager {
   /**
    * Bir `splash_diff` çağrısını yürütür (Step 10 spec 4-9):
    *
-   *   girdi → aynı-oturum FIFO → (RAM önbellek | lazy disk load + kurtarma)
+   *   girdi → aynı-oturum FIFO → (RAM önbellek + commit edilmiş state
+   *   doğrulaması | lazy disk load + kurtarma)
    *   → `workspace.diff` (varsayılan: tüm workspace, -U3) | `workspace.stat`
+   *
+   * Gösterilen = close'un export edeceği: RAM'deki worktree dışarıdan
+   * değiştiyse önce commit edilmiş duruma döndürülür (`#ensureCommittedWorkspace`).
    *
    * Salt-incelemedir: inference / coordinator / bağlam kurma / kural çözme /
    * stale denetimi / tur artışı / kalıcılık / RAM durum mutasyonu YOK. Stale
@@ -830,7 +834,9 @@ export class SessionManager {
     const sessionId = request.sessionId;
     const statOnly = request.stat === true;
     return this.#runExclusive(sessionId, async (): Promise<SplashDiffResult> => {
-      const entry = this.#cache.get(sessionId) ?? (await this.#loadAndRecover(sessionId));
+      const cached = this.#cache.get(sessionId);
+      const entry =
+        cached !== undefined ? await this.#ensureCommittedWorkspace(cached) : await this.#loadAndRecover(sessionId);
       if (statOnly) {
         return { mode: "stat", diffStats: await entry.workspace.stat({ files }) };
       }
@@ -866,7 +872,8 @@ export class SessionManager {
   /**
    * `close` gövdesi — sıra KESİNDİR (spec 11); her hata sınırı açıktır:
    *
-   * 1. RAM | lazy load + kurtarma — hata aynen; hiçbir şey silinmez.
+   * 1. RAM (commit edilmiş state doğrulaması) | lazy load + kurtarma — hata
+   *    aynen; hiçbir şey silinmez.
    * 2. Stale denetimi (refine ile AYNI `#detectStale`) — operasyonel hata
    *    aynen; hiçbir şey silinmez. Stale sonucu export'u ENGELLEMEZ.
    * 3. Metadata (workspace canlıyken): `stat()` + kalıcı son sonuçtan
@@ -881,8 +888,11 @@ export class SessionManager {
    * 7. RAM girdisi düşer → sonuç (içerik YOK).
    */
   async #runClose(sessionId: string): Promise<SplashCloseResult> {
-    // 1) load/restore (lazy; kurtarma model-free).
-    const entry = this.#cache.get(sessionId) ?? (await this.#loadAndRecover(sessionId));
+    // 1) load/restore (lazy; kurtarma model-free) | RAM: commit edilmiş
+    //    duruma bağlama (dış değişiklik export'a GİRMEZ).
+    const cached = this.#cache.get(sessionId);
+    const entry =
+      cached !== undefined ? await this.#ensureCommittedWorkspace(cached) : await this.#loadAndRecover(sessionId);
     const { session, workspace } = entry;
 
     // 2) stale-base denetimi — export ÖNCESİ, refine ile birebir aynı algoritma.
@@ -1184,11 +1194,40 @@ export class SessionManager {
       }
     }
     if (session.latestWorkspaceStateHash !== undefined) {
-      const hash = await workspace.recoveryStateHash();
-      if (hash !== session.latestWorkspaceStateHash) {
+      // Step 9 formülüyle kaydedilmiş hash de kabul (Workspace sözleşmesi).
+      if (!(await workspace.matchesRecoveryStateHash(session.latestWorkspaceStateHash))) {
         throw new Error("internal: state hash mismatch");
       }
     }
+  }
+
+  /**
+   * RAM'deki (cache-hit) workspace'i diff/close ÖNCESİ commit edilmiş kalıcı
+   * duruma bağlar (Codex P2 — PR #34): son turdan sonra worktree dışarıdan
+   * (editör/araç) değiştiyse doğrulanmamış içerik gösterilmez/export edilmez.
+   * Hash eşleşirse iş YOK; eşleşmezse commit edilmiş salt-okunur küme altında
+   * TAM yeniden uygulama + doğrulama (tur 0: base'e sıfırlama). Kalıcılık
+   * YOK. Başarısızsa: RAM girdisi düşer + `session_recovery_failed` (hiçbir
+   * şey silinmez/export edilmez). Lazy kurtarma zaten doğruladığı için yalnız
+   * cache-hit yolunda çağrılır.
+   */
+  async #ensureCommittedWorkspace(entry: ActiveSession): Promise<ActiveSession> {
+    const { session, workspace } = entry;
+    const expected = session.latestWorkspaceStateHash;
+    try {
+      if (expected === undefined || (await workspace.matchesRecoveryStateHash(expected))) {
+        return entry;
+      }
+      workspace.setReadonlyPaths(session.readonlyPaths);
+      if (session.latestWorkerResult === undefined) {
+        await workspace.resetToBase();
+      }
+      await this.#reapplyCommittedState(workspace, session);
+    } catch (err) {
+      this.#cache.delete(session.sessionId);
+      throw sessionError("session_recovery_failed", err);
+    }
+    return entry;
   }
 
   /**

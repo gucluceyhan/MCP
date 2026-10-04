@@ -310,6 +310,7 @@ async function brokenDestroyWorkspace(input: WorkspaceCreateInput): Promise<Work
     exportPatch: (outputRoot: string) => real.exportPatch(outputRoot),
     snapshotRecoveryState: () => real.snapshotRecoveryState(),
     recoveryStateHash: () => real.recoveryStateHash(),
+    matchesRecoveryStateHash: (expected: string) => real.matchesRecoveryStateHash(expected),
     currentCreatedPaths: () => real.currentCreatedPaths(),
     setReadonlyPaths: (p: readonly string[]) => real.setReadonlyPaths(p),
     destroy: async () => {
