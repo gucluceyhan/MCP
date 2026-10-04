@@ -329,6 +329,8 @@ export class SessionManager {
   #inFlight = new Set<Promise<unknown>>();
   /** `dispose()` sonrası yeni task/refine/diff/close kabul edilmez (spec 128/131). */
   #disposed = false;
+  /** Tek kapanış sözü — tekrarlanan `dispose()` çağrıları bunu paylaşır (S#8). */
+  #disposePromise: Promise<void> | undefined;
 
   constructor(deps: SessionManagerDeps) {
     this.#config = deps.config;
@@ -656,6 +658,12 @@ export class SessionManager {
 
     // ── max-round guard — stale SONRASI (spec 60-65: stale öncelikli) ───────
     if (session.round >= this.#config.maxRounds && !session.maxRoundsAcknowledged) {
+      // İz 4 S#7: iptal edilmiş isteğin yanıtı orkestratöre ULAŞMAZ (SDK
+      // düşürür) — ack yazılsaydı guard sessizce tüketilirdi. Ack YAZILMAZ;
+      // iptal edilmiş normal refine ile aynı tip'li `aborted` hatası.
+      if (request.signal?.aborted === true) {
+        throw new CoordinatorError("aborted", "Inference request was aborted before it started");
+      }
       const result = this.#maxRoundsResult(session);
       // Acknowledgement kalıcılaşır — restart unutmaz (spec 61/62/210).
       const candidate: PersistedSession = { ...session, maxRoundsAcknowledged: true };
@@ -799,8 +807,9 @@ export class SessionManager {
    * Gösterilen = close'un export edeceği: RAM'deki worktree dışarıdan
    * değiştiyse önce commit edilmiş duruma döndürülür (`#ensureCommittedWorkspace`).
    *
-   * Salt-incelemedir: inference / coordinator / bağlam kurma / kural çözme /
-   * stale denetimi / tur artışı / kalıcılık / RAM durum mutasyonu YOK. Stale
+   * İnceleme amaçlıdır: inference / coordinator / bağlam kurma / kural çözme /
+   * stale denetimi / tur artışı / kalıcılık / oturum durumu mutasyonu YOK
+   * (yalnız worktree'deki doğrudan düzenlemeler atılır). Stale
    * ana ağaç diff'i ENGELLEMEZ (spec 6) — çıktı her zaman immutable base →
    * workspace katkısıdır. Kilit sayesinde yarım `applyPatchSet` gözlemlenemez.
    * Yol filtresi Workspace'in literal (`:(literal)`) pathspec disiplinini
@@ -880,6 +889,9 @@ export class SessionManager {
    *    `filesChanged`/`summary` — diff metni PARSE EDİLMEZ.
    * 4. Export — hata aynen; workspace + session.json + RAM girdisi geçerli
    *    kalır (retry edilebilir; spec 16).
+   * 4b. Export sonrası state doğrulaması — uyuşmazlık/hata: RAM girdisi
+   *    düşer + `session_recovery_failed`; workspace + session.json KALIR
+   *    (yazılmış patch dosyası retry'da üzerine yazılır).
    * 5. Workspace imhası — hata: RAM girdisi düşer (canlılık belirsiz), hata
    *    aynen; patch + session.json KALIR (sonraki çağrı kurtarır; spec 17).
    * 6. Yetkili durum silme — hata: RAM girdisi düşer (workspace imha edildi);
@@ -906,6 +918,12 @@ export class SessionManager {
 
     // 4) export — başarısızsa HİÇBİR ŞEY silinmez (workspace export_failed'de korunur).
     const patchPath = await workspace.exportPatch(this.#config.outputRoot);
+
+    // 4b) export SONRASI yeniden doğrulama: export penceresinde worktree
+    //     dışarıdan değiştiyse patch doğrulanmamış içerik taşıyabilir →
+    //     workspace + session.json KALIR, RAM düşer; retry kurtarır ve
+    //     patch'in üzerine yazar.
+    await this.#verifyExportedState(sessionId, session, workspace);
 
     // 5) workspace imhası — patch artık dayanıklı kurtarma artifact'ı.
     try {
@@ -956,10 +974,22 @@ export class SessionManager {
    * (spec 319/320). Kilit + in-flight kaydı ilk `await`'ten ÖNCE senkron
    * kurulur — kuyruktaki (başlamamış) iş de `dispose` tarafından beklenir
    * (spec 131). refine / diff / close bu TEK yardımcıyı kullanır.
+   *
+   * İz 4 S#7: sırası geldiğinde `dispose` başlamışsa gövde HİÇ çalışmaz →
+   * `shutting_down` (inference / export / imha / kalıcılık YOK; oturum diskte
+   * dayanıklı kalır). Kapanış istendikten sonra yeni iş başlatılmaz; dispose
+   * bu hızlı reddi de bekler. Başlamış iş etkilenmez (güvenli terminaline
+   * ulaşır).
    */
   async #runExclusive<T>(sessionId: string, body: () => Promise<T>): Promise<T> {
     const previous = this.#locks.get(sessionId) ?? Promise.resolve();
-    const execution = previous.then(body, body);
+    const start = (): Promise<T> => {
+      if (this.#disposed) {
+        return Promise.reject(new SplashTaskError("shutting_down", "Splash is shutting down"));
+      }
+      return body();
+    };
+    const execution = previous.then(start, start);
     const tail = execution.then(
       () => undefined,
       () => undefined,
@@ -1068,10 +1098,17 @@ export class SessionManager {
    *      oturum kapalı kalır; export'u başarısız close'un oturumu diskte
    *      dayanıklı kalır (Step 10 spec 25).
    */
-  async dispose(): Promise<void> {
-    if (this.#disposed) {
-      return;
+  dispose(): Promise<void> {
+    // İz 4 S#8: idempotent — her çağrı AYNI kapanış sözünü alır (ikinci çağrı
+    // in-flight işi beklemeden erken dönmez, hatayı da yutmaz).
+    if (this.#disposePromise === undefined) {
+      this.#disposePromise = this.#runDispose();
     }
+    return this.#disposePromise;
+  }
+
+  /** `dispose` gövdesi — yalnız bir kez çalışır (`#disposePromise`). */
+  async #runDispose(): Promise<void> {
     // 1) Herhangi bir await'ten ÖNCE: artık yeni iş başlatılamaz.
     this.#disposed = true;
     // 2) In-flight settlement'lar SINIFLANDIRILIR (fail-closed).
@@ -1205,8 +1242,9 @@ export class SessionManager {
    * RAM'deki (cache-hit) workspace'i diff/close ÖNCESİ commit edilmiş kalıcı
    * duruma bağlar (Codex P2 — PR #34): son turdan sonra worktree dışarıdan
    * (editör/araç) değiştiyse doğrulanmamış içerik gösterilmez/export edilmez.
-   * Hash eşleşirse iş YOK; eşleşmezse commit edilmiş salt-okunur küme altında
-   * TAM yeniden uygulama + doğrulama (tur 0: base'e sıfırlama). Kalıcılık
+   * Hızlı yol YALNIZ güncel formül (`recoveryStateHash() === kalıcı`); aksi
+   * halde (Step 9 formülüyle eşleşme dahil) commit edilmiş salt-okunur küme
+   * altında TAM yeniden uygulama + doğrulama (tur 0: base'e sıfırlama). Kalıcılık
    * YOK. Başarısızsa: RAM girdisi düşer + `session_recovery_failed` (hiçbir
    * şey silinmez/export edilmez). Lazy kurtarma zaten doğruladığı için yalnız
    * cache-hit yolunda çağrılır.
@@ -1215,7 +1253,7 @@ export class SessionManager {
     const { session, workspace } = entry;
     const expected = session.latestWorkspaceStateHash;
     try {
-      if (expected === undefined || (await workspace.matchesRecoveryStateHash(expected))) {
+      if (expected === undefined || (await workspace.recoveryStateHash()) === expected) {
         return entry;
       }
       workspace.setReadonlyPaths(session.readonlyPaths);
@@ -1228,6 +1266,29 @@ export class SessionManager {
       throw sessionError("session_recovery_failed", err);
     }
     return entry;
+  }
+
+  /**
+   * close: export edilen state'in hâlâ commit edilmiş state olduğunu doğrular
+   * (L3). Uyuşmazlık veya doğrulama hatası → RAM girdisi düşer +
+   * `session_recovery_failed`; hiçbir şey silinmez/imha edilmez.
+   */
+  async #verifyExportedState(sessionId: string, session: PersistedSession, workspace: Workspace): Promise<void> {
+    const expected = session.latestWorkspaceStateHash;
+    if (expected === undefined) {
+      return;
+    }
+    let verified: boolean;
+    try {
+      verified = await workspace.matchesRecoveryStateHash(expected);
+    } catch (err) {
+      this.#cache.delete(sessionId);
+      throw sessionError("session_recovery_failed", err);
+    }
+    if (!verified) {
+      this.#cache.delete(sessionId);
+      throw sessionError("session_recovery_failed", new Error("internal: workspace changed during export"));
+    }
   }
 
   /**

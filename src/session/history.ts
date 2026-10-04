@@ -10,6 +10,8 @@
  *
  * Sıra — konuşma repliği (eski → yeni, spec 82-86):
  *   assistant(result_i)  →  user(feedback_{i+1} + validation_i)   (i = 1..k)
+ * Tur-0 oturumunun 1. turunu refine ürettiyse (`rounds[0].feedback` var) o
+ * geri bildirim result_1'den ÖNCE korumasız `user(feedback_1)` olarak gelir.
  * Her geri bildirim / validation / worker sonucu TAM BİR defa görünür
  * (yoklama yok). En son `user` mesajı = GÜNCEL geri bildirim + SON validation
  * → `protected` (asla azaltılmaz, spec 82/101). Geri kalan refinement'ler
@@ -96,6 +98,17 @@ export function buildHistory(
     ];
   }
   const messages: ContextHistoryMessage[] = [];
+  // İz 4: 1. turu üreten refine geri bildirimi (tur-0 → refine) başka hiçbir
+  // mesajda yer almaz — replik sırasıyla result_1'den önce, eski refinement.
+  const openingFeedback = rounds[0]?.feedback;
+  if (openingFeedback !== undefined) {
+    messages.push({
+      role: "user",
+      kind: "refinement",
+      content: `REFINEMENT FEEDBACK\n${openingFeedback}`,
+      protected: false,
+    });
+  }
   const last = rounds.length - 1;
   for (let i = 0; i < rounds.length; i++) {
     const record = rounds[i];
