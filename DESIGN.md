@@ -1064,20 +1064,8 @@ automatically — only when it genuinely cannot fit.
 
 **To the local model** (via Context Assembler / Worker Contract):
 - **Secrets & credentials** — `.env`, keys, tokens, passwords, certs:
-  redacted (pattern pass: `sk-...`, `AKIA...`, private-key blocks,
-  passworded URL credentials of any scheme, credential assignments whose
-  value is a **literal** — a quoted/backtick string, string prefixes such
-  as `b'…'`/`@"…"` kept — or a bare value only in explicitly anchored forms:
-  a line-start, space-free `KEY=value` (dotted keys allowed; indentation
-  only after a comment mark `#`/`//`/`;`/`!` or `export`/`ENV`/`ARG`) and
-  CLI flags `--…password…=VALUE` / `-e KEY=VALUE`. In **configuration
-  files** (by path: `.yml`/`.yaml`/`.ini`/`.toml`/`.properties`/`.conf`/
-  `.cfg`/`.env`, `.env.*`/`.env-*`/`.env_*` templates) additionally any
-  indented, commented, YAML `- ` list-item bare `KEY: value` /
-  `KEY = value` to end of line, except pure references (`${VAR}`,
-  `${{ secrets.X }}`, `$VAR`). Code files, `.md`, the task, rules, and
-  history get only the literal + anchored forms, so code that merely names
-  a credential is left intact) and secret files skipped entirely.
+  redacted (pattern pass: `sk-...`, `AKIA...`, private-key blocks) and
+  secret files skipped entirely.
 - **The orchestrator's system prompt / internal reasoning** — never proxied.
 - **Unrelated code** — only the orchestrator-selected `files`; no repo crawl.
 - **Editability labels** — files added on refine are presented to the worker
@@ -1207,10 +1195,7 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
       by Step 8):** the shipped step implements secret-file suppression,
       secret/PII redaction, exact token measurement, adaptive tier selection,
        output-reserve negotiation, read-only context reduction, and
-       `needs_split` (credential redaction targets literal values plus the
-       anchored bare forms of Section 9, with a path hint for configuration
-       files; every pattern is linear-time on long separator-joined runs); the
-       `splash_task` loop consumes its output (measured
+       `needs_split`; the `splash_task` loop consumes its output (measured
        messages == dispatched messages; `context.input_tokens` is the exact
        preflight count). Step 9 completes this layer with classified refine
        history and cumulative read-only references.
