@@ -822,8 +822,9 @@ export class SessionManager {
    * Gösterilen = close'un export edeceği: RAM'deki worktree dışarıdan
    * değiştiyse önce commit edilmiş duruma döndürülür (`#ensureCommittedWorkspace`).
    *
-   * Salt-incelemedir: inference / coordinator / bağlam kurma / kural çözme /
-   * stale denetimi / tur artışı / kalıcılık / RAM durum mutasyonu YOK. Stale
+   * İnceleme amaçlıdır: inference / coordinator / bağlam kurma / kural çözme /
+   * stale denetimi / tur artışı / kalıcılık / oturum durumu mutasyonu YOK
+   * (yalnız worktree'deki doğrudan düzenlemeler atılır). Stale
    * ana ağaç diff'i ENGELLEMEZ (spec 6) — çıktı her zaman immutable base →
    * workspace katkısıdır. Kilit sayesinde yarım `applyPatchSet` gözlemlenemez.
    * Yol filtresi Workspace'in literal (`:(literal)`) pathspec disiplinini
@@ -903,6 +904,9 @@ export class SessionManager {
    *    `filesChanged`/`summary` — diff metni PARSE EDİLMEZ.
    * 4. Export — hata aynen; workspace + session.json + RAM girdisi geçerli
    *    kalır (retry edilebilir; spec 16).
+   * 4b. Export sonrası state doğrulaması — uyuşmazlık/hata: RAM girdisi
+   *    düşer + `session_recovery_failed`; workspace + session.json KALIR
+   *    (yazılmış patch dosyası retry'da üzerine yazılır).
    * 5. Workspace imhası — hata: RAM girdisi düşer (canlılık belirsiz), hata
    *    aynen; patch + session.json KALIR (sonraki çağrı kurtarır; spec 17).
    * 6. Yetkili durum silme — hata: RAM girdisi düşer (workspace imha edildi);
@@ -929,6 +933,12 @@ export class SessionManager {
 
     // 4) export — başarısızsa HİÇBİR ŞEY silinmez (workspace export_failed'de korunur).
     const patchPath = await workspace.exportPatch(this.#config.outputRoot);
+
+    // 4b) export SONRASI yeniden doğrulama: export penceresinde worktree
+    //     dışarıdan değiştiyse patch doğrulanmamış içerik taşıyabilir →
+    //     workspace + session.json KALIR, RAM düşer; retry kurtarır ve
+    //     patch'in üzerine yazar.
+    await this.#verifyExportedState(sessionId, session, workspace);
 
     // 5) workspace imhası — patch artık dayanıklı kurtarma artifact'ı.
     try {
@@ -1249,8 +1259,9 @@ export class SessionManager {
    * RAM'deki (cache-hit) workspace'i diff/close ÖNCESİ commit edilmiş kalıcı
    * duruma bağlar (Codex P2 — PR #34): son turdan sonra worktree dışarıdan
    * (editör/araç) değiştiyse doğrulanmamış içerik gösterilmez/export edilmez.
-   * Hash eşleşirse iş YOK; eşleşmezse commit edilmiş salt-okunur küme altında
-   * TAM yeniden uygulama + doğrulama (tur 0: base'e sıfırlama). Kalıcılık
+   * Hızlı yol YALNIZ güncel formül (`recoveryStateHash() === kalıcı`); aksi
+   * halde (Step 9 formülüyle eşleşme dahil) commit edilmiş salt-okunur küme
+   * altında TAM yeniden uygulama + doğrulama (tur 0: base'e sıfırlama). Kalıcılık
    * YOK. Başarısızsa: RAM girdisi düşer + `session_recovery_failed` (hiçbir
    * şey silinmez/export edilmez). Lazy kurtarma zaten doğruladığı için yalnız
    * cache-hit yolunda çağrılır.
@@ -1259,7 +1270,7 @@ export class SessionManager {
     const { session, workspace } = entry;
     const expected = session.latestWorkspaceStateHash;
     try {
-      if (expected === undefined || (await workspace.matchesRecoveryStateHash(expected))) {
+      if (expected === undefined || (await workspace.recoveryStateHash()) === expected) {
         return entry;
       }
       workspace.setReadonlyPaths(session.readonlyPaths);
@@ -1272,6 +1283,29 @@ export class SessionManager {
       throw sessionError("session_recovery_failed", err);
     }
     return entry;
+  }
+
+  /**
+   * close: export edilen state'in hâlâ commit edilmiş state olduğunu doğrular
+   * (L3). Uyuşmazlık veya doğrulama hatası → RAM girdisi düşer +
+   * `session_recovery_failed`; hiçbir şey silinmez/imha edilmez.
+   */
+  async #verifyExportedState(sessionId: string, session: PersistedSession, workspace: Workspace): Promise<void> {
+    const expected = session.latestWorkspaceStateHash;
+    if (expected === undefined) {
+      return;
+    }
+    let verified: boolean;
+    try {
+      verified = await workspace.matchesRecoveryStateHash(expected);
+    } catch (err) {
+      this.#cache.delete(sessionId);
+      throw sessionError("session_recovery_failed", err);
+    }
+    if (!verified) {
+      this.#cache.delete(sessionId);
+      throw sessionError("session_recovery_failed", new Error("internal: workspace changed during export"));
+    }
   }
 
   /**

@@ -312,8 +312,10 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
         "This is the only Splash tool that returns generated code. Default: the unified diff of the " +
         "entire session workspace against its immutable base (3 context lines). `files` narrows the " +
         "diff to the listed repository-relative paths (literal paths, no globs). `stat: true` returns " +
-        "statistics only (files, insertions, deletions) with no source content. Read-only: no inference, " +
-        "no session state change; a drifted main working tree does not block it.",
+        "statistics only (files, insertions, deletions) with no source content. No inference and no " +
+        "persisted session change; a drifted main working tree does not block it. The workspace is " +
+        "verified against the last committed round; direct edits made inside the workspace are " +
+        "discarded — use splash_refine for changes.",
       inputSchema: splashDiffInputSchema,
     },
     async (args) => {
@@ -365,7 +367,9 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
         "only (absolute patch_path, files_changed, diff_stats, summary, base_status) — never code or diff " +
         "content. The patch file stays on disk outside the repository. A stale base does not block the " +
         "export, but a stale result (base_status \"stale\") must not be applied automatically by the " +
-        "orchestrator. Splash never applies the patch to the repository itself.",
+        "orchestrator. Splash never applies the patch to the repository itself. The workspace is " +
+        "verified against the last committed round; direct edits made inside the workspace are " +
+        "discarded — use splash_refine for changes.",
       inputSchema: splashCloseInputSchema,
     },
     async (args) => {

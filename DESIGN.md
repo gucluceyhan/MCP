@@ -1380,7 +1380,11 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
     state is checked against the committed hash; on drift (an external
     edit after the last round) the committed state is re-applied and
     verified, and on failure RAM is evicted with `session_recovery_failed`
-    (nothing exported or deleted).
+    (nothing exported or deleted). `splash_close` re-verifies the state after
+    the export and before destroying the workspace; a mismatch (an edit
+    during the export) keeps the workspace and `session.json`, evicts RAM,
+    and returns `session_recovery_failed` — the patch file already written
+    is left on disk without being reported, and a retry overwrites it.
 11. **End-to-end** on a real repo + real local model: verify compact
     responses, on-demand diff, `git apply` merge into the main checkout,
     refine-loop convergence with bounded token growth, the stale-base path
