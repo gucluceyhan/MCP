@@ -24,7 +24,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, rm, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { CoordinatorError, InferenceCoordinator, type RuntimeLockLike } from "../dist/backend/InferenceCoordinator.js";
 import type { LockAcquireResult } from "../dist/backend/RuntimeLock.js";
@@ -1347,6 +1347,7 @@ function delegatingWorkspace(real: Workspace, overrides: Partial<Workspace> = {}
     readBaseEntry: (p: string) => real.readBaseEntry(p),
     snapshotRecoveryState: () => real.snapshotRecoveryState(),
     recoveryStateHash: () => real.recoveryStateHash(),
+    matchesRecoveryStateHash: (expected: string) => real.matchesRecoveryStateHash(expected),
     currentCreatedPaths: () => real.currentCreatedPaths(),
     setReadonlyPaths: (p: readonly string[]) => real.setReadonlyPaths(p),
     applyPatchSet: (result) => real.applyPatchSet(result),
@@ -2247,6 +2248,139 @@ test("S2c: üretilmemiş refine turları (needs_split / inference_busy) aday sal
   assert.equal(busy.status, "inference_busy");
   assert.deepEqual(readonlyCalls.at(-1), [], "busy sonrası commit edilmiş küme");
   assert.deepEqual((await readSessionJson(first.sessionId, h.sessionsDir)).readonlyPaths, []);
+});
+
+// ── Codex P2 (PR #34): commit edilmiş state doğrulaması + Step 9 hash kabulü ──
+
+/** Son turdan SONRA worktree'deki tracked dosyaları dışarıdan (editör/araç) değiştirir. */
+async function driftWorktree(h: ManagerHarness, sessionId: string): Promise<string> {
+  const wsDir = path.join(h.sessionsDir, sessionId, "workspace");
+  await writeFile(path.join(wsDir, "src/a.ts"), "const value = 999;\n"); // worker'ın dosyası
+  await writeFile(path.join(wsDir, "src/b.ts"), "const other = 'external';\n"); // dokunmadığı dosya
+  return wsDir;
+}
+
+test("E1: RAM'deki worktree dışarıdan değişti → close YALNIZ worker sonucunu export eder; diffStats tutarlı", async (t) => {
+  const h = await makeManagerHarness(t);
+  const first = await taskRound1(h);
+  const committedStats = (await readSessionJson(first.sessionId, h.sessionsDir)).latestResult?.diffStats;
+  await driftWorktree(h, first.sessionId);
+  const restoreBefore = h.restoreCalls.count;
+
+  const closed = await h.manager.close({ sessionId: first.sessionId });
+  assert.equal(h.restoreCalls.count, restoreBefore, "RAM yolu: lazy kurtarma YOK");
+  const patch = await readFile(closed.patchPath, "utf8");
+  assert.ok(patch.includes("+const value = 2;"), "worker sonucu patch'te");
+  assert.ok(!patch.includes("999") && !patch.includes("external") && !patch.includes("src/b.ts"), "dış değişiklik patch'e GİRMEZ");
+  assert.deepEqual(closed.filesChanged, ["src/a.ts"]);
+  assert.deepEqual(closed.diffStats, committedStats);
+  assert.equal(closed.baseStatus, "fresh");
+});
+
+test("E2: RAM'deki worktree dışarıdan değişti → diff YALNIZ worker sonucunu gösterir; kalıcılık YOK", async (t) => {
+  const h = await makeManagerHarness(t);
+  const first = await taskRound1(h);
+  const sessionFile = path.join(h.sessionsDir, first.sessionId, "session.json");
+  const persistedBefore = await readFile(sessionFile, "utf8");
+  const committedStats = (await readSessionJson(first.sessionId, h.sessionsDir)).latestResult?.diffStats;
+  const wsDir = await driftWorktree(h, first.sessionId);
+  const restoreBefore = h.restoreCalls.count;
+
+  const diff = await h.manager.diff({ sessionId: first.sessionId });
+  assert.ok(diff.mode === "diff" && diff.diff.includes("+const value = 2;"));
+  assert.ok(!diff.diff.includes("999") && !diff.diff.includes("external"), "dış değişiklik görünmez");
+  await driftWorktree(h, first.sessionId);
+  assert.deepEqual(await h.manager.diff({ sessionId: first.sessionId, stat: true }), {
+    mode: "stat",
+    diffStats: committedStats,
+  });
+  assert.equal(await readFile(path.join(wsDir, "src/b.ts"), "utf8"), "const other = 10;\n", "worktree commit edilmiş duruma döndü");
+  assert.equal(await readFile(sessionFile, "utf8"), persistedBefore, "diff kalıcılık YAPMAZ");
+  assert.equal(h.restoreCalls.count, restoreBefore, "RAM yolu: lazy kurtarma YOK");
+  assert.equal(h.manager.activeSessions()[0]?.round, 1);
+});
+
+test("E3: dış değişiklik + yeniden-uygulama doğrulaması başarısız → close session_recovery_failed; patch YOK, session.json KALIR, RAM düşer", async (t) => {
+  const fault = { tamperNextApply: false };
+  const h = await makeManagerHarness(t, {
+    wrapWorkspace: (real) =>
+      delegatingWorkspace(real, {
+        applyPatchSet: async (result) => {
+          const applied = await real.applyPatchSet(result);
+          if (fault.tamperNextApply) {
+            fault.tamperNextApply = false;
+            return { ...applied, filesChanged: [...applied.filesChanged, "src/ghost.ts"] };
+          }
+          return applied;
+        },
+      }),
+  });
+  const first = await taskRound1(h);
+  const sessionFile = path.join(h.sessionsDir, first.sessionId, "session.json");
+  await driftWorktree(h, first.sessionId);
+  fault.tamperNextApply = true;
+
+  await assert.rejects(
+    h.manager.close({ sessionId: first.sessionId }),
+    (e: unknown) => e instanceof SessionError && e.kind === "session_recovery_failed",
+  );
+  assert.equal(fault.tamperNextApply, false, "sapma doğrulamanın yeniden-uygulamasında üretildi");
+  assert.ok(!(await pathExists(expectedPatchPath(h, first.sessionId))), "export YAPILMAZ");
+  assert.ok(await pathExists(sessionFile), "yetkili durum SİLİNMEZ");
+  assert.equal(h.manager.activeSessions().length, 0, "doğrulanamayan workspace RAM'de tutulmaz");
+
+  // Retry diskten kurtarır ve YALNIZ worker sonucunu export eder.
+  const closed = await h.manager.close({ sessionId: first.sessionId });
+  const patch = await readFile(closed.patchPath, "utf8");
+  assert.ok(patch.includes("+const value = 2;") && !patch.includes("999") && !patch.includes("external"));
+});
+
+test("V8: Step 9 formülüyle (varsayılan-DIŞI config) kaydedilmiş hash → yeniden başlatmada kurtarma BAŞARILI; yanlış hash session_recovery_failed", async (t) => {
+  const h = await makeManagerHarness(t);
+  const first = await taskRound1(h);
+  const sessionFile = path.join(h.sessionsDir, first.sessionId, "session.json");
+  const wsDir = path.join(h.sessionsDir, first.sessionId, "workspace");
+  const persisted = await readSessionJson(first.sessionId, h.sessionsDir);
+  // Step 9 sürecindeki kullanıcı config'i (biçim ayarları) + o sürümün pin'siz formülü.
+  const globalConfig = process.env.GIT_CONFIG_GLOBAL;
+  assert.ok(globalConfig !== undefined);
+  await writeFile(globalConfig, "[diff]\n\tnoprefix = true\n\talgorithm = histogram\n\tcontext = 7\n[color]\n\tui = always\n");
+  const legacyHash = createHash("sha256")
+    .update(
+      execFileSync(
+        "git",
+        ["-c", "core.hooksPath=/dev/null", "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames", persisted.workspaceRecovery.baseCommit],
+        { cwd: wsDir },
+      ),
+    )
+    .digest("hex");
+  assert.notEqual(legacyHash, persisted.latestWorkspaceStateHash, "fikstür: eski formül bu config'te farklı");
+  const writeHash = async (hash: string): Promise<void> => {
+    const session = await readSessionJson(first.sessionId, h.sessionsDir);
+    session.latestWorkspaceStateHash = hash;
+    session.workspaceRecovery = { ...session.workspaceRecovery, recoveryStateHash: hash };
+    await writeFile(sessionFile, JSON.stringify(session, null, 2), { mode: 0o600 });
+  };
+  const { manager: second } = await makeSecondManager(h);
+  t.after(async () => {
+    await second.dispose().catch(() => undefined);
+  });
+
+  // Yanlış hash: hâlâ fail-closed.
+  await writeHash("0".repeat(64));
+  await assert.rejects(
+    second.diff({ sessionId: first.sessionId }),
+    (e: unknown) => e instanceof SessionError && e.kind === "session_recovery_failed",
+  );
+
+  // Step 9 hash'i: kurtarma + diff + close BAŞARILI; kalıcı durum YENİDEN YAZILMAZ.
+  await writeHash(legacyHash);
+  const diff = await second.diff({ sessionId: first.sessionId });
+  assert.ok(diff.mode === "diff" && diff.diff.includes("+const value = 2;"));
+  assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).latestWorkspaceStateHash, legacyHash);
+  const closed = await second.close({ sessionId: first.sessionId });
+  assert.ok((await readFile(closed.patchPath, "utf8")).includes("+const value = 2;"));
+  assert.ok(!(await pathExists(sessionFile)));
 });
 
 // ── İz 4 (S#7/S#8): dispose sonrası kuyruk, iptal edilmiş istek, idempotent dispose ──
