@@ -384,7 +384,7 @@ export class ContextAssembler {
         body = entry.exists ? SECRET_FILE_MARKER : ABSENT_MARKER;
       } else {
         body = this.#editableBody(entry);
-        const redacted = redactText(body);
+        const redacted = redactText(body, { path: canonical });
         if (redacted !== body) {
           contentRedacted = true;
         }
@@ -424,7 +424,7 @@ export class ContextAssembler {
       }
       for (const canonical of orderedReadonly) {
         const body = await this.#readReadonlyBody(canonicalRoot, canonical, input.signal);
-        const redacted = redactText(body);
+        const redacted = redactText(body, { path: canonical });
         if (redacted !== body) {
           contentRedacted = true;
         }

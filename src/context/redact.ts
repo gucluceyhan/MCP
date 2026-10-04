@@ -14,7 +14,8 @@
  *
  * Sıralama (kaba → ince): PEM blokları (iç base64 token desenleriyle
  * çift-çevrime girmez) → token aileleri → Bearer → URL kimliği →
- * credential ataması → e-posta → telefon.
+ * credential ataması (literal → satır başı dotenv → yalnız yapılandırma
+ * dosyasında çıplak `KEY: value`) → e-posta → telefon.
  */
 
 import path from "node:path";
@@ -28,6 +29,18 @@ export const REDACTED_EMAIL = "[REDACTED_EMAIL]";
 export const REDACTED_PHONE = "[REDACTED_PHONE]";
 /** Secret dosya içeriğinin TAMAMEN bırakıldığı yer tutucu. */
 export const SECRET_FILE_MARKER = "[SECRET FILE CONTENT OMITTED]";
+/**
+ * Redaksiyonun ürettiği TÜM sabit yer tutucular — doğrulayıcı, worker'ın
+ * yazdığı içerikte (base'te literal olarak yoksa) bunları reddeder (K3).
+ */
+export const REDACTION_PLACEHOLDERS: readonly string[] = [
+  REDACTED_SECRET,
+  REDACTED_PRIVATE_KEY,
+  REDACTED_CERTIFICATE,
+  REDACTED_EMAIL,
+  REDACTED_PHONE,
+  SECRET_FILE_MARKER,
+];
 
 // ── Desenler ─────────────────────────────────────────────────────────────────
 
@@ -52,18 +65,81 @@ const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const GOOGLE_API_KEY = /\bAIza[0-9A-Za-z_-]{35}\b/g;
 /** `Authorization: Bearer <token>` — "Bearer " etiketi korunur. */
 const BEARER = /\b(Bearer\s+)[A-Za-z0-9_\-._~+/]+=*/gi;
-/** URL gömülü kimlik (`https://user:pass@host`). */
+/**
+ * Her şemada parolalı URL kimliği (`postgresql+asyncpg://u:p@h`,
+ * `redis://:pw@h`, `mongodb+srv://`, `mqtt://`). Şema uzunluğu sınırlı —
+ * `a-a-a…` gibi uzun koşularda her başlangıç sabit maliyetli (ReDoS yok).
+ */
+const URL_PASSWORD = /\b([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@?#:]*:[^\s/@?#]+@/gi;
+/** HTTP(S) URL gömülü kimlik — parolasız token biçimi de (`https://TOKEN@host`). */
 const URL_USERINFO = /\b(https?:\/\/)[^\s/@?#]+@/gi;
 /**
- * Credential ataması (`password: "x"`, `token=x`, `api_key = y`,
- * `aws_secret_access_key = ...`, ...). İsim, secret'vari bir SONA sahip tam
- * kimliktir (`aws_`/`my_` gibi önekler dahil — `\b` tek başına underscore
- * içine giremez). Değer: tırnaksız string, tırlı string ya da tek bare token.
+ * Credential anahtarı: secret'vari kelime İÇEREN tam kimlik (`aws_`/`my_`
+ * önekleri dahil). Önek/sonek sınırlı + başlangıç yalnız koşu başında
+ * (`(?<![\w-])`) → uzun `[\w-]` koşularında doğrusal.
  */
-const CREDENTIAL_ASSIGNMENT =
-  /\b([\w-]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|client[_-]?secret|private[_-]?key)[\w-]*)(\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;]+)/gi;
-/** E-posta adresleri. */
-const EMAIL = /\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g;
+const SECRET_KEY =
+  "[\\w-]{0,64}(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|client[_-]?secret|private[_-]?key)[\\w-]{0,64}";
+/**
+ * Credential ataması — değer yalnız LİTERAL (tırnaklı string; kaçışlı tırnak
+ * dahil). Anahtar opsiyonel tırnaklı (JSON `"password": "x"`), anahtar ile
+ * ayraç arasında opsiyonel tip anotasyonu (`jwt_secret: str = "x"`,
+ * `apiKey: string = "x"`; anotasyon TEK sınırlı niceleyici — boşluk koşusunda
+ * karesel geri izleme yok). Ayraç `:`/`=`/`:=`; literal ayraçtan (+ boşluk)
+ * HEMEN sonra başlamalı → `==`/`===`/`=>`/`::` yapısal olarak eşleşmez.
+ * Grup 1 (anahtar + ayraç) korunur; grup 2 (literal) placeholder'a gider.
+ */
+const CREDENTIAL_LITERAL = new RegExp(
+  `(?<![\\w-])(["']?${SECRET_KEY}["']?[ \\t]*` +
+    `(?::[\\w.\\[\\]<>|? \\t]{1,64}?=|:=|:|=)[ \\t]*)` +
+    `("(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)*')`,
+  "gi",
+);
+/**
+ * Çıplak değer YALNIZ satır başı `KEY=value` biçiminde (dotenv/ini/
+ * properties; opsiyonel `export `): değer satırın geri kalanıdır (boşluklu
+ * `# yorum` hariç) ve kod ifadesi değildir (tırnak/parantez/köşeli/süslü
+ * yok; `None`/`null`/`true`/`false`… değil). Girintili satır (çağrı
+ * argümanı) eşleşmez.
+ */
+const CREDENTIAL_DOTENV = new RegExp(
+  `^((?:export[ \\t]+)?${SECRET_KEY}[ \\t]*=[ \\t]*)` +
+    `(?!(?:none|null|nil|undefined|true|false)(?:[ \\t]|$))` +
+    "([^\\s\"'`()\\[\\]{}]+)(?=[ \\t]+#.*$|[ \\t]*$)",
+  "gim",
+);
+/**
+ * Yapılandırma dosyalarında (yol ipucu, `isConfigFilePath`) çıplak değer:
+ * satır başı (girinti + YAML `- ` öğesi + `export ` serbest) `KEY: value` /
+ * `KEY = value`; değer satır sonuna kadar (boşluklu `# yorum` hariç).
+ * Tırnaklı (literal geçişi), `[`/`{` (yer tutucu/akış), `|`/`>` (YAML blok)
+ * ve `null`/`~`/`true`… değerler dokunulmaz. Kod dosyaları bu geçişi ALMAZ.
+ */
+const CREDENTIAL_CONFIG = new RegExp(
+  `^([ \\t]*(?:-[ \\t]+)?(?:export[ \\t]+)?["']?${SECRET_KEY}["']?[ \\t]*[:=][ \\t]*)` +
+    `(?!(?:none|null|nil|undefined|true|false|~)(?:[ \\t]|$))` +
+    `([^\\s"'\\[{|>](?:[^\\n\\r]*?[^\\s])?)(?=[ \\t]+#|[ \\t]*$)`,
+  "gim",
+);
+/** Çıplak-değer kuralının uygulandığı yapılandırma uzantıları. */
+const CONFIG_EXTENSIONS: readonly string[] = [".yml", ".yaml", ".ini", ".toml", ".properties", ".conf", ".cfg", ".env"];
+
+/** Yapılandırma dosyası mı? (`.env` şablonları dahil — içerikleri redakte edilir.) */
+function isConfigFilePath(repoRelativePath: string): boolean {
+  const name = path.posix.basename(repoRelativePath).toLowerCase();
+  return (
+    CONFIG_EXTENSIONS.includes(path.posix.extname(name)) ||
+    name === ".env" ||
+    name.startsWith(".env.") ||
+    name.startsWith(".env-") ||
+    name.startsWith(".env_")
+  );
+}
+/**
+ * E-posta adresleri. Başlangıç yalnız yerel-kısım koşusunun başında
+ * (`(?<![\w.+-])`) — `a.a.a…` koşusunda her konumdan yeniden tarama yok.
+ */
+const EMAIL = /(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g;
 /**
  * Telefon numaraları — GÜÇLÜ biçim gerektirir: `+` öneki + 6-18 karakter
  * (rakkam/boşluk/ayraç) YA da 3-3-4 gruplu biçim. Replacer rakam sayısını
@@ -84,11 +160,17 @@ function countDigits(value: string): number {
   return digits;
 }
 
+/** Redaksiyon ipucu: metnin geldiği repository-göreceli dosya yolu (varsa). */
+export interface RedactOptions {
+  path?: string;
+}
+
 /**
  * Tek metin üzerinde TÜM geçişleri sabit sırayla uygular.
- * İdempotent: `redactText(redactText(x)) === redactText(x)`.
+ * İdempotent: `redactText(redactText(x, o), o) === redactText(x, o)`.
+ * `options.path` bir yapılandırma dosyasıysa çıplak `KEY: value` da gider.
  */
-export function redactText(text: string): string {
+export function redactText(text: string, options: RedactOptions = {}): string {
   if (text.length === 0) {
     return text;
   }
@@ -103,38 +185,45 @@ export function redactText(text: string): string {
     .replace(JWT, () => REDACTED_SECRET)
     .replace(GOOGLE_API_KEY, () => REDACTED_SECRET)
     .replace(BEARER, (_whole: string, label: string) => `${label}${REDACTED_SECRET}`)
-    .replace(URL_USERINFO, (whole, scheme: string) => `${scheme}${REDACTED_SECRET}@`);
-  // Credential ataması: anahtar adı + ayraç korunur; değer placeholder'a.
-  out = out.replace(CREDENTIAL_ASSIGNMENT, (whole: string, key: string, separator: string, value: string) => {
-    // Boş tırnak çifti (`""`) secret DEĞİLDİR — dokunulmaz (placeholder
-    // "secret varmış" iması üretmez).
-    if (value === '""' || value === "''") {
+    .replace(URL_PASSWORD, (_whole: string, scheme: string) => `${scheme}${REDACTED_SECRET}@`)
+    .replace(URL_USERINFO, (_whole: string, scheme: string) => `${scheme}${REDACTED_SECRET}@`);
+  // Credential ataması: anahtar adı + ayraç (+ tip anotasyonu) korunur;
+  // yalnız literal değer placeholder'a. Boş tırnak çifti (`""`) secret
+  // DEĞİLDİR — dokunulmaz.
+  out = out.replace(CREDENTIAL_LITERAL, (whole: string, prefix: string, literal: string) => {
+    if (literal.length === 2) {
       return whole;
     }
-    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
-      return `${key}${separator}"${REDACTED_SECRET}"`;
-    }
-    if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
-      return `${key}${separator}'${REDACTED_SECRET}'`;
-    }
-    return `${key}${separator}${REDACTED_SECRET}`;
+    const quote = literal.charAt(0);
+    return `${prefix}${quote}${REDACTED_SECRET}${quote}`;
   });
+  out = out.replace(CREDENTIAL_DOTENV, (_whole: string, prefix: string) => `${prefix}${REDACTED_SECRET}`);
+  if (options.path !== undefined && isConfigFilePath(options.path)) {
+    out = out.replace(CREDENTIAL_CONFIG, (_whole: string, prefix: string) => `${prefix}${REDACTED_SECRET}`);
+  }
   out = out.replace(EMAIL, () => REDACTED_EMAIL);
   // Telefon: rakam sayısı doğrulaması replacer'da (yalnız güçlü biçimler).
   out = out.replace(PHONE, (whole) => (countDigits(whole) >= 7 && countDigits(whole) <= 15 ? REDACTED_PHONE : whole));
   return out;
 }
 
+/** Belge amaçlı `.env` şablon adları — secret DEĞİL. */
+const ENV_TEMPLATE_NAMES: readonly string[] = ["example", "sample", "template", "dist"];
+
 /**
  * Secret dosya Sınıflandırması (deterministik v1; adım dosya adına bakar,
  * içeriğe ASLA bakmaz):
- * - `.env` ve `.env.<suffix>` — `example`/`sample`/`template`/`dist`
- *   suffix'leri hariç (belge amaçlı şablonlar secret DEĞİLDİR);
+ * - `.env`, `.env.<suffix>`/`.env-<suffix>`/`.env_<suffix>` ve `<ad>.env` —
+ *   `example`/`sample`/`template`/`dist` adları hariç (belge amaçlı
+ *   şablonlar secret DEĞİLDİR);
  * - anahtar/sertifika depolama uzantıları: `.key`/`.p12`/`.pfx`/`.jks`/`.keystore`;
  * - SSH özel anahtar isimleri: `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`
  *   (`.pub` dahil DEĞİL — public anahtar secret değildir);
  * - `credentials`/`credentials.*`, `secret(s).json`, service-account
- *   kimlik dosyaları.
+ *   kimlik dosyaları;
+ * - Terraform state (`*.tfstate`, `*.tfstate.backup`), PuTTY `*.ppk`,
+ *   `.git-credentials`, `.vault-token`, `.docker/config.json`,
+ *   kubeconfig (`.kube/config`, `kubeconfig`).
  *
  * Gizli dosya içeriği bağlama GİRMEDEN `SECRET_FILE_MARKER`'a düşer
  * (yoksa ABSENT marker) + sabit uyarı; dosyanın varlığı korunur.
@@ -147,9 +236,24 @@ export function isSecretFilePath(repoRelativePath: string): boolean {
   if (name === ".env") {
     return true;
   }
-  if (name.startsWith(".env.")) {
-    const suffix = name.slice(".env.".length);
-    return !["example", "sample", "template", "dist"].includes(suffix);
+  if (name.startsWith(".env.") || name.startsWith(".env-") || name.startsWith(".env_")) {
+    return !ENV_TEMPLATE_NAMES.includes(name.slice(".env.".length));
+  }
+  // `prod.env` / `local.env` (şablon adları hariç: `example.env` …).
+  if (name.endsWith(".env")) {
+    return !ENV_TEMPLATE_NAMES.includes(name.slice(0, -".env".length));
+  }
+  // Terraform state (düz metin secret taşır), PuTTY özel anahtarı,
+  // git/vault/kube kimlik dosyaları.
+  if (name.endsWith(".tfstate") || name.endsWith(".tfstate.backup") || name.endsWith(".ppk")) {
+    return true;
+  }
+  if (name === ".git-credentials" || name === ".vault-token" || name === "kubeconfig") {
+    return true;
+  }
+  const parent = path.posix.basename(path.posix.dirname(repoRelativePath)).toLowerCase();
+  if ((parent === ".docker" && name === "config.json") || (parent === ".kube" && name === "config")) {
+    return true;
   }
   if (
     name.endsWith(".key") ||

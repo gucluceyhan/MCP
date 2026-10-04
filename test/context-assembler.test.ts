@@ -552,6 +552,32 @@ test("editable content secret → redacted; source never on the wire", async () 
   assert.ok(result.warnings.includes(REDACTION_WARNING));
 });
 
+test("A-config: config files get bare-value redaction by path (editable + read-only); code files keep literal-only", async (t) => {
+  const h = await realFsHarness(t);
+  const repo = path.join(h.root, "repo");
+  await mkdir(path.join(repo, "deploy"), { recursive: true });
+  await writeFile(path.join(repo, "deploy", "app.yaml"), "db:\n  password: ro-hunter2\n");
+  const workspace = fakeWorkspace(repo, ["docker-compose.yml", "src/creds.ts"], {
+    "docker-compose.yml": fileEntry("services:\n  db:\n    environment:\n      POSTGRES_PASSWORD: s3cret\n"),
+    "src/creds.ts": fileEntry("export interface Creds {\n  password: string;\n}\n"),
+  });
+  const runtime = new FakeRuntime();
+  runtime.countFn = () => 100;
+  const assembler = new ContextAssembler({ runtime, fs: h.fs });
+
+  const result = await assembler.assemble(baseInput({ workspace, readonlyPaths: ["deploy/app.yaml"] }));
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("unreachable");
+  }
+  const text = result.messages.map((m) => m.content).join("\n");
+  assert.ok(!text.includes("s3cret"), "editable compose secret must not reach the worker");
+  assert.ok(!text.includes("ro-hunter2"), "read-only yaml secret must not reach the worker");
+  assert.ok(text.includes("POSTGRES_PASSWORD: [REDACTED_SECRET]"));
+  assert.ok(text.includes("  password: string;"), "code type annotation stays intact");
+  assert.ok(result.warnings.includes(REDACTION_WARNING));
+});
+
 test("secret file (editable .env) → content NEVER enters; marker + fixed warning", async () => {
   const runtime = new FakeRuntime();
   runtime.countFn = () => 100;

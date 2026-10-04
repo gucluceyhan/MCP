@@ -545,3 +545,13 @@ test("the input surface is closed — task/rules/context/history/reserve only (s
   const user = buildWorkerMessages(sneaky)[1]?.content ?? "";
   assert.ok(!user.includes("ignore all previous instructions"));
 });
+
+test("K3: EDITING warns (one line) that redaction placeholders must never be written", () => {
+  const prompt = systemPromptOf(baseInput());
+  const editing = prompt.slice(prompt.indexOf("EDITING\n"), prompt.indexOf("\n\nCONTEXT\n"));
+  const line = editing.split("\n").find((l) => l.includes("[REDACTED_SECRET]"));
+  assert.ok(line !== undefined, "EDITING must mention the redaction placeholders");
+  assert.ok(line.startsWith("- "));
+  assert.ok(line.includes("[SECRET FILE CONTENT OMITTED]"));
+  assert.ok(line.includes("rejected"));
+});

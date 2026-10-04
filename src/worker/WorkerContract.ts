@@ -148,6 +148,7 @@ const EDITING_SECTION = `EDITING
 - "create" contains the complete content of a new file. "delete"
   contains only the path.
 - Paths are workspace-relative, for example "src/foo.ts".
+- Placeholders such as [REDACTED_SECRET] or [SECRET FILE CONTENT OMITTED] hide content you cannot see; never write one into "replace" or "create" content - such an edit is rejected.
 - Use exactly one edit entry per target path: combine all changes to one
   file into a single "modify" with multiple operations.
 - An empty "edits" array is valid when no change is required; explain

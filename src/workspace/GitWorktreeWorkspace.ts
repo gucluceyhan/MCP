@@ -122,7 +122,13 @@ import {
 } from "./pathSafety.js";
 import { errnoIs } from "./SafeRepoReader.js";
 import { captureLiveFingerprint, gitModeType, normalizeGitFileMode, sha256Hex } from "./fingerprint.js";
-import { validateWorkerResult, type EditPlan, type WorkspaceBase } from "./validate.js";
+import {
+  REJECTION_REASONS,
+  rejectCreatePlans,
+  validateWorkerResult,
+  type EditPlan,
+  type WorkspaceBase,
+} from "./validate.js";
 
 /** Deterministik Splash commit kimliği (spec 25 — kullanıcının git kimliği GEREKMEZ). */
 const SPLASH_GIT_IDENTITY: NodeJS.ProcessEnv = {
@@ -326,7 +332,13 @@ export class GitWorktreeWorkspace implements Workspace {
    */
   private async git(
     args: readonly string[],
-    options: { cwd?: string; config?: readonly string[]; stdin?: Buffer | string; env?: NodeJS.ProcessEnv } = {},
+    options: {
+      cwd?: string;
+      config?: readonly string[];
+      stdin?: Buffer | string;
+      env?: NodeJS.ProcessEnv;
+      allowedExitCodes?: readonly number[];
+    } = {},
   ): Promise<GitRunResult> {
     const config: string[] = [HOOKS_DISABLED_CONFIG, ...(options.config ?? [])];
     try {
@@ -335,6 +347,7 @@ export class GitWorktreeWorkspace implements Workspace {
         config,
         stdin: options.stdin,
         env: options.env,
+        allowedExitCodes: options.allowedExitCodes,
       });
     } catch (err) {
       if (err instanceof WorkspaceError) {
@@ -785,7 +798,15 @@ export class GitWorktreeWorkspace implements Workspace {
     this.workerTouchedAttributePaths = new Set<string>();
 
     // (3) TÜM seti immutable base'e karşı doğrula — yazmadan ÖNCE (spec 39).
-    const validation = validateWorkerResult(this.validationBase, workerResult);
+    // (3a) K4: git-ignored yola create → `git add -N` exit 1 ile TÜM turu
+    // düşürürdü. Karar YAZMADAN önce worktree'de (base durumu) alınır;
+    // eşleşen create'ler sabit nedenle reddedilir, diğer düzenlemeler sürer.
+    const validated = validateWorkerResult(this.validationBase, workerResult);
+    const validation = rejectCreatePlans(
+      validated,
+      await this.ignoredCreatePaths(validated.plan),
+      REJECTION_REASONS.pathIgnored,
+    );
 
     // (3b) PR #24 SB-1: bu turda worker'ın modify/delete ettiği ve base'te
     // TRACKED olan `.gitattributes` yollarını SB-1 kümesine yaz — turun
@@ -972,6 +993,43 @@ export class GitWorktreeWorkspace implements Workspace {
     // (8) Bilinen worker-oluşturulan küme (spec 59) — Step 9 kalıcılık +
     // kurtarma yeniden-uygulaması + kapsamlı sıfırlama için döndürülür.
     return { validation: validation.result, filesChanged, diffStats, createdPaths: [...this.workerCreatedPaths] };
+  }
+
+  /**
+   * K4: kabul edilen create yollarından git'in yoksaydıkları (.gitignore,
+   * `info/exclude`, `core.excludesFile` — `git add`'in kullandığı aynı
+   * kaynaklar). `check-ignore` `:(literal)`/`--literal-pathspecs`'i
+   * desteklemez (ölçüldü, Git 2.50: "pathspec magic not supported");
+   * `./` öneki `:(…)`/`:x` adlarının magic yorumlanmasını engeller, glob
+   * karakterleri zaten literaldir. Çıkış 1 = hiçbiri yoksayılmıyor.
+   * Yolunda sembolik bağlantı olan create sorulmaz (`check-ignore` onda
+   * 128 ile ölür); uygulama döngüsü onu `unsafe_path` ile reddeder.
+   */
+  private async ignoredCreatePaths(plan: readonly EditPlan[]): Promise<Set<string>> {
+    const creates: string[] = [];
+    for (const entry of plan) {
+      if (entry.action !== "create") {
+        continue;
+      }
+      const abs = resolveContained(this.workspaceDir, entry.canonical);
+      if (abs !== null && !(await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: true }))) {
+        creates.push(entry.canonical);
+      }
+    }
+    if (creates.length === 0) {
+      return new Set<string>();
+    }
+    const result = await this.git(["check-ignore", "--stdin", "-z"], {
+      stdin: creates.map((p) => `./${p}\0`).join(""),
+      allowedExitCodes: [1],
+    });
+    const ignored = new Set<string>();
+    for (const entry of result.stdout.toString("utf8").split("\0")) {
+      if (entry.startsWith("./")) {
+        ignored.add(entry.slice(2));
+      }
+    }
+    return ignored;
   }
 
   /**

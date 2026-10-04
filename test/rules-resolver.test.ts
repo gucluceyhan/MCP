@@ -23,6 +23,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Stats } from "node:fs";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { RulesResolver } from "../dist/rules/RulesResolver.js";
@@ -41,6 +43,10 @@ interface EntrySpec {
   content?: Buffer;
   lstatError?: string;
   readError?: string;
+  /** symlink: `realpath`'in döndüreceği kanonik hedef. */
+  realpathTarget?: string;
+  /** symlink: `realpath` hatası (errno). */
+  realpathError?: string;
 }
 
 function statOf(kind: EntryKind | undefined): Stats {
@@ -99,6 +105,12 @@ class ScriptedRulesFs implements RulesFs {
     return this;
   }
 
+  /** Yaprak symlink: `realpath` → `target` (kanonik mutlak) ya da `error` errno. */
+  setSymlink(rel: string, link: { target?: string; error?: string }): this {
+    this.entries.set(this.abs(rel), { kind: "symlink", realpathTarget: link.target, realpathError: link.error });
+    return this;
+  }
+
   async lstat(target: string): Promise<Stats> {
     this.lstatCalls.push(target);
     const spec = this.entries.get(target);
@@ -127,6 +139,13 @@ class ScriptedRulesFs implements RulesFs {
     this.realpathCalls.push(target);
     if (this.realpathError !== undefined) {
       throw errno(this.realpathError);
+    }
+    const spec = this.entries.get(target);
+    if (spec?.realpathError !== undefined) {
+      throw errno(spec.realpathError);
+    }
+    if (spec?.realpathTarget !== undefined) {
+      return spec.realpathTarget;
     }
     // Kimlik canonicalizasyonu: kök aynen döner (test kökleri zaten
     // kanoniktir).
@@ -487,4 +506,56 @@ test("a resolver that would need a write surface is impossible by construction (
     /outside the RulesFs seam/,
     "the seam guard rejects any non-lstat/readFile/realpath access",
   );
+});
+
+// ── İz 3 / K2: AGENTS.md → <root>/CLAUDE.md takma adı ───────────────────────
+
+const failsClosed = (err: unknown): boolean =>
+  err instanceof RulesResolutionError && err.message === RULES_RESOLUTION_FAILED_MESSAGE;
+
+test("K2: AGENTS.md leaf symlink whose canonical target is exactly <root>/CLAUDE.md → alias, skipped WITHOUT reading", async () => {
+  const fs = new ScriptedRulesFs()
+    .setFile("CLAUDE.md", "claude rule")
+    .setSymlink("AGENTS.md", { target: RESOLVER });
+  const result = await new RulesResolver({ fs }).resolve({ repoRoot: "/repo" });
+
+  assert.equal(result.source, "CLAUDE.md");
+  assert.deepEqual(result.documents, [{ source: "CLAUDE.md", content: "claude rule" }]);
+  assert.deepEqual(fs.readFileCalls, [RESOLVER], "the alias content must never be read");
+});
+
+test("K2: every other symlink stays fail-closed (never read)", async () => {
+  const cases: Array<[string, ScriptedRulesFs]> = [
+    ["AGENTS.md → outside the repository", new ScriptedRulesFs().setFile("CLAUDE.md", "c").setSymlink("AGENTS.md", { target: "/outside/AGENTS.md" })],
+    ["AGENTS.md → in-repo non-root CLAUDE.md", new ScriptedRulesFs().setFile("CLAUDE.md", "c").setSymlink("AGENTS.md", { target: "/repo/docs/CLAUDE.md" })],
+    ["AGENTS.md → in-repo other file", new ScriptedRulesFs().setFile("CLAUDE.md", "c").setSymlink("AGENTS.md", { target: "/repo/README.md" })],
+    ["AGENTS.md canonicalization fails (dangling)", new ScriptedRulesFs().setSymlink("AGENTS.md", { error: "ENOENT" })],
+    ["AGENTS.md canonicalization fails (ELOOP)", new ScriptedRulesFs().setFile("CLAUDE.md", "c").setSymlink("AGENTS.md", { error: "ELOOP" })],
+    ["CLAUDE.md → AGENTS.md (reverse alias is NOT accepted)", new ScriptedRulesFs().setFile("AGENTS.md", "a").setSymlink("CLAUDE.md", { target: AGENTS })],
+  ];
+  for (const [label, fs] of cases) {
+    await assert.rejects(new RulesResolver({ fs }).resolve({ repoRoot: "/repo" }), failsClosed, label);
+    for (const [abs, spec] of fs.entries) {
+      if (spec.kind === "symlink") {
+        assert.ok(!fs.readFileCalls.includes(abs), `${label}: a symlink must never be read`);
+      }
+    }
+  }
+});
+
+test("K2 (real filesystem): relative AGENTS.md -> CLAUDE.md alias resolves to CLAUDE.md only; ../outside link fails closed", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "splash-rules-k2-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = path.join(root, "repo");
+  await mkdir(repo);
+  await writeFile(path.join(repo, "CLAUDE.md"), "claude rule\n");
+  await symlink("CLAUDE.md", path.join(repo, "AGENTS.md"));
+  const ok = await new RulesResolver().resolve({ repoRoot: repo });
+  assert.equal(ok.source, "CLAUDE.md");
+  assert.deepEqual(ok.documents, [{ source: "CLAUDE.md", content: "claude rule\n" }]);
+
+  await rm(path.join(repo, "AGENTS.md"));
+  await writeFile(path.join(root, "outside.md"), "outside rule\n");
+  await symlink("../outside.md", path.join(repo, "AGENTS.md"));
+  await assert.rejects(new RulesResolver().resolve({ repoRoot: repo }), failsClosed);
 });

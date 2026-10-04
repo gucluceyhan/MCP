@@ -226,3 +226,177 @@ test("redactText: pathological inputs resolve quickly (no catastrophic backtrack
     assert.equal(typeof out, "string");
   }
 });
+
+// ── İz 3 / A: credential ataması — yalnız LİTERAL değer (kod bozulmaz) ──────
+
+test("A: code that merely NAMES a credential is untouched (no literal value)", () => {
+  const unchanged = [
+    "inputTokens: number;",
+    "  inputTokens: number;",
+    "if (token === null) {",
+    "if (token == null) {",
+    'if (token == "admin") {',
+    "if (password === 'x') {",
+    'const pick = (token) => "default";',
+    'secret::load("x")',
+    'if token: x == "y"',
+    "const strip = (token) => token.trim();",
+    "access_token = create_access_token(data)",
+    "TOKEN = None",
+    "API_TOKEN = null  # set at runtime",
+    "def verify_password(plain_password: str, hashed_password: str) -> bool:",
+    "    api_key=api_key,",
+    "secret::Vault::open()",
+    '"api_key": null,',
+  ];
+  for (const line of unchanged) {
+    assert.equal(redactText(line), line, `must not change: ${line}`);
+  }
+});
+
+test("A: literal credential values are redacted (typed, quoted-key, dotenv, export)", () => {
+  const table: Array<[string, string]> = [
+    ['jwt_secret: str = "prod-secret"', `jwt_secret: str = "${REDACTED_SECRET}"`],
+    ['const apiKey: string = "abc123";', `const apiKey: string = "${REDACTED_SECRET}";`],
+    ['"password": "hunter2"', `"password": "${REDACTED_SECRET}"`],
+    ["'password': 'hunter2'", `'password': '${REDACTED_SECRET}'`],
+    ['{"password":"hunter2"}', `{"password":"${REDACTED_SECRET}"}`],
+    ["PASSWORD=hunter2", `PASSWORD=${REDACTED_SECRET}`],
+    ["PASSWORD=hunter2\nDEBUG=1", `PASSWORD=${REDACTED_SECRET}\nDEBUG=1`],
+    ["PASSWORD=abc;def # rotated", `PASSWORD=${REDACTED_SECRET} # rotated`],
+    ["aws_secret_access_key = wJalr/abc0123", `aws_secret_access_key = ${REDACTED_SECRET}`],
+    ["export API_KEY=x", `export API_KEY=${REDACTED_SECRET}`],
+    ['token := "abc"', `token := "${REDACTED_SECRET}"`],
+    ['private static final String API_KEY = "abc";', `private static final String API_KEY = "${REDACTED_SECRET}";`],
+    ['password = "ab\\"cd"', `password = "${REDACTED_SECRET}"`],
+  ];
+  for (const [input, expected] of table) {
+    assert.equal(redactText(input), expected, `input: ${input}`);
+    assert.equal(redactText(expected), expected, `idempotent: ${expected}`);
+  }
+});
+
+// ── İz 3 / B: URL kimliği her şemada + ek secret dosya sınıfları ─────────────
+
+test("B: URL userinfo with a password is redacted for every scheme (host preserved)", () => {
+  const table: Array<[string, string]> = [
+    ["postgresql://u:p@h/db", `postgresql://${REDACTED_SECRET}@h/db`],
+    ["redis://:pw@redis:6379", `redis://${REDACTED_SECRET}@redis:6379`],
+    ["postgresql+asyncpg://user:s3cr3t@db:5432/app", `postgresql+asyncpg://${REDACTED_SECRET}@db:5432/app`],
+    ["mongodb+srv://admin:pa55@cluster0.example.net/x", `mongodb+srv://${REDACTED_SECRET}@cluster0.example.net/x`],
+    ["mqtt://dev:pw@broker:1883", `mqtt://${REDACTED_SECRET}@broker:1883`],
+  ];
+  for (const [input, expected] of table) {
+    assert.equal(redactText(input), expected, `input: ${input}`);
+    assert.equal(redactText(expected), expected, `idempotent: ${expected}`);
+  }
+  // Parolasız, kimliksiz URL'ler değişmez.
+  for (const benign of ["redis://redis:6379/0", "http://host:8080/path?q=a:b", "file:///tmp/x"]) {
+    assert.equal(redactText(benign), benign);
+  }
+});
+
+test("B: additional secret file classes", () => {
+  for (const p of [
+    "infra/terraform.tfstate",
+    "infra/terraform.tfstate.backup",
+    "keys/putty.ppk",
+    ".git-credentials",
+    "home/.docker/config.json",
+    ".docker/config.json",
+    "home/.kube/config",
+    ".kube/config",
+    "ci/kubeconfig",
+    ".vault-token",
+    "deploy/prod.env",
+    ".env-local",
+    ".env_production",
+  ]) {
+    assert.equal(isSecretFilePath(p), true, p);
+  }
+  for (const p of ["docs/config.json", "app/config", "src/environment.ts", ".env-example", ".env_sample", "example.env", "sample.env"]) {
+    assert.equal(isSecretFilePath(p), false, p);
+  }
+});
+
+test("ReDoS: long separator-joined runs resolve quickly", () => {
+  for (const input of ["a-".repeat(50_000), "a.".repeat(50_000), "a_password-".repeat(20_000), "x://:".repeat(20_000), "password:" + " ".repeat(100_000) + "x"]) {
+    const start = Date.now();
+    redactText(input);
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 1_000, `redaction took ${elapsed}ms (possible ReDoS)`);
+  }
+});
+
+// ── İz 3 / A-config: yapılandırma dosyalarında çıplak değer (yol ipucu) ──────
+
+test("A-config: bare `KEY: value` / `KEY = value` in config files is redacted (indented, list item, comment kept)", () => {
+  const compose = [
+    "services:",
+    "  db:",
+    "    environment:",
+    "      POSTGRES_PASSWORD: s3cret",
+    "      API_TOKEN: correct horse battery # rotated monthly",
+    "  app:",
+    "    environment:",
+    "      - CLIENT_SECRET=abc123",
+    "password: hunter2",
+    "token: null",
+    "secret:",
+    "  nested: value",
+  ].join("\n");
+  const expected = [
+    "services:",
+    "  db:",
+    "    environment:",
+    `      POSTGRES_PASSWORD: ${REDACTED_SECRET}`,
+    `      API_TOKEN: ${REDACTED_SECRET} # rotated monthly`,
+    "  app:",
+    "    environment:",
+    `      - CLIENT_SECRET=${REDACTED_SECRET}`,
+    `password: ${REDACTED_SECRET}`,
+    "token: null",
+    "secret:",
+    "  nested: value",
+  ].join("\n");
+  const out = redactText(compose, { path: "deploy/docker-compose.yml" });
+  assert.equal(out, expected);
+  assert.equal(redactText(out, { path: "deploy/docker-compose.yml" }), out); // idempotent
+});
+
+test("A-config: every config extension / env template gets the bare-value rule; code files keep literal-only", () => {
+  const line = "  password = hunter2\npassword: hunter2";
+  const redacted = `  password = ${REDACTED_SECRET}\npassword: ${REDACTED_SECRET}`;
+  for (const p of [
+    "a.yml", "a.yaml", "conf/app.ini", "pyproject.toml", "src/main/resources/application.properties",
+    "nginx/site.conf", "setup.cfg", "deploy/prod.env", ".env.example", ".env.sample", "CONFIG.YAML",
+  ]) {
+    assert.equal(redactText(line, { path: p }), redacted, p);
+  }
+  for (const p of ["src/a.ts", "app/models.py", "Makefile", "README.md", "src/config.ts", undefined]) {
+    assert.equal(redactText(line, { path: p }), line, String(p));
+  }
+  // Kod dosyasındaki tip bildirimi DEĞİŞMEZ (yanlış-pozitif düzeltmesi korunur).
+  const ts = "interface Creds {\n  password: string;\n  token: string\n}\npassword: hunter2";
+  assert.equal(redactText(ts, { path: "src/creds.ts" }), ts);
+  assert.equal(redactText(ts), ts);
+});
+
+test("ReDoS: config-hinted redaction stays linear", () => {
+  const inputs = [
+    "a-".repeat(50_000),
+    "a.".repeat(50_000),
+    "password: " + "a #".repeat(30_000),
+    "password:" + " ".repeat(100_000) + "x",
+    " ".repeat(100_000) + "password: x",
+    "  - ".repeat(30_000),
+    "token: x\n".repeat(50_000),
+    "  password = " + "a b ".repeat(30_000),
+  ];
+  for (const input of inputs) {
+    const start = Date.now();
+    redactText(input, { path: "docker-compose.yml" });
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 1_000, `config redaction took ${elapsed}ms (possible ReDoS)`);
+  }
+});

@@ -3935,3 +3935,52 @@ test("recovery: expected workspaceDir inside the repo fails with the stable unsa
     await ws.destroy().catch(() => undefined);
   }
 });
+
+// ── İz 3 / K4: git-ignored yola create → yalnız o düzenleme reddedilir ───────
+
+test("K4: create into ignored paths (.gitignore / info/exclude, magic-looking name) → `path is ignored`; others apply; workspace stays usable", async () => {
+  const fixture = await buildFixture("k4-ignored");
+  // `info/exclude` ortak git dizinindedir → worktree de görür (git add ile aynı kaynak).
+  await writeFile(path.join(fixture.repo, ".git", "info", "exclude"), "*.log\n");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const result = await ws.applyPatchSet(
+      workerResult([
+        { kind: "create", path: "nested/ignored.txt", content: "x\n" }, // .gitignore: ignored.txt
+        { kind: "modify", path: "src/a.ts", operations: [{ search: "alpha-USER", replace: "alpha-WORKER" }] },
+        { kind: "create", path: "logs/:(exclude)run.log", content: "y\n" }, // info/exclude: *.log (magic adı literal)
+        { kind: "create", path: "src/fresh.ts", content: "fresh\n" },
+      ]),
+    );
+    assert.deepEqual(result.validation.rejected, [
+      { file: "nested/ignored.txt", edit: 0, reason: "path is ignored" },
+      { file: "logs/:(exclude)run.log", edit: 2, reason: "path is ignored" },
+    ]);
+    assert.equal(result.validation.editsApplied, 2);
+    assert.deepEqual([...result.filesChanged].sort(), ["src/a.ts", "src/fresh.ts"]);
+    assert.deepEqual(result.createdPaths, ["src/fresh.ts"]);
+    // Reddedilen create'ler worktree'ye YAZILMADI.
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "nested")));
+    await assert.rejects(lstat(path.join(ws.workspaceDir, "logs")));
+
+    // Sonraki tur aynı workspace'te normal çalışır.
+    const next = await ws.applyPatchSet(workerResult([{ kind: "create", path: "src/fresh2.ts", content: "f2\n" }]));
+    assert.deepEqual(next.validation.rejected, []);
+    assert.deepEqual(next.filesChanged, ["src/fresh2.ts"]);
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("K4: create beneath a symlink that appeared in the workspace still fails with `unsafe_path` (check-ignore never sees it)", async () => {
+  const fixture = await buildFixture("k4-symlink");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    await symlink(tmp, path.join(ws.workspaceDir, "stray-link"));
+    await expectWorkspaceError("unsafe_path", () =>
+      ws.applyPatchSet(workerResult([{ kind: "create", path: "stray-link/x.js", content: "1\n" }])),
+    );
+  } finally {
+    await ws.destroy();
+  }
+});

@@ -1503,3 +1503,35 @@ test("Step 8: failed (0 applied) sonucu gerçek rulesSource taşır; workspace k
   assert.equal(result.rulesSource, "CLAUDE.md");
   assert.equal(h.service.activeTasks().length, 1);
 });
+
+test("K4: create into a git-ignored path → that edit rejected (`path is ignored`), round `partial`, session survives", async (t) => {
+  const h = await makeHarness(t, { newSessionId: () => "k4-id" });
+  await writeFile(path.join(h.fixture.repoRoot, ".gitignore"), "dist/\n");
+  git(h.fixture.repoRoot, "add", ".gitignore");
+  git(h.fixture.repoRoot, "commit", "-m", "ignore dist");
+  h.backend.runBehavior = async () => ({
+    content: workerJson({
+      summary: "Build output + change.",
+      edits: [
+        { kind: "create", path: "dist/x.js", content: "module.exports = 1;\n" },
+        {
+          kind: "modify",
+          path: "src/a.ts",
+          operations: [{ search: "const value = 1;", replace: "const value = 2;" }],
+        },
+      ],
+    }),
+    usage: { inputTokens: 100, outputTokens: 60 },
+  });
+
+  const result = await h.service.executeTask({ task: "Change", files: ["src/a.ts"] });
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.validation.rejected, [{ file: "dist/x.js", edit: 0, reason: "path is ignored" }]);
+  assert.equal(result.validation.editsApplied, 1);
+  assert.deepEqual(result.filesChanged, ["src/a.ts"]);
+  // Oturum + workspace yaşıyor; yoksayılan dosya worktree'ye YAZILMADI.
+  assert.equal(h.service.activeTasks().length, 1);
+  const workspaceDir = path.join(h.sessionsDir, "k4-id", "workspace");
+  assert.ok(await pathExists(workspaceDir));
+  assert.equal(await pathExists(path.join(workspaceDir, "dist/x.js")), false);
+});

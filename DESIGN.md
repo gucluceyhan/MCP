@@ -439,13 +439,21 @@ the orchestrator asks for it.
   "diff_stats": { "files": 2, "insertions": 34, "deletions": 12 },
   "validation": { "edits_requested": 5, "edits_applied": 5,
                   "rejected": [ { "file": "...", "edit": 2,
-                                  "reason": "search text not found | match not unique | overlapping edits" } ] },
+                                  "reason": "search text not found | match not unique | overlapping edits | edit contains a redaction placeholder | path is ignored" } ] },
   "warnings": ["..."],
   "usage": { "in": 0, "out": 0 }
 }
 ```
 - `validation` in v1 is **structural only** (schema + allow-list +
-  unique search-match + overlap rejection). No test/lint execution in v1 — the workspace is a *real,
+  unique search-match + overlap rejection). Two content/path guards add
+  fixed reasons (no new wire field): `edit contains a redaction placeholder`
+  — a `modify.replace` / `create.content` carries a redaction placeholder
+  (`[REDACTED_*]`, `[SECRET FILE CONTENT OMITTED]`) that is not literally in
+  that file's base (the worker never saw the hidden value; writing the
+  placeholder would destroy it); `path is ignored` — a `create` targets a
+  path Git ignores (`.gitignore` / `info/exclude` / `core.excludesFile`,
+  decided by `git check-ignore` in the workspace before any write); only
+  that edit is rejected, the round continues. No test/lint execution in v1 — the workspace is a *real,
   valid checkout*, which makes a future `splash_verify` (or the orchestrator
   running tests in the workspace dir with its own tools) a natural extension,
   not a redesign.
@@ -602,6 +610,9 @@ fallback chain:
    discovery rule — no crawling of unrelated directories). If both exist,
    they are **combined in a deterministic order** (`CLAUDE.md` first, then
    `AGENTS.md`) and **labeled with their source** in the context block.
+   A root `AGENTS.md` that is a symlink whose canonical target is exactly
+   `<root>/CLAUDE.md` is an alias of the same rules and is skipped (not
+   read); every other symlink fails closed.
 3. **`none`.** If neither source yields rules, the session proceeds with no
    pinned rules and records it; the worker prompt simply omits the rules
    block.
@@ -1045,8 +1056,15 @@ automatically — only when it genuinely cannot fit.
 
 **To the local model** (via Context Assembler / Worker Contract):
 - **Secrets & credentials** — `.env`, keys, tokens, passwords, certs:
-  redacted (pattern pass: `sk-...`, `AKIA...`, private-key blocks) and
-  secret files skipped entirely.
+  redacted (pattern pass: `sk-...`, `AKIA...`, private-key blocks,
+  passworded URL credentials of any scheme, credential assignments whose
+  value is a **literal** — a quoted string, or a bare value only on a
+  line-start `KEY=value` / `export KEY=value` line; in **configuration
+  files** (by path: `.yml`/`.yaml`/`.ini`/`.toml`/`.properties`/`.conf`/
+  `.cfg`/`.env` and `.env.*` templates) also any (indented) bare
+  `KEY: value` / `KEY = value` to end of line; in code files, code that
+  merely names a credential is left intact) and secret files skipped
+  entirely.
 - **The orchestrator's system prompt / internal reasoning** — never proxied.
 - **Unrelated code** — only the orchestrator-selected `files`; no repo crawl.
 - **Editability labels** — files added on refine are presented to the worker
@@ -1174,7 +1192,9 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
       by Step 8):** the shipped step implements secret-file suppression,
       secret/PII redaction, exact token measurement, adaptive tier selection,
        output-reserve negotiation, read-only context reduction, and
-       `needs_split`; the `splash_task` loop consumes its output (measured
+       `needs_split` (credential redaction targets literal values only; every
+       pattern is linear-time on long separator-joined runs); the
+       `splash_task` loop consumes its output (measured
        messages == dispatched messages; `context.input_tokens` is the exact
        preflight count). Step 9 completes this layer with classified refine
        history and cumulative read-only references.
@@ -1188,7 +1208,10 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
       with fail-closed semantics (symlink/non-regular entry, any I/O error
       other than `ENOENT`, invalid UTF-8, or an uncertain root
       canonicalization all fail the request before any workspace/session
-      exists, with one fixed safe error). The Context Assembler then redacts
+      exists, with one fixed safe error). Sole symlink exception: a root
+      `AGENTS.md` leaf symlink whose canonical target (`realpath`; an error
+      fails closed) is exactly `<root>/CLAUDE.md` is skipped without being
+      read — an alias of rules already loaded. The Context Assembler then redacts
       every rule document before any measurement, exact-measures the
       formatted rules against the 8,192-token soft budget, and compacts ONLY
       exact duplicates when over budget (unique rule material is never
