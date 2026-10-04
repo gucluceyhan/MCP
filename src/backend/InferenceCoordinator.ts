@@ -113,6 +113,26 @@ export class CoordinatorError extends Error {
   }
 }
 
+/** Ön-kapı iptali: dispatch'in kuyruk-iptaliyle AYNI tip'li hata (LOW-1). */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal !== undefined && signal.aborted) {
+    throw new CoordinatorError("aborted", "Inference request was aborted before it started");
+  }
+}
+
+/**
+ * `acquire`'ı her koşulda bir Promise'a çevirir: senkron throw → red (dispatch
+ * fail-closed yolunu, ön-kapı beklemesini aynı biçimde görür). Yerel Promise
+ * aynen döner — ek tick yok.
+ */
+function startAcquire(lock: RuntimeLockLike, ownerId: string): Promise<LockAcquireResult> {
+  try {
+    return Promise.resolve(lock.acquire(ownerId));
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
 /**
  * Koordinatörün kullandığı kilit sözleşmesi (injeksiyon dikişi). Üretim
  * implementasyonu `RuntimeLock`'tur (süreçler arası, token-doğrulamalı);
@@ -121,7 +141,21 @@ export class CoordinatorError extends Error {
 export interface RuntimeLockLike {
   acquire(ownerId: string): Promise<LockAcquireResult>;
   release(token: string): Promise<void>;
+  /**
+   * İsteğe bağlı salt-okunur yoklama (İz 2 / M4 ön-kapısı) — `RuntimeLock`
+   * sağlar. Yoksa ön-kapı kilit adımını atlar (dispatch yine yetkilidir).
+   */
+  peek?(): Promise<"free" | "busy" | "uncertain">;
 }
+
+/**
+ * `probe` sonucu: `clear` — ölçüm trafiği başlayabilir (dispatch yine her
+ * şeyi YENİDEN denetler); `inference_busy` — dispatch'in vereceği aynı
+ * kapalı sözlükle meşgul.
+ */
+export type InferenceProbeResult =
+  | { status: "clear" }
+  | { status: "inference_busy"; conflict: InferenceConflict };
 
 /**
  * Injeksiyon dikişleri — üretimde yalnızca `runtimeDir` + `backend`
@@ -165,6 +199,22 @@ export class InferenceCoordinator {
   #active: QueuedJob | null = null;
   /** `activeOwnerId` alanı (dequeue'da ayarlanır, finally'de temizlenir). */
   #activeOwnerId: string | null = null;
+  /**
+   * Bu süreç inference kilidini FİİLEN tutuyor mu: `acquire` `acquired:true`
+   * döndükten SONRA kurulur, release denemesi bitince (başarılı ya da değil)
+   * temizlenir. `#active` sahiplik kanıtı DEĞİLDİR (Codex P2): dequeue olmuş
+   * işin `acquire`'ı hâlâ bekliyor ya da yabancı sahip bildirecek olabilir;
+   * release sonrası da pump temizliğine dek dolu kalır. Ön-kapı (`probe`)
+   * yoklamayı yalnız buna dayanarak atlar.
+   */
+  #lockHeld = false;
+  /**
+   * Bu süreçte SÜRMEKTE olan acquire denemesi (yoksa `null`; acquire
+   * sonuçlanınca `finally`'de temizlenir). Ön-kapı, yoklama meşgul derken
+   * gözlenen sahibin bizim yarım kilidimiz olup olmadığını bunun sonucuyla
+   * ayırır (DESIGN 2.7: aynı süreç dispatch'i ASLA çakışma değildir).
+   */
+  #acquiring: Promise<LockAcquireResult> | null = null;
 
   constructor(deps: CoordinatorDeps) {
     this.#backend = deps.backend;
@@ -253,6 +303,76 @@ export class InferenceCoordinator {
     return promise;
   }
 
+  /**
+   * Ölçüm trafiği ÖNCESİ kilit ALMAYAN ön-kapı (İz 2 / M4; DESIGN.md 2.5:
+   * adaptör yalnız koordinatör üzerinden). Context Assembler'ın runtime
+   * ölçümleri (`/status`, `/v1/models`, `/apply-template`, `/tokenize`)
+   * FIFO'dan geçmez; bu yoklama, meşgul bir host'ta ölçüm yapılmadan
+   * `inference_busy` dönülmesini sağlar. Danışma niteliğindedir (TOCTOU):
+   * `dispatch` kilidi alıp her şeyi yeniden denetler.
+   *
+   * Sıra (dispatch'in haritasıyla birebir):
+   *  0. sinyal zaten iptalse → tip'li `aborted` (dispatch'in iptal sözlüğü);
+   *  1. bu süreç kilidi FİİLEN tutmuyorsa kilit yoklaması: canlı sahip →
+   *     `splash`, doğrulanamıyor → `unknown` — kilit meşgulse runtime'a HİÇ
+   *     gidilmez. Bu süreç kilidi fiilen tutuyorsa (`acquire` başarıyla
+   *     dönmüş, release bitmemiş — yoklama öncesinde ya da yoklama SÜRERKEN)
+   *     kilit BİZİMDİR — aynı süreç dispatch'i ASLA çakışma DEĞİLDİR (LOW-2;
+   *     DESIGN 2.7). Yalnız dequeue olmuş bir dispatch kanıt DEĞİLDİR (Codex
+   *     P2): yoklama meşgul/doğrulanamaz derken bu süreçte bir acquire
+   *     sürüyorsa gözlenen sahip onun yarım kilidi olabilir — o acquire'ın
+   *     SONUCU beklenir: alındı → kilit bizim; alınamadı/hata → yabancı
+   *     sahip doğrulandı, yoklamanın kararı geçerli (runtime'a temas yok).
+   *     Bekleme sınırlıdır (acquire başka süreci BEKLEMEZ) ve caller
+   *     sinyaliyle kesilir. Yoklamadan (ve bu beklemeden) sonra sinyal
+   *     iptalse → `aborted` (LOW-1);
+   *  2. host taraması için YALNIZ runtime kimliği yenilenir (`/status` +
+   *     `/v1/models`; asla önbellek — yeniden başlamış runtime'ın PID'i);
+   *     tokenize/şablon ölçümü YOK; hata tip'li olarak AYNEN yayılır;
+   *  3. kimlik yok → `unknown`; tarama hatası → `unknown`; çakışma → tür.
+   * Hiçbir kilit alınmaz, hiçbir dosya yazılmaz, jenerasyon yapılmaz.
+   */
+  async probe(signal?: AbortSignal): Promise<InferenceProbeResult> {
+    throwIfAborted(signal);
+    if (!this.#lockHeld && this.#lock.peek !== undefined) {
+      let state: "free" | "busy" | "uncertain";
+      try {
+        state = await this.#lock.peek();
+      } catch {
+        state = "uncertain";
+      }
+      throwIfAborted(signal);
+      // Yoklama sürerken bu süreçteki bir dispatch kilidi FİİLEN aldıysa
+      // gözlenen sahip biziz. Yalnız dequeue (acquire sonuçlanmamış) kanıt
+      // değildir — gözlenen sahip yabancı olabilir.
+      let ownLock: boolean = this.#lockHeld;
+      const ownAttempt = this.#acquiring;
+      if (!ownLock && state !== "free" && ownAttempt !== null) {
+        // Gözlenen sahip bu süreçte sürmekte olan acquire'ın YARIM kilidi
+        // olabilir: karar o acquire'ın sonucuna bırakılır.
+        ownLock = await this.#awaitOwnAcquire(ownAttempt, signal);
+        throwIfAborted(signal);
+      }
+      if (state === "busy" && !ownLock) {
+        return { status: "inference_busy", conflict: "splash" };
+      }
+      if (state === "uncertain" && !ownLock) {
+        return { status: "inference_busy", conflict: "unknown" };
+      }
+    }
+    const info = await this.#backend.refreshRuntimeInfo(signal);
+    if (info.runtimeProcessId === undefined) {
+      return { status: "inference_busy", conflict: "unknown" };
+    }
+    let conflict: ConflictKind;
+    try {
+      conflict = await this.#detector.detect(info.runtimeProcessId);
+    } catch {
+      return { status: "inference_busy", conflict: "unknown" };
+    }
+    return conflict === "none" ? { status: "clear" } : { status: "inference_busy", conflict };
+  }
+
   /** Aktif işin opak `ownerId`'si; hiçbir iş dispatch'de değilse `null`. */
   get activeOwnerId(): string | null {
     return this.#activeOwnerId;
@@ -267,6 +387,40 @@ export class InferenceCoordinator {
   }
 
   // ── iç mekanizma ───────────────────────────────────────────────────────
+
+  /**
+   * Bu süreçte sürmekte olan acquire'ın SONUCUNU bekler (ön-kapı): `true` →
+   * kilit bizim; `false` → alınamadı ya da hata (yabancı sahip doğrulandı).
+   * Sonsuz bekleme yolu YOK: kilit sözleşmesi gereği `acquire` başka süreci
+   * BEKLEMEZ (busy/uncertain ile derhal döner, yeniden denemesi sınırlı) —
+   * yalnız kendi dosya işlemleri kadar sürer. Caller sinyali beklemeyi
+   * keser → tip'li `aborted` (dispatch'in iptal sözlüğü).
+   */
+  async #awaitOwnAcquire(
+    attempt: Promise<LockAcquireResult>,
+    signal: AbortSignal | undefined,
+  ): Promise<boolean> {
+    const own = attempt.then(
+      (result) => result.acquired,
+      () => false,
+    );
+    if (signal === undefined) {
+      return own;
+    }
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () =>
+        reject(new CoordinatorError("aborted", "Inference request was aborted before it started"));
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([own, aborted]);
+    } finally {
+      if (onAbort !== undefined) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+  }
 
   /**
    * FIFO pompası: aktif iş yoksa kuyruğun BAŞINDAKİ işi (sırası geleni)
@@ -345,15 +499,21 @@ export class InferenceCoordinator {
         return;
       }
 
-      // 2) Süreçler arası kilit (atomik mkdir).
+      // 2) Süreçler arası kilit (atomik mkdir). Deneme ön-kapıya görünür
+      //    (`#acquiring`): yoklama bizim yarım kilidimizi görürse sonucu
+      //    bekleyebilsin.
+      const attempt = startAcquire(this.#lock, request.ownerId);
+      this.#acquiring = attempt;
       let acquisition: LockAcquireResult;
       try {
-        acquisition = await this.#lock.acquire(request.ownerId);
+        acquisition = await attempt;
       } catch {
         // Kilit katmanı sözleşmesi gereği atmaz (busy/uncertain
         // döndürür); yine de koru: fail closed, backend çağrılmaz.
         job.resolve({ status: "inference_busy", conflict: "unknown" });
         return;
+      } finally {
+        this.#acquiring = null;
       }
 
       // 3) Başka bir Splash süreci inference'ı sahipleniyor (ya da
@@ -370,6 +530,9 @@ export class InferenceCoordinator {
 
       // Bundan sonrası kilidi BİZİM — 13'teki release sonucu nihai
       // settlement'i belirler; release tamamlanana dek iş çözülmez.
+      // Sahiplik ancak ŞİMDİ kanıtlı: ön-kapı yoklamayı bu andan release
+      // bitene dek atlayabilir.
+      this.#lockHeld = true;
       let intended: CoordinatedInferenceResult | null = null;
       let inferenceError: unknown = null;
       try {
@@ -433,6 +596,10 @@ export class InferenceCoordinator {
         } catch (err) {
           releaseFailure = err;
         }
+        // Release denemesi bitti: sahiplik artık kanıtlanamaz (hata yolunda
+        // kilit yerinde kalmış olabilir) — ön-kapı yeniden yoklar (fail
+        // closed). Settlement'tan ÖNCE: caller sonucu gördüğünde temizdir.
+        this.#lockHeld = false;
 
         // 14) TEK settlement noktası — öncelik (dosya dok.):
         if (releaseFailure === null) {

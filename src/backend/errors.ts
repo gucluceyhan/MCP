@@ -9,7 +9,9 @@
  *   yüzeyine taşır — o yüzden `message` fragment-taşıyan bir metin asla
  *   değildir.
  * - `cause` TEKNİK geliştirici kanalıdır; `message`'in parçası DEĞİLDİR:
- *   - `kind: "network"`      → orijinal hata nesnesi (fetch hatası / AbortError)
+ *   - `kind: "network"`      → YALNIZ hata kodu dizesi (ör. `ECONNREFUSED`,
+ *     `ABORT_ERR`, `UND_ERR_HEADERS_TIMEOUT`) ya da `undefined` — ham hata
+ *     nesnesi ASLA (mesajı host/port ya da geçersiz header değerini taşıyabilir)
  *   - `kind: "http"`         → yanıt gövdesinden ≤200 karakterlik detay dizesi
  *     (`error.message` / üst düzey `message`) ya da parse edilemezse `undefined`
  *   - `kind: "invalid_response"` → `undefined` — JSON parse hatası
@@ -36,15 +38,20 @@ export type BackendErrorKind =
   /** 2xx dönen yanıt beklenen şekle uymuyor. */
   | "invalid_response"
   /** İşaretleyicinin (caller) kendi istek seçenekleri doğrulamadan geçemedi. */
-  | "invalid_request";
+  | "invalid_request"
+  /**
+   * Tamamlanma çıkış bütçesini tüketti (`finish_reason: "length"`): yanıt
+   * yarım — dürüst ayrı tür ("geçersiz JSON" değil). İçerik taşınmaz.
+   */
+  | "output_truncated";
 
 export interface BackendErrorOptions {
   /** HTTP durum kodu; yalnızca `kind: "http"` için anlamlıdır. */
   status?: number;
   /**
    * Teknik kanal (bkz. dosya başlığı): `kind: "http"` için yanıt gövdesinden
-   * ≤200 karakterlik detay dizesi; `kind: "network"` için orijinal hata
-   * nesnesi; `invalid_response` için her zaman `undefined` (parse hatası
+   * ≤200 karakterlik detay dizesi; `kind: "network"` için yalnız hata kodu
+   * dizesi (ya da `undefined`); `invalid_response` için her zaman `undefined` (parse hatası
    * gövde snippet'i taşır). `message` her zaman GÜVENLİ kalır; detay
    * yalnız burada durur.
    */

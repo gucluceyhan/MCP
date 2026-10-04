@@ -31,6 +31,12 @@ export interface ProcessInfo {
   ppid: number;
   /** Ham komut satırı — asla dışarı taşırılmaz. */
   command: string;
+  /**
+   * İsteğe bağlı çalıştırılabilir yolu (`ps -o comm=`, macOS'ta argv[0]) —
+   * BOŞLUK içerebilir (İz 2 / M2). Yalnız `command`'ın boşlukla sınırlı
+   * ÖNEKİ ise ilk token yerine kullanılır; aksi hâlde yok sayılır.
+   */
+  executable?: string;
 }
 
 /** Host süreç tablosu taraması (injeksiyon noktası). */
@@ -43,11 +49,14 @@ export type ConflictKind = "none" | "splash" | "mlx" | "ollama";
  * Python ailesi yorumlayıcı basename deseni: `python`, `python2`,
  * `python3`, `python2.7`, `python3.12`, `python3.13`, ... — yani
  * `python` + isteğe bağlı major (`2`/`3`) + sıfır ya da daha fazla `.N`
- * versiyon segmenti. `^…$` sınırları sayesinde `python-helper`,
+ * versiyon segmenti. Baş harf `P` da kabul edilir (İz 2 / M2): macOS
+ * framework build'leri (Homebrew / python.org) venv'den çağrılsa bile
+ * `…/Python.app/Contents/MacOS/Python` olarak çalışır (ölçüldü: ps komut
+ * satırı venv yolunu değil bu yürütülebiliri gösterir). `^…$` sınırları sayesinde `python-helper`,
  * `python3-notes`, `mypython3`, `python3.13-debug-wrapper` gibi
  * benzer isimli yürütülebilirler yorumlayıcı DEĞİLDİR.
  */
-const PYTHON_INTERPRETER_BASENAME = /^python(?:2|3)?(\.\d+)*$/;
+const PYTHON_INTERPRETER_BASENAME = /^[Pp]ython(?:2|3)?(\.\d+)*$/;
 
 /** Bir token'ın basename'ı: son `/` (ya da `\`) parçası. */
 function basenameOf(token: string): string {
@@ -60,6 +69,26 @@ function tokenizeCommand(command: string): string[] {
 }
 
 /**
+ * Süreci token'lara böler: ilk token çalıştırılabilirdir. `executable`
+ * (ps `comm`) komut satırının boşlukla sınırlanan ÖNEKİ ise — yolu boşluk
+ * içeren yorumlayıcılar (`…/Yazılımlarım ve Kodlar/.venv/bin/python3`) —
+ * ilk token TAMAMI odur; aksi hâlde düz boşluk bölmesi (İz 2 / M2).
+ */
+function processTokens(entry: ProcessInfo): string[] {
+  const exe = entry.executable;
+  if (
+    exe !== undefined &&
+    exe.length > 0 &&
+    /\s/.test(exe) &&
+    entry.command.startsWith(exe) &&
+    (entry.command.length === exe.length || /\s/.test(entry.command[exe.length] ?? ""))
+  ) {
+    return [exe, ...tokenizeCommand(entry.command.slice(exe.length))];
+  }
+  return tokenizeCommand(entry.command);
+}
+
+/**
  * Komutun çalıştırılabiliri (ilk token) Python/uv ailesinden mi?
  *
  * Yorumlayıcı basename'ı YOL bağımsızdır: `/opt/homebrew/bin/python3.13` ya da
@@ -68,8 +97,7 @@ function tokenizeCommand(command: string): string[] {
  * literal olarak korunur. Bu kapı hem `isSplashRuntime` (b) dalını hem de
  * `isMlxRuntime`'u besler.
  */
-function usesInterpreterLauncher(command: string): boolean {
-  const tokens = tokenizeCommand(command);
+function usesInterpreterLauncher(tokens: readonly string[]): boolean {
   const first = tokens[0];
   if (first === undefined) {
     return false;
@@ -100,8 +128,7 @@ function usesInterpreterLauncher(command: string): boolean {
  * alt-komutu YINE şarttır; bir editörün `splash` adında dosya AÇMASI
  * (yürütülebilir `code`/`vim`) çakışma DEĞİLDİR.
  */
-function isSplashRuntime(command: string): boolean {
-  const tokens = tokenizeCommand(command);
+function isSplashRuntime(tokens: readonly string[]): boolean {
   if (tokens.length === 0) {
     return false;
   }
@@ -137,7 +164,7 @@ function isSplashRuntime(command: string): boolean {
   //     (`splash.ts`, `splash-notes.txt` eşleşmez); `serve` alt-komutu
   //     zorunludur — `python3 ~/my/splash --flag` gibi düz betik
   //     çağrıları runtime sayılmaz.
-  if (usesInterpreterLauncher(command)) {
+  if (usesInterpreterLauncher(tokens)) {
     return tokens.some((token) => basenameOf(token) === "splash");
   }
   return false;
@@ -156,8 +183,7 @@ function isSplashRuntime(command: string): boolean {
  * aynı dosya adları ve `code /project/mlx-notes.txt` gibi argüman içi
  * metinler eşleşmez.
  */
-function isMlxRuntime(command: string): boolean {
-  const tokens = tokenizeCommand(command);
+function isMlxRuntime(tokens: readonly string[]): boolean {
   if (tokens.length === 0) {
     return false;
   }
@@ -168,7 +194,7 @@ function isMlxRuntime(command: string): boolean {
   if (executable.startsWith("mlx_lm.") || executable.startsWith("mlx_vlm.")) {
     return true;
   }
-  if (!usesInterpreterLauncher(command)) {
+  if (!usesInterpreterLauncher(tokens)) {
     return false;
   }
   return tokens.some((token) => {
@@ -202,8 +228,7 @@ function isMlxRuntime(command: string): boolean {
  * Argüman içindeki "ollama" metni (`echo ollama`, `code
  * /project/ollama-notes.txt`) YETMEZ — yürütülebilir konumu şarttır.
  */
-function isOllamaRuntime(command: string): boolean {
-  const tokens = tokenizeCommand(command);
+function isOllamaRuntime(tokens: readonly string[]): boolean {
   if (tokens.length < 2) {
     return false;
   }
@@ -231,9 +256,10 @@ export class RuntimeConflictDetector {
 
   /**
    * Host'u sınıflandırır. `configuredPid` (yapılandırılan Splash
-   * runtime'ın PID'si; bilinmiyorsa `null`) ve TÜM torun süreçleri
-   * sınıflandırmadan çıkarılır — istemli backend ve yerel child
-   * runtime'ı (`serve-native`) asla çakışma üretmez.
+   * runtime'ın PID'si; bilinmiyorsa `null`), TÜM torun süreçleri ve ATA
+   * zinciri (pid > 1; uv/uvx başlatıcı) sınıflandırmadan çıkarılır —
+   * istemli backend, başlatıcısı ve yerel child runtime'ı (`serve-native`)
+   * asla çakışma üretmez; atanın diğer alt ağaçları dışlanmaz.
    *
    * Öncelik sırası sabittir (deterministik): splash > mlx > ollama >
    * none. Scanner hatası (throw/reject) YAYDIRILIR — çağrılan
@@ -257,12 +283,27 @@ export class RuntimeConflictDetector {
     // Yapılandırılan runtime'ın torun kapalılığı (BFS, döngü-güvenli).
     const excluded = new Set<number>();
     if (configuredPid !== null && known.has(configuredPid)) {
+      // ATA zinciri de dışlanır (İz 2 / M3): `uvx splash serve` gibi bir
+      // başlatıcı yapılandırılmış runtime'ın EBEVEYNİDİR, rakibi değil.
+      // Yalnız zincirin kendisi (ppid ile, pid > 1'e kadar; döngü-güvenli)
+      // — atanın DİĞER çocuk alt ağaçları dışlanmaz.
+      const parentOf = new Map<number, number>();
+      for (const entry of table) {
+        parentOf.set(entry.pid, entry.ppid);
+      }
+      let ancestor = parentOf.get(configuredPid);
+      while (ancestor !== undefined && ancestor > 1 && !excluded.has(ancestor) && ancestor !== configuredPid) {
+        excluded.add(ancestor);
+        ancestor = parentOf.get(ancestor);
+      }
+      const descendants = new Set<number>();
       const stack = [configuredPid];
       while (stack.length > 0) {
         const pid = stack.pop();
-        if (pid === undefined || excluded.has(pid)) {
+        if (pid === undefined || descendants.has(pid)) {
           continue;
         }
+        descendants.add(pid);
         excluded.add(pid);
         const children = childrenOf.get(pid);
         if (children !== undefined) {
@@ -280,11 +321,12 @@ export class RuntimeConflictDetector {
       if (excluded.has(entry.pid)) {
         continue; // İstemli backend ağacı: çakışma değildir.
       }
-      if (isSplashRuntime(entry.command)) {
+      const tokens = processTokens(entry);
+      if (isSplashRuntime(tokens)) {
         foundSplash = true;
-      } else if (isMlxRuntime(entry.command)) {
+      } else if (isMlxRuntime(tokens)) {
         foundMlx = true;
-      } else if (isOllamaRuntime(entry.command)) {
+      } else if (isOllamaRuntime(tokens)) {
         foundOllama = true;
       }
     }
@@ -302,6 +344,19 @@ export class RuntimeConflictDetector {
   }
 }
 
+/** `ps`'yi kabuksuz çalıştırır; hata/`maxBuffer` aşımı → red. */
+function runPs(columns: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    execFile("ps", ["-axww", "-o", columns], { maxBuffer: 10 * 1024 * 1024 }, (error, stdout) => {
+      if (error !== null) {
+        reject(error);
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
 /**
  * Üretim süreç tarayıcısı: `ps` — `execFile` ile, kabuk YOK, boru YOK
  * (dolayısıyla komut enjeksiyonu yüzeyi de yok).
@@ -310,42 +365,49 @@ export class RuntimeConflictDetector {
  * başlıksız biçimi çıktıyı deterministik tutar. Çıktı `maxBuffer`'ı
  * aşarsa ya da `ps` başarısız olursa promise REDDER — coordinator bunu
  * fail-closed `inference_busy`/`unknown` olarak haritalar.
+ *
+ * İkinci tarama `pid=,comm=` (İz 2 / M2): çalıştırılabilir yolunu (macOS'ta
+ * argv[0]; boşluk içerebilir) verir — komut satırı boşlukta bölünürken
+ * kaybolan sınırı geri kazandırır. İki tarama atomik değildir: PID ile
+ * eşlenir; eşleşmeyen/ayrıştırılamayan `comm` satırı yalnız ipucunu düşürür
+ * (sınıflandırma ilk-token kuralına döner). `comm` taraması başarısızsa
+ * tablo REDDEDİLİR (fail closed).
  */
 export function createPsScanner(): ProcessScanner {
-  return () =>
-    new Promise<ProcessInfo[]>((resolve, reject) => {
-      execFile(
-        "ps",
-        ["-axww", "-o", "pid=,ppid=,command="],
-        { maxBuffer: 10 * 1024 * 1024 },
-        (error, stdout) => {
-          if (error !== null) {
-            reject(error);
-            return;
-          }
-          const table: ProcessInfo[] = [];
-          for (const line of stdout.split("\n")) {
-            if (line.trim().length === 0) {
-              continue; // Boş satır (ör. sondaki satır): zararsız.
-            }
-            const parts = line.trim().split(/\s+/);
-            const pid = Number.parseInt(parts[0] ?? "", 10);
-            const ppid = Number.parseInt(parts[1] ?? "", 10);
-            // `ppid >= 0`: PID 1 (launchd) `ppid 0` raporlar — bu her
-            // gerçek tablodadır ve güvenli yorumlanabilir (ebeveyn yok).
-            // `pid > 0`: gerçek süreç kimliği şarttır.
-            if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || ppid < 0) {
-              // Güvenle yorumlanamayan satır: tablo tam güvenilmez —
-              // fail closed (coordinator `unknown` haritalar).
-              reject(new Error("Process table contains an unparseable row"));
-              return;
-            }
-            // `command`: kalan tüm satır. (Boş komut — örn. zombi —
-            // hiçbir imzayla eşleşmez; tablo hata sayılmaz.)
-            table.push({ pid, ppid, command: parts.slice(2).join(" ") });
-          }
-          resolve(table);
-        },
-      );
-    });
+  return async () => {
+    const [commandOut, commOut] = await Promise.all([runPs("pid=,ppid=,command="), runPs("pid=,comm=")]);
+    const executables = new Map<number, string>();
+    for (const line of commOut.split("\n")) {
+      const match = /^\s*(\d+) (.+)$/.exec(line);
+      if (match !== null) {
+        executables.set(Number.parseInt(match[1] ?? "", 10), (match[2] ?? "").trimEnd());
+      }
+    }
+    const table: ProcessInfo[] = [];
+    for (const line of commandOut.split("\n")) {
+      if (line.trim().length === 0) {
+        continue; // Boş satır (ör. sondaki satır): zararsız.
+      }
+      const parts = line.trim().split(/\s+/);
+      const pid = Number.parseInt(parts[0] ?? "", 10);
+      const ppid = Number.parseInt(parts[1] ?? "", 10);
+      // `ppid >= 0`: PID 1 (launchd) `ppid 0` raporlar — bu her
+      // gerçek tablodadır ve güvenli yorumlanabilir (ebeveyn yok).
+      // `pid > 0`: gerçek süreç kimliği şarttır.
+      if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || ppid < 0) {
+        // Güvenle yorumlanamayan satır: tablo tam güvenilmez —
+        // fail closed (coordinator `unknown` haritalar).
+        throw new Error("Process table contains an unparseable row");
+      }
+      // `command`: kalan tüm satır. (Boş komut — örn. zombi —
+      // hiçbir imzayla eşleşmez; tablo hata sayılmaz.)
+      const info: ProcessInfo = { pid, ppid, command: parts.slice(2).join(" ") };
+      const executable = executables.get(pid);
+      if (executable !== undefined && executable.length > 0) {
+        info.executable = executable;
+      }
+      table.push(info);
+    }
+    return table;
+  };
 }

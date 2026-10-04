@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
-import { InferenceCoordinator, type RuntimeLockLike } from "../dist/backend/InferenceCoordinator.js";
+import { CoordinatorError, InferenceCoordinator, type RuntimeLockLike } from "../dist/backend/InferenceCoordinator.js";
 import type { LockAcquireResult } from "../dist/backend/RuntimeLock.js";
 import {
   type InferenceBackend,
@@ -206,6 +206,8 @@ class FakeLock implements RuntimeLockLike {
   releaseCount = 0;
   /** `true` ise başka bir süreç kilidi tutuyormuş gibi davran. */
   busy = false;
+  /** İz 2 / M4: `true` ise kilit ALMAYAN ön-kapı (peek) canlı yabancı sahip görür. */
+  peekBusy = false;
   async acquire(ownerId: string): Promise<LockAcquireResult> {
     this.acquireCount++;
     if (this.busy) {
@@ -215,6 +217,9 @@ class FakeLock implements RuntimeLockLike {
   }
   async release(_token: string): Promise<void> {
     this.releaseCount++;
+  }
+  async peek(): Promise<"free" | "busy" | "uncertain"> {
+    return this.peekBusy ? "busy" : "free";
   }
 }
 
@@ -2336,7 +2341,16 @@ test("E3: dış değişiklik + yeniden-uygulama doğrulaması başarısız → c
 });
 
 test("V8: Step 9 formülüyle (varsayılan-DIŞI config) kaydedilmiş hash → yeniden başlatmada kurtarma BAŞARILI; yanlış hash session_recovery_failed", async (t) => {
-  const h = await makeManagerHarness(t);
+  const applyCalls = { count: 0 };
+  const h = await makeManagerHarness(t, {
+    wrapWorkspace: (real) =>
+      delegatingWorkspace(real, {
+        applyPatchSet: (result) => {
+          applyCalls.count++;
+          return real.applyPatchSet(result);
+        },
+      }),
+  });
   const first = await taskRound1(h);
   const sessionFile = path.join(h.sessionsDir, first.sessionId, "session.json");
   const wsDir = path.join(h.sessionsDir, first.sessionId, "workspace");
@@ -2378,7 +2392,253 @@ test("V8: Step 9 formülüyle (varsayılan-DIŞI config) kaydedilmiş hash → y
   const diff = await second.diff({ sessionId: first.sessionId });
   assert.ok(diff.mode === "diff" && diff.diff.includes("+const value = 2;"));
   assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).latestWorkspaceStateHash, legacyHash);
+  // L2: RAM hızlı yolu YALNIZ güncel formül — yalnız eski formülle eşleşen oturum yeniden uygulanıp doğrulanır.
+  const appliesBefore = applyCalls.count;
+  assert.deepEqual(await second.diff({ sessionId: first.sessionId }), diff);
+  assert.equal(applyCalls.count, appliesBefore + 1, "eski formül eşleşmesi → reapply + doğrulama");
   const closed = await second.close({ sessionId: first.sessionId });
   assert.ok((await readFile(closed.patchPath, "utf8")).includes("+const value = 2;"));
   assert.ok(!(await pathExists(sessionFile)));
+});
+
+test("M4: refine whose pre-measurement probe is busy → inference_busy with the LAST KNOWN context (input 0); no measurement, no dispatch, state unchanged", async (t) => {
+  const h = await makeManagerHarness(t);
+  const first = await taskRound1(h);
+  assert.equal(first.status, "applied");
+  let measured = 0;
+  h.backend.countBehavior = () => {
+    measured++;
+    return 1_000;
+  };
+  const acquiresBefore = h.lock.acquireCount;
+  h.lock.peekBusy = true;
+
+  const busy = await h.manager.refine({ sessionId: first.sessionId, feedback: "again", files: ["src/b.ts"] });
+
+  assert.equal(busy.status, "inference_busy");
+  assert.equal(busy.inference?.conflict, "splash");
+  assert.equal(measured, 0, "no measurement traffic behind a busy probe");
+  assert.equal(h.lock.acquireCount, acquiresBefore, "dispatch is never reached");
+  assert.deepEqual(busy.context, { ...first.context, inputTokens: 0 });
+  assert.deepEqual(busy.filesChanged, first.filesChanged);
+  assert.deepEqual(busy.warnings, []);
+  assert.deepEqual((await readSessionJson(first.sessionId, h.sessionsDir)).readonlyPaths, []);
+});
+
+// ── PR #34 audit LOW'ları (L3/L4/L5) ─────────────────────────────────────────
+
+/** `applyPatchSet` sonucunu bir kez kurcalayabilen harness (yeniden-uygulama sapması). */
+async function tamperingHarness(t: TestContext): Promise<{ h: ManagerHarness; fault: { tamperNextApply: boolean } }> {
+  const fault = { tamperNextApply: false };
+  const h = await makeManagerHarness(t, {
+    wrapWorkspace: (real) =>
+      delegatingWorkspace(real, {
+        applyPatchSet: async (result) => {
+          const applied = await real.applyPatchSet(result);
+          if (fault.tamperNextApply) {
+            fault.tamperNextApply = false;
+            return { ...applied, filesChanged: [...applied.filesChanged, "src/ghost.ts"] };
+          }
+          return applied;
+        },
+      }),
+  });
+  return { h, fault };
+}
+
+test("E4: export penceresinde worktree değişir → close session_recovery_failed; workspace + session.json KALIR, RAM düşer; retry patch'in üzerine yazar", async (t) => {
+  const fault = { driftOnExport: false };
+  const h = await makeManagerHarness(t, {
+    wrapWorkspace: (real) =>
+      delegatingWorkspace(real, {
+        exportPatch: async (outputRoot: string) => {
+          if (fault.driftOnExport) {
+            fault.driftOnExport = false;
+            // Ön doğrulamadan SONRA, export sırasında gelen dış düzenleme.
+            await writeFile(path.join(real.workspaceDir, "src/b.ts"), "const other = 'external';\n");
+          }
+          return real.exportPatch(outputRoot);
+        },
+      }),
+  });
+  const first = await taskRound1(h);
+  const sessionDir = path.join(h.sessionsDir, first.sessionId);
+  const patchPath = expectedPatchPath(h, first.sessionId);
+  fault.driftOnExport = true;
+
+  await assert.rejects(
+    h.manager.close({ sessionId: first.sessionId }),
+    (e: unknown) => e instanceof SessionError && e.kind === "session_recovery_failed",
+  );
+  assert.equal(fault.driftOnExport, false, "sapma export sırasında üretildi");
+  assert.ok(await pathExists(path.join(sessionDir, "workspace")), "workspace İMHA EDİLMEZ");
+  assert.ok(await pathExists(path.join(sessionDir, "session.json")), "yetkili durum SİLİNMEZ");
+  assert.equal(h.manager.activeSessions().length, 0, "RAM girdisi düşer");
+  assert.ok((await readFile(patchPath, "utf8")).includes("external"), "kalıntı: doğrulanmamış patch diskte (sonuç DÖNMEDİ)");
+
+  // Retry diskten kurtarır; patch'in ÜZERİNE yazar (yalnız worker sonucu).
+  const closed = await h.manager.close({ sessionId: first.sessionId });
+  assert.equal(closed.patchPath, patchPath);
+  const patch = await readFile(patchPath, "utf8");
+  assert.ok(patch.includes("+const value = 2;") && !patch.includes("external"));
+  assert.ok(!(await pathExists(path.join(sessionDir, "session.json"))));
+});
+
+test("E5: RAM'deki worktree'ye dış filter (.gitattributes + filter.<x>.clean) → diff ve close güvenli red; filter ÇALIŞMAZ, patch YOK, session.json KALIR", async (t) => {
+  const h = await makeManagerHarness(t);
+  const forDiff = await taskRound1(h);
+  const forClose = await taskRound1(h);
+  const marker = path.join(h.fixture.root, "filter-ran");
+  const script = path.join(h.fixture.root, "evil-clean.sh");
+  await writeFile(script, `#!/bin/sh\ntouch "${marker}"\ncat\n`, { mode: 0o755 });
+  git(h.fixture.repoRoot, "config", "filter.evil.clean", script);
+  for (const session of [forDiff, forClose]) {
+    await writeFile(path.join(h.sessionsDir, session.sessionId, "workspace", ".gitattributes"), "* filter=evil\n");
+  }
+  const recoveryFailed = (e: unknown): boolean => e instanceof SessionError && e.kind === "session_recovery_failed";
+
+  await assert.rejects(h.manager.diff({ sessionId: forDiff.sessionId }), recoveryFailed);
+  await assert.rejects(h.manager.close({ sessionId: forClose.sessionId }), recoveryFailed);
+  assert.ok(!(await pathExists(marker)), "dış filter ASLA çalıştırılmaz");
+  assert.ok(!(await pathExists(expectedPatchPath(h, forClose.sessionId))), "export YAPILMAZ");
+  for (const session of [forDiff, forClose]) {
+    assert.ok(await pathExists(path.join(h.sessionsDir, session.sessionId, "session.json")), "yetkili durum SİLİNMEZ");
+  }
+  assert.equal(h.manager.activeSessions().length, 0, "doğrulanamayan workspace'ler RAM'de tutulmaz");
+});
+
+test("E6: tur-0 (needs_split) RAM oturumu + dış değişiklik → diff boş, close boş patch; worktree base'e döner", async (t) => {
+  const h = await makeManagerHarness(t);
+  h.backend.countBehavior = () => 999_999_999;
+  const first = await h.manager.createTask({ task: "Huge", files: ["src/a.ts"] });
+  assert.equal(first.status, "needs_split");
+  const bPath = path.join(h.sessionsDir, first.sessionId, "workspace", "src/b.ts");
+  const restoreBefore = h.restoreCalls.count;
+
+  await writeFile(bPath, "const other = 'external';\n");
+  const diff = await h.manager.diff({ sessionId: first.sessionId });
+  assert.ok(diff.mode === "diff" && diff.diff === "", "dış değişiklik görünmez");
+  assert.equal(await readFile(bPath, "utf8"), "const other = 10;\n", "base'e döndü");
+
+  await writeFile(bPath, "const other = 'external';\n");
+  const closed = await h.manager.close({ sessionId: first.sessionId });
+  assert.deepEqual(closed.filesChanged, []);
+  assert.deepEqual(closed.diffStats, { files: 0, insertions: 0, deletions: 0 });
+  assert.equal((await stat(closed.patchPath)).size, 0, "boş patch");
+  assert.equal(h.restoreCalls.count, restoreBefore, "RAM yolu: lazy kurtarma YOK");
+});
+
+test("E7: diff yolunda doğrulama başarısız → session_recovery_failed; RAM düşer, session.json bayt-eşit", async (t) => {
+  const { h, fault } = await tamperingHarness(t);
+  const first = await taskRound1(h);
+  const sessionFile = path.join(h.sessionsDir, first.sessionId, "session.json");
+  const before = await readFile(sessionFile);
+  await driftWorktree(h, first.sessionId);
+  fault.tamperNextApply = true;
+
+  await assert.rejects(
+    h.manager.diff({ sessionId: first.sessionId }),
+    (e: unknown) => e instanceof SessionError && e.kind === "session_recovery_failed",
+  );
+  assert.equal(fault.tamperNextApply, false, "sapma doğrulamanın yeniden-uygulamasında üretildi");
+  assert.equal(h.manager.activeSessions().length, 0, "RAM girdisi düşer");
+  assert.ok((await readFile(sessionFile)).equals(before), "session.json bayt-eşit");
+});
+
+// ── İz 4 (S#7/S#8): dispose sonrası kuyruk, iptal edilmiş istek, idempotent dispose ──
+
+/** Kapıdan geçince 2. turu (taban 1 → 3) üreten backend davranışı. */
+function gatedRound2(h: ManagerHarness, gate: Promise<void>): void {
+  h.backend.runBehavior = async () => {
+    await gate;
+    return {
+      content: modifyWorkerJson("const value = 1;", "const value = 3;", "Changed value to 3."),
+      usage: { inputTokens: 20, outputTokens: 10 },
+    };
+  };
+}
+
+test("S#7a: dispose — başlamış refine tamamlanır; kuyruktaki (başlamamış) refine/diff/close shutting_down; inference/export YOK; oturum diskte KALIR", async (t) => {
+  const h = await makeManagerHarness(t);
+  const first = await taskRound1(h);
+  const gate = deferred();
+  gatedRound2(h, gate.promise);
+  // Sayaç tabanı: başlamamış gövdelerin HİÇ çalışmadığının kanıtı (aşağıdaki farklar).
+  const liveBaseBefore = h.liveBaseGate.calls;
+  const savesBefore = h.store.saves.length;
+  const restoresBefore = h.restoreCalls.count;
+  const inflight = h.manager.refine({ sessionId: first.sessionId, feedback: "started", files: [] });
+  let queuedRefine!: ReturnType<SessionManager["refine"]>;
+  let queuedDiff!: ReturnType<SessionManager["diff"]>;
+  let queuedClose!: ReturnType<SessionManager["close"]>;
+  let disposePromise!: Promise<void>;
+  try {
+    await waitFor(() => h.backend.runCalls.length >= 2); // refine dispatch'te (başlamış)
+    queuedRefine = h.manager.refine({ sessionId: first.sessionId, feedback: "queued", files: [] });
+    queuedDiff = h.manager.diff({ sessionId: first.sessionId });
+    queuedClose = h.manager.close({ sessionId: first.sessionId });
+    disposePromise = h.manager.dispose();
+  } finally {
+    gate.resolve();
+  }
+  const done = await inflight;
+  assert.equal(done.status, "applied", "dispose'dan önce başlamış iş güvenli terminale ulaşır");
+  assert.equal(done.round, 2);
+  const shuttingDown = (e: unknown) => e instanceof SplashTaskError && e.kind === "shutting_down";
+  await assert.rejects(queuedRefine, shuttingDown);
+  await assert.rejects(queuedDiff, shuttingDown);
+  await assert.rejects(queuedClose, shuttingDown);
+  await disposePromise; // shutting_down güvenli sınıf — dispose REDDETMEZ
+  assert.equal(h.backend.runCalls.length, 2, "kuyruktaki refine inference'a BAŞLAMADI");
+  assert.equal(h.liveBaseGate.calls - liveBaseBefore, 1, "stale ölçümü yalnız başlamış refine'da (kuyruktaki refine/close YOK)");
+  assert.equal(h.store.saves.length - savesBefore, 1, "yalnız başlamış refine'ın tur kalıcılığı");
+  assert.equal(h.restoreCalls.count - restoresBefore, 0, "kuyruktaki iş kurtarma/yükleme YAPMADI");
+  assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).round, 2);
+  assert.ok(await pathExists(path.join(h.sessionsDir, first.sessionId, "workspace")), "oturum dayanıklı kalır");
+  assert.ok(!(await pathExists(path.join(h.fixture.outputRoot, "patches"))), "kuyruktaki close export ETMEDİ");
+});
+
+test("S#7b: iptal edilmiş istek max_rounds onayını TÜKETMEZ — ack yazılmaz; sonraki çağrı yine guard görür", async (t) => {
+  const h = await makeManagerHarness(t, { config: { maxRounds: 1 } });
+  const first = await taskRound1(h); // round 1 == maxRounds
+  const savesBefore = h.store.saves.length;
+  const runsBefore = h.backend.runCalls.length;
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(
+    h.manager.refine({ sessionId: first.sessionId, feedback: "cancelled", files: [], signal: cancelled.signal }),
+    (e: unknown) => e instanceof CoordinatorError && e.kind === "aborted",
+  );
+  assert.equal(h.store.saves.length, savesBefore, "iptal edilmiş istekte ack kalıcılığı YOK");
+  assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).maxRoundsAcknowledged, false);
+
+  const guard = await h.manager.refine({ sessionId: first.sessionId, feedback: "explicit", files: [] });
+  assert.equal(guard.status, "max_rounds", "guard tüketilmedi — orkestratör uyarıyı görür");
+  assert.equal(h.backend.runCalls.length, runsBefore, "inference YOK");
+  assert.equal((await readSessionJson(first.sessionId, h.sessionsDir)).maxRoundsAcknowledged, true);
+});
+
+test("S#8: ikinci dispose() AYNI kapanışı döner — in-flight bitmeden çözülmez; kalıcılık hatası iki çağrıya da yayılır", async (t) => {
+  // Kalıcılık: 1) tur 0, 2) round 1, 3) refine round 2 → ÜÇÜNCÜSÜ fail.
+  const h = await makeManagerHarness(t, { failSaveAt: 3 });
+  const first = await taskRound1(h);
+  const gate = deferred();
+  gatedRound2(h, gate.promise);
+  const refinePromise = h.manager.refine({ sessionId: first.sessionId, feedback: "in-flight", files: [] });
+  let firstDispose!: Promise<void>;
+  let secondDispose!: Promise<void>;
+  try {
+    await waitFor(() => h.backend.runCalls.length >= 2);
+    firstDispose = h.manager.dispose();
+    secondDispose = h.manager.dispose();
+    const secondSettled = trackSettled(secondDispose);
+    await sleep(50);
+    assert.equal(secondSettled(), false, "ikinci dispose in-flight işi BEKLER (erken dönmez)");
+  } finally {
+    gate.resolve();
+  }
+  await assert.rejects(refinePromise, (e: unknown) => e instanceof SessionError && e.kind === "session_persistence_failed");
+  const cleanupFailed = (e: unknown) => e instanceof SplashTaskError && e.kind === "task_cleanup_failed";
+  await assert.rejects(firstDispose, cleanupFailed);
+  await assert.rejects(secondDispose, cleanupFailed, "ikinci çağrı hatayı YUTMAZ");
 });

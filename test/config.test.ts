@@ -209,3 +209,19 @@ test("context: preferred reserve equal to the minimum reserve is accepted", () =
   assert.equal(config.context.minOutputReserve, 40_000);
   assert.equal(config.context.preferredOutputReserve, 40_000);
 });
+
+test("L5: SPLASH_API_KEY with CR/LF/NUL/inner space/non-ASCII is rejected at load — the key is never echoed", () => {
+  for (const bad of ["sk-abc\r\nX-Injected: 1", "sk-abc\ndef", "sk-abc\rdef", "sk-a\u0000b", "sk a", "sk-é", "sk-\u007f"]) {
+    assert.throws(
+      () => loadConfig({ SPLASH_API_KEY: bad }),
+      (err: unknown) =>
+        err instanceof Error &&
+        err.message === "Invalid SPLASH_API_KEY: expected visible ASCII characters only (no whitespace or control characters)" &&
+        !err.message.includes("sk-") && !err.message.includes("abc"),
+      JSON.stringify(bad),
+    );
+  }
+  // Görünür ASCII (0x21-0x7E) her karakter kabul edilir.
+  const visible = Array.from({ length: 0x7e - 0x21 + 1 }, (_, i) => String.fromCharCode(0x21 + i)).join("");
+  assert.equal(loadConfig({ SPLASH_API_KEY: visible }).backend.apiKey, visible);
+});
