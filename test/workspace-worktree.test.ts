@@ -4325,10 +4325,16 @@ test("git < 2.44 + partial clone (promisor remote): creation and recovery reject
     readonlyPaths: [],
   });
 
-  // git >= 2.44 (gerçek): promisor'lı repo da oluşturulur — mevcut davranış.
-  const modern = await createGitWorktreeWorkspace(cloneInput("s-m1-modern"));
-  const state = await modern.snapshotRecoveryState();
-  await modern.destroy();
+  // git >= 2.44 (sahte 2.44.0; kurulu git sürümünden bağımsız): promisor'lı
+  // repo da oluşturulur — mevcut davranış. Ayrı dizin ŞART: sürüm önbelleği
+  // `PATH` anahtarlı; aşağıdaki 2.43.0 bloğuyla aynı `out` → aynı PATH →
+  // önbellekteki 2.44.0 okunur ve eski dal reddetmez (ölçüldü).
+  const state = await withFakeGitVersion(path.join(out, "v2.44"), "git version 2.44.0", async () => {
+    const modern = await createGitWorktreeWorkspace(cloneInput("s-m1-modern"));
+    const snapshot = await modern.snapshotRecoveryState();
+    await modern.destroy();
+    return snapshot;
+  });
 
   const created: GitWorktreeWorkspace[] = [];
   try {
