@@ -200,6 +200,20 @@ export function setLiveCaptureSeams(seams: StrictReadSeams | null): void {
 }
 
 /**
+ * W-M6 reset-sonrası hedef incelemesinin (`restoreNormalizedEditableFiles`)
+ * `lstat` dikişi — test: EACCES/EIO enjeksiyonu. İzinle üretilemez (aynı
+ * izin `git reset --hard`'ı da düşürür — ölçüldü, Apple Git 2.50.1);
+ * `activeFs` KULLANILMAZ (onun arıza testleri tüm `lstat`'ları reddeder).
+ * `null` → gerçek `lstat`.
+ */
+let restoreInspectLstat: (target: string) => Promise<Stats> = lstat;
+
+/** Test enjeksiyonu seam'i: `null` → gerçek `lstat`. */
+export function setRestoreInspectLstat(fn: ((target: string) => Promise<Stats>) | null): void {
+  restoreInspectLstat = fn ?? lstat;
+}
+
+/**
  * Patch/diff ÇIKTI biçimi kilidi (Step 10 M1). Kullanıcının porcelain git
  * config'i ham diff baytlarını değiştirir (ölçüldü, Apple Git 2.50.1):
  * `color.ui=always` ANSI kaçışı ekler; `diff.noprefix` / `diff.mnemonicPrefix`
@@ -1403,9 +1417,11 @@ export class GitWorktreeWorkspace implements Workspace {
    * reset LF yazar ≠ worker'ın gördüğü CRLF → modify drift denetimi turu ve
    * kurtarmayı düşürürdü). Yalnız worktree'de atal-symlink'siz DÜZENLİ dosya
    * olan ve baytları base'ten farklı yollar `restoreBaseFiles`'a gider (aynı
-   * atal/hedef symlink güvenliği + mod aynası); yokluk/tip sapması
-   * DOKUNULMAZ — mevcut drift denetimleri raporlar. Git açısından no-op:
-   * base baytları base commit'in kendi clean normalizasyonundan geçmiştir.
+   * atal/hedef symlink güvenliği + mod aynası); yokluk (ENOENT/ENOTDIR)/tip
+   * sapması DOKUNULMAZ — mevcut drift denetimleri raporlar. İnceleme hatası
+   * (atal ya da hedef `lstat`'ında başka errno) → fail-closed red. Git
+   * açısından no-op: base baytları base commit'in kendi clean
+   * normalizasyonundan geçmiştir.
    */
   private async restoreNormalizedEditableFiles(): Promise<void> {
     const failure = "Restoring the base files failed";
@@ -1417,10 +1433,23 @@ export class GitWorktreeWorkspace implements Workspace {
         continue;
       }
       try {
-        if (await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: true })) {
+        // Atal denetimi fail-closed + GERÇEK fs (`removeWorkerCreatedPaths`
+        // ile aynı ilke): ENOENT/ENOTDIR dışı I/O "link yok" sayılmaz.
+        if (await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: false, failClosed: true })) {
           continue;
         }
-        const stat = await lstat(abs).catch(() => null);
+        // Hedef: YALNIZ ENOENT/ENOTDIR yokluktur; başka hata (EACCES/EIO/...)
+        // → red — "sessiz başarılı reset" YOK (Codex P2, PR #40). Hedef link
+        // → `isFile` değil → dokunulmaz.
+        let stat: Stats | null;
+        try {
+          stat = await restoreInspectLstat(abs);
+        } catch (err) {
+          if (!isErrnoCode(err, "ENOENT") && !isErrnoCode(err, "ENOTDIR")) {
+            throw err;
+          }
+          stat = null;
+        }
         if (stat === null || !stat.isFile() || (await readFile(abs)).equals(baseContent)) {
           continue;
         }

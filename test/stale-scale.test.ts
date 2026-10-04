@@ -33,7 +33,12 @@ import type {
 } from "../dist/backend/InferenceBackend.js";
 import { BackendError } from "../dist/backend/errors.js";
 import type { SplashConfig } from "../dist/config.js";
-import { createGitWorktreeWorkspace, setLiveCaptureSeams, setWorkspaceFs } from "../dist/workspace/GitWorktreeWorkspace.js";
+import {
+  createGitWorktreeWorkspace,
+  setLiveCaptureSeams,
+  setRestoreInspectLstat,
+  setWorkspaceFs,
+} from "../dist/workspace/GitWorktreeWorkspace.js";
 import { noFollowReadFile } from "../dist/workspace/SafeRepoReader.js";
 import { WorkspaceError, type Workspace, type WorkspaceCreateInput } from "../dist/workspace/Workspace.js";
 import type { WorkerEdit } from "../dist/worker/result.js";
@@ -1034,4 +1039,42 @@ test("İz5 Codex P2 (uçtan uca): round-0 (needs_split) session + untracked CRLF
   assert.equal(close.isError, false, JSON.stringify(close.json));
   assert.equal(close.json.base_status, "fresh");
   assert.deepEqual(close.json.files_changed, []);
+});
+
+test("İz5 Codex P2 (fail-closed): an EACCES on the post-reset inspection lstat rejects resetToBase (no silent success); a retry restores the CRLF base bytes", async (t) => {
+  const fixture = await crlfUntrackedFixture(t);
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repoRoot,
+    workspaceDir: path.join(fixture.root, "ws"),
+    sessionId: "inspect-1",
+    editablePaths: ["src/new.ts"],
+  });
+  t.after(() => ws.destroy().catch(() => undefined));
+  const wsFile = path.join(ws.workspaceDir, "src/new.ts");
+  // Değişen içerik → sonraki reset dosyayı blob'tan (LF) yeniden yazar.
+  await ws.applyPatchSet({
+    schemaVersion: 1,
+    summary: "Edit.",
+    edits: [{ kind: "modify", path: "src/new.ts", operations: [{ search: "const value = 1;", replace: "const value = 22;" }] }],
+  });
+
+  let armed = false;
+  t.after(() => setRestoreInspectLstat(null));
+  setRestoreInspectLstat(async (target) => {
+    if (armed && path.resolve(target) === path.resolve(wsFile)) {
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    }
+    return lstat(target);
+  });
+  armed = true;
+  await assert.rejects(
+    ws.resetToBase(),
+    (e: unknown) =>
+      e instanceof WorkspaceError && e.kind === "workspace_operation_failed" && e.message === "Restoring the base files failed",
+  );
+  assert.equal(await readFile(wsFile, "utf8"), "const value = 1;\nconst tail = 0;\n", "reset wrote the blob bytes; the restore did not run");
+
+  armed = false;
+  await ws.resetToBase();
+  assert.equal(await readFile(wsFile, "utf8"), CRLF_BASE, "retry restores the base bytes");
 });
