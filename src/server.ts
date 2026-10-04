@@ -12,9 +12,9 @@ import { ContextAssembler } from "./context/ContextAssembler.js";
 import { RulesResolver } from "./rules/RulesResolver.js";
 import type { RulesResolverLike } from "./rules/types.js";
 import { SplashTaskService, type ContextAssemblerLike } from "./task/SplashTaskService.js";
-import { serializeCompactResult, serializeToolError } from "./task/wire.js";
+import { serializeCloseResult, serializeCompactResult, serializeDiffResult, serializeToolError } from "./task/wire.js";
 
-/** Service name reported in MCP `initialize` and by the dev ping tool. */
+/** Service name reported in MCP `initialize`. */
 export const SERVICE_NAME = "splash";
 /** Service version; keep in sync with package.json. */
 export const SERVICE_VERSION = "0.1.0";
@@ -27,8 +27,8 @@ export const SERVICE_VERSION = "0.1.0";
 export interface SplashRuntime {
   readonly server: McpServer;
   /**
-   * Step 9 runtime kapatımı: yeni görev/refine reddedilir, in-flight
-   * çalışmalara güvenli terminal yollarına ulaşıncaya KADAR beklenir,
+   * Step 9/10 runtime kapatımı: yeni görev/refine/diff/close reddedilir,
+   * in-flight çalışmalara güvenli terminal yollarına ulaşıncaya KADAR beklenir,
    * RAM önbellek + kilit kayıtları temizlenir; KALICI OTURUMLARA
    * DOKUNULMAZ — worktree'ler imha edilmez, session dizinleri silinmez
    * (spec 128-130: süreç kapanışı implicit close DEĞİL; hayatta kalan
@@ -170,37 +170,6 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
     version: SERVICE_VERSION,
   });
 
-  // ─────────────────────────────────────────────────────────────────────
-  // TEMPORARY (development only) — NOT part of the final Splash v1
-  // public API. Remove this block when the four real tools
-  // (splash_task, splash_refine, splash_diff, splash_close) are introduced.
-  //
-  // Exists only to verify MCP/stdio connectivity end to end. It touches
-  // nothing: no repository, no model call, no git, no sessions, no files,
-  // no background work.
-  // ─────────────────────────────────────────────────────────────────────
-  server.registerTool(
-    "splash_ping",
-    {
-      title: "Splash ping (temporary dev tool)",
-      description:
-        "Development-only connectivity check. Returns the service name, version, and an ok status. " +
-        "Temporary: removed once the real Splash tools are introduced.",
-    },
-    () => ({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            service: SERVICE_NAME,
-            version: SERVICE_VERSION,
-            status: "ok",
-          }),
-        },
-      ],
-    }),
-  );
-
   // ── splash_task (Step 6+7 — ilk production aracı) ────────────────────────
   // El çok incedir: şema doğrulaması (yukarıda) → servis orkestrasyonu →
   // wire serileştirme. İş mantığı `SplashTaskService`'tadır, burada YOK.
@@ -305,6 +274,113 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
         };
       } catch (err) {
         // Tip'li, güvenli hata metadata'sı — kaynak/cause/stderr YOK (spec 12/13/58).
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(serializeToolError(err)),
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // ── splash_diff (Step 10 — içerik döndüren TEK araç, açık istekle) ──────
+  // Açık oturumun immutable base → workspace katkısını İNCELEMEK için:
+  // varsayılan tüm workspace unified diff'i (-U3); `files` literal yol
+  // filtresi; `stat: true` yalnız istatistik. İş mantığı `SessionManager`'da
+  // (kilit + lazy kurtarma; inference/kalıcılık YOK) — burada YOK.
+  //
+  // Şema: `session_id` zorunlu; `files`/`stat` isteğe bağlı. `.strict()`:
+  // bilinmeyen alanlar sessizce DÜŞMEZ — reddedilir.
+  const splashDiffInputSchema = z
+    .object({
+      session_id: z.string().min(1),
+      files: z.array(z.string()).optional(),
+      stat: z.boolean().optional(),
+    })
+    .strict();
+
+  server.registerTool(
+    "splash_diff",
+    {
+      title: "Splash diff",
+      description:
+        "Deliberately returns generated diff content for explicit inspection of an open Splash session. " +
+        "This is the only Splash tool that returns generated code. Default: the unified diff of the " +
+        "entire session workspace against its immutable base (3 context lines). `files` narrows the " +
+        "diff to the listed repository-relative paths (literal paths, no globs). `stat: true` returns " +
+        "statistics only (files, insertions, deletions) with no source content. Read-only: no inference, " +
+        "no session state change; a drifted main working tree does not block it.",
+      inputSchema: splashDiffInputSchema,
+    },
+    async (args) => {
+      try {
+        const result = await taskService.executeDiff({
+          sessionId: args.session_id,
+          files: args.files,
+          stat: args.stat,
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: serializeDiffResult(result),
+            },
+          ],
+        };
+      } catch (err) {
+        // Tip'li, güvenli hata metadata'sı — kaynak/cause/stderr YOK.
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(serializeToolError(err)),
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // ── splash_close (Step 10 — export + oturum kapatma) ─────────────────────
+  // Yalnız `session_id`: patch yolu güvenilen `outputRoot`'tan türetilir;
+  // apply/force/output_path gibi alanlar `.strict()` ile REDDEDİLİR. Splash
+  // patch'i ana checkout'a ASLA uygulamaz — iş mantığı `SessionManager`'da.
+  const splashCloseInputSchema = z
+    .object({
+      session_id: z.string().min(1),
+    })
+    .strict();
+
+  server.registerTool(
+    "splash_close",
+    {
+      title: "Splash close",
+      description:
+        "Export the final patch of an open Splash session and close the session. Returns compact metadata " +
+        "only (absolute patch_path, files_changed, diff_stats, summary, base_status) — never code or diff " +
+        "content. The patch file stays on disk outside the repository. A stale base does not block the " +
+        "export, but a stale result (base_status \"stale\") must not be applied automatically by the " +
+        "orchestrator. Splash never applies the patch to the repository itself.",
+      inputSchema: splashCloseInputSchema,
+    },
+    async (args) => {
+      try {
+        const result = await taskService.executeClose({ sessionId: args.session_id });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(serializeCloseResult(result)),
+            },
+          ],
+        };
+      } catch (err) {
+        // Tip'li, güvenli hata metadata'sı — kaynak/cause/stderr YOK.
         return {
           isError: true,
           content: [

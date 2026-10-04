@@ -1,7 +1,7 @@
 /**
  * Step 6: MCP wire serileştirme sınırı (DESIGN.md §3, 9, 11 madde 6).
  *
- * İKİ bağımsız serileştirici yaşar burada (asla karıştırılmaz):
+ * Bağımsız serileştiriciler yaşar burada (asla karıştırılmaz):
  *
  * 1. `serializeCompactResult` — internal camelCase `CompactResult` →
  *    DESIGN §3 wire vocabulary'si (snake_case). `JSON.stringify(result)`
@@ -18,12 +18,21 @@
  *    hiçbir bilinen hatada YÜZEYE TAŞINMAZ (DESIGN.md §9): bilinen tipler
  *    `message`'lerini zaten güvenli/sabit üretir; bilinmeyen her şey
  *    `internal_error` / "Internal Splash error" olur (spec 58-59).
+ *
+ * 3. `serializeCloseResult` (Step 10) — `splash_close` sonucu: YALNIZ
+ *    `patch_path` / `files_changed` / `diff_stats` / `summary` /
+ *    `base_status` (+ yalnız stale'de `stale_files`). İçerik YOK.
+ *
+ * 4. `serializeDiffResult` (Step 10) — `splash_diff` sonucu: oluşturulan
+ *    kodu taşıyan TEK araç (kasıtlı içerik istisnası) — `diff` modunda ham
+ *    unified diff metni; `stat` modunda yalnız `{"diff_stats":{...}}`.
  */
 
 import { BackendError } from "../backend/errors.js";
 import { CoordinatorError } from "../backend/InferenceCoordinator.js";
 import { ContextAssemblyError } from "../context/types.js";
 import { SessionError } from "../session/types.js";
+import type { SplashCloseResult, SplashDiffResult } from "../session/SessionManager.js";
 import { RulesResolutionError } from "../rules/types.js";
 import { WorkspaceError } from "../workspace/Workspace.js";
 import { WorkerContractError, type CompactResult } from "../worker/result.js";
@@ -143,4 +152,54 @@ export function serializeCompactResult(result: CompactResult): Record<string, un
     wire.stale_files = [...result.staleFiles];
   }
   return wire;
+}
+
+/**
+ * `splash_close` sonucu → MCP wire JSON'u (Step 10 spec 10/29; snake_case).
+ *
+ * Alan alan AÇIK eşleme (`JSON.stringify(result)` YOK): yalnız
+ * `patch_path`, `files_changed`, `diff_stats`, `summary`, `base_status` ve
+ * YALNIZ `base_status == "stale"` iken `stale_files`. Kaynak/diff/patch
+ * içeriği, worker çıktısı, geçmiş, görev, kurallar, repo kökü, workspace
+ * yolu, kurtarma durumu — hiçbiri alan DEĞİLDİR.
+ */
+export function serializeCloseResult(result: SplashCloseResult): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    patch_path: result.patchPath,
+    files_changed: [...result.filesChanged],
+    diff_stats: {
+      files: result.diffStats.files,
+      insertions: result.diffStats.insertions,
+      deletions: result.diffStats.deletions,
+    },
+    summary: result.summary,
+    base_status: result.baseStatus,
+  };
+  if (result.baseStatus === "stale") {
+    // Stale export ENGELLENMEDİ; orkestratör otomatik UYGULAMAMALI.
+    wire.stale_files = [...result.staleFiles];
+  }
+  return wire;
+}
+
+/**
+ * `splash_diff` sonucu → MCP text payload'u (Step 10 spec 9).
+ *
+ * - `diff` modu: ham unified diff metni — sarmalayıcı metadata YOK (boş
+ *   diff → `""`). Oluşturulan kodu döndüren TEK MCP aracıdır (kasıtlı,
+ *   açık istekle inceleme).
+ * - `stat` modu: yalnız `{"diff_stats":{"files","insertions","deletions"}}`
+ *   — kaynak/diff içeriği YOK.
+ */
+export function serializeDiffResult(result: SplashDiffResult): string {
+  if (result.mode === "stat") {
+    return JSON.stringify({
+      diff_stats: {
+        files: result.diffStats.files,
+        insertions: result.diffStats.insertions,
+        deletions: result.diffStats.deletions,
+      },
+    });
+  }
+  return result.diff;
 }

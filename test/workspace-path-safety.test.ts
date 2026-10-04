@@ -10,7 +10,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -293,6 +293,35 @@ test("hasSymlinkInPath: missing ancestors stop the walk (no false positive)", as
     assert.equal(await hasSymlinkInPath(path.join(root, "nope", "deeper", "f.txt"), root), false);
   } finally {
     await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("hasSymlinkInPath failClosed: an ancestor became a FILE (lstat ENOTDIR) → false, no throw (the rest cannot exist)", async () => {
+  const tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "splash-pathsaf-")));
+  try {
+    const root = path.join(tmp, "ws");
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "src"), "now a file\n"); // `src` artık DOSYA
+    const target = path.join(root, "src", "x", "a.ts");
+    // Ölçüm (varsayım değil): `src/x` atalının lstat'ı gerçek fs'te ENOTDIR.
+    await assert.rejects(lstat(path.join(root, "src", "x")), (e: unknown) => (e as NodeJS.ErrnoException).code === "ENOTDIR");
+
+    assert.equal(await hasSymlinkInPath(target, root, { includeTarget: false, failClosed: true }), false);
+    assert.equal(await hasSymlinkInPath(target, root, { includeTarget: true, failClosed: true }), false);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("hasSymlinkInPath failClosed: any other ancestor lstat errno (EACCES/EIO/ELOOP/EPERM) is still thrown", async () => {
+  for (const code of ["EACCES", "EIO", "ELOOP", "EPERM"]) {
+    const lstatFn = async (): Promise<never> => {
+      throw Object.assign(new Error(`${code} (fault-injected)`), { code });
+    };
+    await assert.rejects(
+      hasSymlinkInPath("/repo/src/x/a.ts", "/repo", { includeTarget: false, lstatFn, failClosed: true }),
+      (e: unknown) => (e as NodeJS.ErrnoException).code === code,
+    );
   }
 });
 

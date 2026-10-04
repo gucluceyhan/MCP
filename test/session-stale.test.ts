@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
 import { decideStale, type StaleDecisionInput } from "../dist/session/stale.js";
+import { SYMLINKED_ANCESTOR_FINGERPRINT } from "../dist/context/ContextAssembler.js";
 import type { PathFingerprint } from "../dist/workspace/Workspace.js";
 import type { LiveBaseState } from "../dist/context/types.js";
 
@@ -232,6 +233,45 @@ test("çoklu stale: girdi sırası ne olursa olsun çıktı leksikografik + dedu
     liveCreated: new Map([[abs(CREATED), false]]),
   });
   assert.deepEqual(stale, [A, B, C]); // sıralı, mükerrer C tek
+});
+
+// ── Canlı sürüklenme ölçümleri (`captureLiveBase`: ENOTDIR yokluğu + atal-symlink sentinel'i) ──
+//
+// `captureLiveBase` bu durumları HATA değil ÖLÇÜM olarak döner (refine ve
+// close aynı algoritma; stale close'u engellemez — DESIGN §7.5). `decideStale`
+// DEĞİŞMEDEN onları stale'e çevirmeli.
+
+test("atal-symlink sentinel'i HİÇBİR taban parmak iziyle eşit değil → her taban şeklinde stale", () => {
+  const bases: PathFingerprint[] = [
+    fileFingerprint("100644", "const value = 1;"),
+    fileFingerprint("100755", "const value = 1;"),
+    symlinkFingerprint("target.ts"),
+    DIRECTORY,
+    ABSENT,
+    { exists: true, type: "other", mode: "160000" }, // gitlink
+  ];
+  for (const base of bases) {
+    const stale = decide({
+      editablePaths: [A],
+      baseFingerprints: new Map([[A, base]]),
+      liveBase: new Map([[abs(A), SYMLINKED_ANCESTOR_FINGERPRINT]]),
+      createdPaths: [],
+    });
+    assert.deepEqual(stale, [A], `taban ${JSON.stringify(base)} sentinel'e karşı stale olmalı`);
+  }
+});
+
+test("ENOTDIR yokluğu (taban: önekteki bileşen DOSYA oldu → exists:false) + created çakışması (true) → ikisi de stale", () => {
+  const stale = decide({
+    editablePaths: [A],
+    baseFingerprints: new Map([[A, fileFingerprint("100644", "const value = 1;")]]),
+    liveBase: new Map([[abs(A), ABSENT]]), // `src` dosya oldu → ENOTDIR → kesin yokluk
+    createdPaths: [CREATED],
+    // created çakışması: `src` symlink oldu (varlık doğrulanamaz) YA DA `src`
+    // DOSYA oldu (ENOTDIR — `create` uygulanamaz) → `captureLiveBase` true verir.
+    liveCreated: new Map([[abs(CREATED), true]]),
+  });
+  assert.deepEqual(stale, [A, CREATED]);
 });
 
 // ── Saf fonksiyon disiplinleri ────────────────────────────────────────────────

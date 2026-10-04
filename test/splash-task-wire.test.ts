@@ -10,14 +10,20 @@
  * - 108: koşullu alanlar yalnız anlamlı durumda; `null` ile boşta YOK — omit.
  * - 58/59: bilinen tip'li hataların güvenli sözlüğü korunur; bilinmeyen
  *   istisna → `internal_error` / sabit mesaj; `cause`/stack/payload ASLA yok.
+ * - Step 10: `serializeCloseResult` yalnız 5 (+stale'de 6) alanı açık eşler —
+ *   içerik YOK; `serializeDiffResult` diff → ham metin, stat → yalnız
+ *   `{"diff_stats":{...}}`.
  */
 import { ContextAssemblyError } from "../dist/context/types.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  serializeCloseResult,
   serializeCompactResult,
+  serializeDiffResult,
   serializeToolError,
 } from "../dist/task/wire.js";
+import type { SplashCloseResult, SplashDiffResult } from "../dist/session/SessionManager.js";
 import { BackendError } from "../dist/backend/errors.js";
 import { CoordinatorError } from "../dist/backend/InferenceCoordinator.js";
 import { WorkspaceError } from "../dist/workspace/Workspace.js";
@@ -369,4 +375,84 @@ test("Step 8: every rules_source vocabulary value round-trips verbatim; content 
       assert.ok(!keys.has(forbidden), `content-bearing key "${forbidden}" leaked into the wire`);
     }
   }
+});
+
+// ── Step 10: splash_close / splash_diff wire ────────────────────────────────
+
+function freshClose(): SplashCloseResult {
+  return {
+    patchPath: "/home/u/.splash/patches/abc123/sess-1.patch",
+    filesChanged: ["src/a.ts", "src/b.ts"],
+    diffStats: { files: 2, insertions: 20, deletions: 4 },
+    summary: "Implementation summary",
+    baseStatus: "fresh",
+  };
+}
+
+test("Step 10: serializeCloseResult fresh → EXACT key set (no stale_files); snake_case; values verbatim", () => {
+  const wire = serializeCloseResult(freshClose());
+  assert.deepEqual(Object.keys(wire).sort(), ["base_status", "diff_stats", "files_changed", "patch_path", "summary"]);
+  assert.deepEqual(wire, {
+    patch_path: "/home/u/.splash/patches/abc123/sess-1.patch",
+    files_changed: ["src/a.ts", "src/b.ts"],
+    diff_stats: { files: 2, insertions: 20, deletions: 4 },
+    summary: "Implementation summary",
+    base_status: "fresh",
+  });
+  assert.ok(!("stale_files" in wire), "fresh close carries no stale_files");
+});
+
+test("Step 10: serializeCloseResult stale → EXACT key set incl. stale_files", () => {
+  const stale: SplashCloseResult = { ...freshClose(), baseStatus: "stale", staleFiles: ["src/a.ts"] };
+  const wire = serializeCloseResult(stale);
+  assert.deepEqual(Object.keys(wire).sort(), [
+    "base_status",
+    "diff_stats",
+    "files_changed",
+    "patch_path",
+    "stale_files",
+    "summary",
+  ]);
+  assert.equal(wire.base_status, "stale");
+  assert.deepEqual(wire.stale_files, ["src/a.ts"]);
+});
+
+test("Step 10: serializeCloseResult maps field by field — smuggled content/paths never reach the wire", () => {
+  const smuggled = {
+    ...freshClose(),
+    diff: "+SOURCE_LEAK_MARKER",
+    patch: "PATCH_LEAK_MARKER",
+    workspaceDir: "/private/ws",
+    repoRoot: "/private/repo",
+    task: "TASK_LEAK_MARKER",
+  } as unknown as SplashCloseResult;
+  const wire = serializeCloseResult(smuggled);
+  assert.deepEqual(Object.keys(wire).sort(), ["base_status", "diff_stats", "files_changed", "patch_path", "summary"]);
+  assert.deepEqual(Object.keys(wire.diff_stats as object).sort(), ["deletions", "files", "insertions"]);
+  const text = JSON.stringify(wire);
+  for (const leak of ["SOURCE_LEAK_MARKER", "PATCH_LEAK_MARKER", "/private/ws", "/private/repo", "TASK_LEAK_MARKER"]) {
+    assert.ok(!text.includes(leak), `leaked: ${leak}`);
+  }
+  const keys = collectKeys(wire);
+  for (const camel of ["patchPath", "filesChanged", "diffStats", "baseStatus", "staleFiles"]) {
+    assert.ok(!keys.has(camel), `camelCase "${camel}" leaked`);
+  }
+});
+
+test("Step 10: serializeDiffResult diff → raw unified diff text verbatim (no wrapper); empty diff → \"\"", () => {
+  const raw = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-const value = 1;\n+const value = 2;\n";
+  const diffResult: SplashDiffResult = { mode: "diff", diff: raw };
+  assert.equal(serializeDiffResult(diffResult), raw);
+  assert.equal(serializeDiffResult({ mode: "diff", diff: "" }), "");
+});
+
+test("Step 10: serializeDiffResult stat → ONLY {\"diff_stats\":{...}} (no source, no extra fields)", () => {
+  const smuggled = {
+    mode: "stat",
+    diffStats: { files: 2, insertions: 34, deletions: 12, extra: "SOURCE_LEAK_MARKER" },
+    diff: "+SOURCE_LEAK_MARKER",
+  } as unknown as SplashDiffResult;
+  const text = serializeDiffResult(smuggled);
+  assert.equal(text, '{"diff_stats":{"files":2,"insertions":34,"deletions":12}}');
+  assert.ok(!text.includes("SOURCE_LEAK_MARKER"));
 });

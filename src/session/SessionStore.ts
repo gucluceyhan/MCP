@@ -16,6 +16,8 @@
  *   kural provenance / geçersiz worker sonucu → `session_corrupt`. "Best
  *   effort" yeniden yapı YOK — fail-closed.
  * - **İzin** (spec 7): oturum dizinleri 0700, `session.json` 0600.
+ * - **Dar silme** (Step 10): `delete` yalnız `unlink` + tek-dizin `rmdir`;
+ *   commit noktası = `session.json` unlink'i (rekürsif silme YOK).
  * - **No-log** (spec 17): kalıcı içerik ASLA loglanmaz; hatalar sabit güvenli
  *   mesaj + (yalnız geliştirici kanalı) kısa neden etiketi taşır.
  * - **No-Git** (spec 5/113): SessionStore Git BİLMEZ — repository kimliği
@@ -26,7 +28,7 @@
  * (bu dosyadaki gerçek adapter), testler deterministik sahte.
  */
 
-import { constants, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { constants, lstat, mkdir, open, rename, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { computeRepoId } from "../workspace/git.js";
 import { isSafeSessionId, isTrustedTreePath, normalizeRepoPath } from "../workspace/pathSafety.js";
@@ -72,12 +74,29 @@ const FILE_MODE = 0o600;
 const SESSION_FILE = "session.json";
 /** Deterministik geçici yazım adı (spec 15). */
 const SESSION_TMP = "session.json.tmp";
+/**
+ * Oturum dizini altındaki worktree alt dizini — SessionManager'ın yerleşimi
+ * (`<sessionDir>/workspace`). `delete` yalnız BOŞSA `rmdir` eder (Step 10).
+ */
+const WORKSPACE_SUBDIR = "workspace";
 
 /** `err` bir `NodeJS.ErrnoException` ve `code` verilen errno'ya eşit mi? */
 function errnoIs(err: unknown, code: string): boolean {
   return (
     typeof err === "object" && err !== null && "code" in err && (err as NodeJS.ErrnoException).code === code
   );
+}
+
+/**
+ * Kısa `cause` etiketi (Step 10 spec 18): yalnız adım + errno kodu — yol,
+ * mesaj, içerik ASLA taşınmaz (errno mesajı mutlak özel yolu içerir).
+ */
+function deleteCause(step: string, err: unknown): string {
+  const code =
+    typeof err === "object" && err !== null && "code" in err && typeof (err as NodeJS.ErrnoException).code === "string"
+      ? (err as NodeJS.ErrnoException).code
+      : "unknown";
+  return `session_delete:${step}:${code}`;
 }
 
 async function lstatOptional(fs: SessionStoreFs, target: string): Promise<SessionStat | null> {
@@ -186,6 +205,10 @@ const realFs: SessionStoreFs = {
         throw err;
       }
     }
+  },
+  async removeDir(dir) {
+    // Tek dizin `rmdir` — rekürsif DEĞİL; symlink'i izlemez (ENOTDIR).
+    await rmdir(dir);
   },
   async openDir(dir) {
     const handle = await open(dir, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -627,9 +650,11 @@ function validateRound(value: unknown, sessionId: string): PersistedRound {
   if (!isPositiveInteger(value["round"])) {
     corruptFail("round:round");
   }
-  if (value["round"] === 1 && hasFeedback) {
-    corruptFail("round:first-feedback");
-  }
+  // 1. turda `feedback` İSTEĞE BAĞLIDIR: `splash_task` ile üretilen 1. tur
+  // onu taşımaz, ama ilk çağrısı `needs_split`/`inference_busy` dönen (tur 0
+  // kalan) oturumun 1. turunu `splash_refine` üretir ve kayıt o turun
+  // geri bildirimini MEŞRU olarak taşır. Bunu reddetmek, restart sonrası
+  // oturumu kalıcı `session_corrupt` yapardı. `round > 1` zorunluluğu aynen.
   if (value["round"] > 1 && !hasFeedback) {
     corruptFail("round:refine-feedback-missing");
   }
@@ -700,6 +725,16 @@ function validateTrustedTreePath(value: unknown, field: string): string {
   return value;
 }
 
+/**
+ * Canlı-ölçüm sentinel'inin modu (`ContextAssembler.SYMLINKED_ANCESTOR_FINGERPRINT`
+ * — atal symlink sürüklenmesi). YALNIZ canlı ölçümde üretilir; kalıcı bir
+ * TABAN parmak izinde ASLA geçerli değildir: kabul edilseydi sentinel'e eşit
+ * bir "taban" (tamper) atal-symlink sürüklenmesini `fresh` gösterirdi.
+ * (Dikiş: `test/session-store.test.ts` değeri üretim sabitinden kurar — iki
+ * taraf ayrışırsa test kırmızıya düşer.)
+ */
+const LIVE_SENTINEL_MODE = "symlinked-ancestor";
+
 function validatePathFingerprint(value: unknown, field: string): PathFingerprint {
   if (!isPlainObject(value)) {
     corruptFail(`${field}:object`);
@@ -724,6 +759,9 @@ function validatePathFingerprint(value: unknown, field: string): PathFingerprint
   const mode = value["mode"];
   if (typeof mode !== "string" || mode === "") {
     corruptFail(`${field}:mode`);
+  }
+  if (mode === LIVE_SENTINEL_MODE) {
+    corruptFail(`${field}:mode-live-sentinel`);
   }
   if (type === "file" || type === "symlink") {
     if (!isSha256Hex(value["contentSha256"])) {
@@ -1187,6 +1225,114 @@ export class SessionStore {
     } catch (err) {
       await removeStaleTmpNoFollow(fs, tmp).catch(() => undefined);
       throw sessionError("session_persistence_failed", err);
+    }
+  }
+
+  /**
+   * Bir oturumun YETKİLİ kalıcı durumunu dar kapsamla siler (Step 10 spec
+   * 18/19/40). Yol YALNIZ güvenilen `outputRoot` + kimlikten türetilir;
+   * kalıcı hiçbir yol (ör. `workspaceRecovery.workspaceDir`) kullanılmaz.
+   * İşlemler yalnız `unlink` + TEK-dizin `rmdir`'dir — REKÜRSİF silme YOK,
+   * `rm -rf` YOK; `<outputRoot>/patches/...` bu fonksiyonun hiç dokunmadığı
+   * yerdedir (export edilen patch KALIR).
+   *
+   * Sıra:
+   * 1. Güvensiz kimlik → `session_not_found` (load/create ile tutarlı; fs YOK).
+   * 2. `sessions` / `sessions/<id>` lstat: yok → idempotent dönüş; symlink ya
+   *    da dizin-dışı → `session_operation_failed` (hedefe DOKUNULMAZ).
+   * 3. `session.json` lstat: yok → zaten silinmiş; symlink/düzenli-dışı →
+   *    red (hiçbir şey silinmez); aksi → `unlink`. Hata → durum AYNEN kalır.
+   *    **= COMMIT NOKTASI**: yetkili durumun mantıksal silinmesi budur.
+   * 4. Commit SONRASI best-effort (hiçbir hata dışarı atılmaz): yalnız DÜZENLİ
+   *    `session.json.tmp` unlink; `workspace` ve oturum dizini tek-dizin
+   *    `rmdir` (beklenmeyen girdi → ENOTEMPTY → zararsız dizin KALIR;
+   *    geniş silme yerine bu tercih edilir). `sessions` atası SİLİNMEZ —
+   *    paylaşılan atadır; başka oturumun eşzamanlı `create`'i
+   *    `ensureDirectory(sessions)` ile `mkdir(dir)` arasında olabilir.
+   *
+   * Threat Model A (Step 9, değişmedi): statik symlink savunması vardır
+   * (symlink'li `sessions`, oturum dizini ya da `session.json` reddedilir);
+   * aynı-kullanıcının AKTİF ata-dizin yarışı (lstat ile unlink arasında
+   * yol bileşeninin değiştirilmesi) kabul edilmiş LOW risktir —
+   * `openat`/`openat2` ya da native binding KULLANILMAZ.
+   */
+  async delete(sessionId: string): Promise<void> {
+    if (!isSafeSessionId(sessionId)) {
+      throw sessionError("session_not_found");
+    }
+    const fs = this.#fs;
+    const dir = this.#sessionDirFor(sessionId);
+
+    let sessionsStat: SessionStat | null;
+    try {
+      sessionsStat = await lstatOptional(fs, this.#sessionsDir);
+    } catch (err) {
+      throw sessionError("session_operation_failed", deleteCause("lstat-sessions", err));
+    }
+    if (sessionsStat === null) {
+      return; // silinecek bir şey yok — idempotent
+    }
+    if (sessionsStat.isSymbolicLink() || !sessionsStat.isDirectory()) {
+      throw sessionError("session_operation_failed", "unsafe sessions directory");
+    }
+
+    let dirStat: SessionStat | null;
+    try {
+      dirStat = await lstatOptional(fs, dir);
+    } catch (err) {
+      throw sessionError("session_operation_failed", deleteCause("lstat-session-dir", err));
+    }
+    if (dirStat === null) {
+      return; // idempotent
+    }
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      throw sessionError("session_operation_failed", "unsafe session directory");
+    }
+
+    const file = path.join(dir, SESSION_FILE);
+    let fileStat: SessionStat | null;
+    try {
+      fileStat = await lstatOptional(fs, file);
+    } catch (err) {
+      throw sessionError("session_operation_failed", deleteCause("lstat-session-file", err));
+    }
+    if (fileStat !== null) {
+      if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+        throw sessionError("session_operation_failed", "unsafe session file");
+      }
+      try {
+        await fs.removeFile(file); // COMMIT NOKTASI
+      } catch (err) {
+        throw sessionError("session_operation_failed", deleteCause("unlink-session-file", err));
+      }
+    }
+
+    await this.#cleanupAfterDelete(dir);
+  }
+
+  /**
+   * `delete` commit noktası SONRASI dar + best-effort temizlik (spec 19):
+   * yetkili durum zaten silindi — kozmetik bir `rmdir` hatası kapatmayı
+   * başarısız saydırmaz. Hiçbir hata dışarı atılmaz; rekürsif işlem YOK.
+   */
+  async #cleanupAfterDelete(dir: string): Promise<void> {
+    const fs = this.#fs;
+    try {
+      const tmp = path.join(dir, SESSION_TMP);
+      const tmpStat = await fs.lstat(tmp);
+      // Yalnız DÜZENLİ dosya; symlink/dizin/diğer → olduğu gibi bırakılır.
+      if (!tmpStat.isSymbolicLink() && tmpStat.isFile()) {
+        await fs.removeFile(tmp);
+      }
+    } catch {
+      // Yok (ENOENT) ya da silinemedi — yetkili değil; yutulur.
+    }
+    for (const target of [path.join(dir, WORKSPACE_SUBDIR), dir]) {
+      try {
+        await fs.removeDir(target);
+      } catch {
+        // ENOENT / ENOTEMPTY / ENOTDIR / diğer — zararsız dizin kalır; yutulur.
+      }
     }
   }
 

@@ -694,6 +694,130 @@ test("filtered diff narrows to requested files; unsafe filter rejected (spec 92)
   }
 });
 
+// ── 9b) Step 10: filtreli `stat(options?)` (Step 10 spec 8) ──────────────────
+//
+// Geriye uyumlu genişletme: argümansız `stat()` eski filtresiz sonuçla
+// birebir; `files` → `diff()` ile AYNI güvenli literal yol filtresi. Sayılar
+// git numstat'tan gelir — aşağıdaki diff-türevli şekil YALNIZ test tarafında
+// tutarlılık denetimi içindir (üretim diff metnini parse ETMEZ).
+
+/** Test-tarafı tutarlılık: unified diff'teki dosya başlığı + değişen satır sayısı. */
+function diffShape(diff: string): { files: number; insertions: number; deletions: number } {
+  const lines = changedLines(diff);
+  return {
+    files: diff.split("\n").filter((line) => line.startsWith("diff --git ")).length,
+    insertions: lines.filter((line) => line.startsWith("+")).length,
+    deletions: lines.filter((line) => line.startsWith("-")).length,
+  };
+}
+
+/** Dört türlü değişiklik: iki modify + worker-create (intent-to-add) + delete. */
+const STAT_FILTER_EDITS: WorkerEdit[] = [
+  { kind: "modify", path: "src/a.ts", operations: [{ search: "beta\n", replace: "beta-2\n" }] }, // +1 -1
+  { kind: "modify", path: "src/both.txt", operations: [{ search: "v2 working", replace: "B1\nB2" }] }, // +2 -1
+  { kind: "create", path: "notes/new.txt", content: "n1\nn2\nn3\n" }, // +3
+  { kind: "delete", path: "src/staged.txt" }, // -1 (base: "v2\n")
+];
+
+test("stat(): no-arg call is byte-identical to the legacy unfiltered stats; stat({files: []}) is unfiltered (Step 10 spec 8)", async () => {
+  const fixture = await buildFixture("stat-compat");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    const applied = await ws.applyPatchSet(workerResult(STAT_FILTER_EDITS));
+    assert.equal(applied.validation.editsApplied, 4);
+    const legacy = { files: 4, insertions: 6, deletions: 3 };
+    // `applyPatchSet` içindeki filtresiz `statInternal()` = eski davranış.
+    assert.deepEqual(applied.diffStats, legacy);
+    assert.deepEqual(await ws.stat(), legacy);
+    assert.deepEqual(await ws.stat(undefined), legacy);
+    assert.deepEqual(await ws.stat({}), legacy);
+    // Boş dizi = filtresiz (`diff()` semantiğiyle aynı).
+    assert.deepEqual(await ws.stat({ files: [] }), legacy);
+    assert.equal(await ws.diff({ files: [] }), await ws.diff());
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("stat({files}): counts only the requested paths — modify, worker-created (intent-to-add) and deleted files; consistent with the filtered diff (Step 10 spec 8)", async () => {
+  const fixture = await buildFixture("stat-filter");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    await ws.applyPatchSet(workerResult(STAT_FILTER_EDITS));
+    const cases: Array<{ files: string[]; expected: { files: number; insertions: number; deletions: number } }> = [
+      { files: ["src/a.ts"], expected: { files: 1, insertions: 1, deletions: 1 } },
+      { files: ["src/both.txt"], expected: { files: 1, insertions: 2, deletions: 1 } },
+      { files: ["notes/new.txt"], expected: { files: 1, insertions: 3, deletions: 0 } }, // worker-created
+      { files: ["src/staged.txt"], expected: { files: 1, insertions: 0, deletions: 1 } }, // silinen
+      { files: ["src/a.ts", "notes/new.txt"], expected: { files: 2, insertions: 4, deletions: 1 } },
+      { files: ["./src/a.ts"], expected: { files: 1, insertions: 1, deletions: 1 } }, // kanonikleştirilir
+      { files: ["tracked-clean.txt"], expected: { files: 0, insertions: 0, deletions: 0 } }, // güvenli, değişmemiş
+    ];
+    for (const { files, expected } of cases) {
+      const stats = await ws.stat({ files });
+      assert.deepEqual(stats, expected, `stat for ${files.join(",")}`);
+      // Aynı filtreli diff ile tutarlı (dosya sayısı + değişen satırlar).
+      assert.deepEqual(diffShape(await ws.diff({ files })), expected, `diff shape for ${files.join(",")}`);
+    }
+    // Filtre diğer dosyaları SAYMAZ: tüm workspace daha geniştir.
+    assert.deepEqual(await ws.stat(), { files: 4, insertions: 6, deletions: 3 });
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("stat({files}): glob/pathspec-like input is literal and never broadens — 0 files, same as diff (Step 10 spec 8, audit CRITICAL-1)", async () => {
+  const fixture = await buildFixture("stat-literal");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    await ws.applyPatchSet(workerResult(STAT_FILTER_EDITS));
+    for (const magic of ["src/*.ts", "*", "src/?.ts", ":(glob)src/**", ":(exclude)src/a.ts", ":!src/a.ts", "src/[ab].ts"]) {
+      assert.deepEqual(
+        await ws.stat({ files: [magic] }),
+        { files: 0, insertions: 0, deletions: 0 },
+        `literal filter must not expand: ${magic}`,
+      );
+      assert.equal(await ws.diff({ files: [magic] }), "", `diff literal filter must not expand: ${magic}`);
+    }
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("stat({files}): unsafe path filters fail closed with unsafe_path, exactly like diff (Step 10 spec 8)", async () => {
+  const fixture = await buildFixture("stat-unsafe");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    await ws.applyPatchSet(workerResult(STAT_FILTER_EDITS));
+    const unsafe = ["../x", "/abs/x", ".git/config", "src/.GIT/config", "a\\b", "a\0b", "src/../x", "", "."];
+    for (const bad of unsafe) {
+      await expectWorkspaceError("unsafe_path", () => ws.stat({ files: [bad] }));
+      await expectWorkspaceError("unsafe_path", () => ws.diff({ files: [bad] }));
+    }
+    // Güvenli bir yolla karışık olsa bile tamamı reddedilir (kısmi sonuç YOK).
+    await expectWorkspaceError("unsafe_path", () => ws.stat({ files: ["src/a.ts", "../x"] }));
+    // Red workspace'i bozmaz.
+    assert.deepEqual(await ws.stat(), { files: 4, insertions: 6, deletions: 3 });
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("stat({files}): a destroyed workspace reds with workspace_destroyed (Step 10 spec 8)", async () => {
+  const fixture = await buildFixture("stat-destroyed");
+  const ws = await createGitWorktreeWorkspace(createInput(fixture));
+  try {
+    await ws.applyPatchSet(workerResult(STAT_FILTER_EDITS));
+    await ws.destroy();
+    await expectWorkspaceError("workspace_destroyed", () => ws.stat({ files: ["src/a.ts"] }));
+    await expectWorkspaceError("workspace_destroyed", () => ws.stat({ files: [] }));
+    // İmha denetimi yol denetiminden ÖNCE (mevcut sıra: assertUsable ilk).
+    await expectWorkspaceError("workspace_destroyed", () => ws.stat({ files: ["../x"] }));
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
 // ── 10) export + git apply uyumu + binary (spec 93/94/95) ───────────────────
 
 test("export: path shape, repo-outside, worker-contribution-only, git-apply compatible (spec 93/94/95)", async () => {
@@ -777,6 +901,290 @@ test("export failure preserves the workspace (spec 96/72)", async () => {
   } finally {
     await ws.destroy();
   }
+});
+
+// ── 11b) kullanıcının porcelain git config'i çıktıyı BOZAMAZ (Step 10 M1) ──
+// Ölçüldü (Apple Git 2.50.1): `color.ui=always` ANSI kaçışı, `diff.noprefix`/
+// `mnemonicPrefix` öneksiz başlık üretir → export patch'i uygulanamaz; base
+// yakalama delta'sı uygulanamaz; `apply.whitespace=fix` base'i main'den
+// saptırır, `=error` yakalamayı düşürür.
+
+/** Sondaki boşluklu kirli main: unstaged değişiklik + staged YENİ dosya. */
+async function buildPorcelainRepo(name: string): Promise<Fixture> {
+  const out = path.join(tmp, name);
+  const repo = path.join(out, "repo");
+  await mkdir(path.join(repo, "src"), { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "Fixture User"]);
+  await gitOk(repo, ["config", "user.email", "fixture@local.invalid"]);
+  await gitOk(repo, ["config", "core.autocrlf", "false"]);
+  await writeFile(path.join(repo, "src", "a.ts"), "alpha\nbeta\n");
+  await writeFile(path.join(repo, "src", "b.ts"), "one\n");
+  await gitOk(repo, ["add", "-A"]);
+  await gitOk(repo, ["commit", "-m", "porcelain base"]);
+  await writeFile(path.join(repo, "src", "a.ts"), "alpha   \nbeta\n"); // unstaged + sondaki boşluk
+  await writeFile(path.join(repo, "src", "staged-new.ts"), "fresh  \n"); // staged YENİ + sondaki boşluk
+  await gitOk(repo, ["add", "src/staged-new.ts"]);
+  return { repo, out };
+}
+
+/** Geçici olarak GLOBAL git config'ini `content`'e çevirir; `finally`'de boşa döner. */
+async function withGlobalGitConfig<T>(out: string, content: string, fn: () => Promise<T>): Promise<T> {
+  const file = path.join(out, `global-${createHash("sha256").update(content).digest("hex").slice(0, 8)}.gitconfig`);
+  await writeFile(file, content);
+  process.env.GIT_CONFIG_GLOBAL = file;
+  try {
+    return await fn();
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = emptyConfigFile;
+  }
+}
+
+const PORCELAIN_CONFIG =
+  "[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n[color]\n\tui = always\n\tdiff = always\n[apply]\n\twhitespace = fix\n";
+
+/** Eski (M1 öncesi) export/hash argümanları — geriye uyum kanıtının referansı. */
+const LEGACY_FULL_DIFF_ARGS = ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames"];
+
+test("porcelain git config (noprefix/mnemonicPrefix/color.ui=always/apply.whitespace=fix): exact base, clean a/ b/ export + diff, git-apply compatible, config-independent hash (Step 10 M1)", async () => {
+  const fixture = await buildPorcelainRepo("porcelain-config");
+  const sessionId = "s-porcelain";
+  const workspaceDir = path.join(fixture.out, "ws", sessionId);
+  const mainA = await readFile(path.join(fixture.repo, "src", "a.ts"));
+  const mainStagedNew = await readFile(path.join(fixture.repo, "src", "staged-new.ts"));
+
+  const ws = await withGlobalGitConfig(fixture.out, PORCELAIN_CONFIG, async () => {
+    const created = await createGitWorktreeWorkspace({
+      repoRoot: fixture.repo,
+      workspaceDir,
+      sessionId,
+      editablePaths: ["src/a.ts", "src/b.ts", "src/staged-new.ts"],
+    });
+    // Base = main'in BİREBİR baytları (apply.whitespace=fix sondaki boşluğu SİLEMEZ).
+    const baseA = created.readBaseEntry("src/a.ts");
+    const baseNew = created.readBaseEntry("src/staged-new.ts");
+    assert.ok(baseA.exists && baseA.type === "file" && baseA.content.equals(mainA), "base src/a.ts === main bytes");
+    assert.ok(baseNew.exists && baseNew.type === "file" && baseNew.content.equals(mainStagedNew), "staged-new === main");
+    return created;
+  });
+  try {
+    const { patch, diff, hostileHash } = await withGlobalGitConfig(fixture.out, PORCELAIN_CONFIG, async () => {
+      await ws.applyPatchSet(
+        workerResult([
+          { kind: "modify", path: "src/a.ts", operations: [{ search: "beta", replace: "beta-W" }] },
+          { kind: "create", path: "src/new.ts", content: "made\n" },
+        ]),
+      );
+      const patchPath = await ws.exportPatch(fixture.out);
+      return { patch: await readFile(patchPath), diff: await ws.diff(), hostileHash: await ws.recoveryStateHash() };
+    });
+
+    // Export: ESC YOK; standart a/ b/ başlıklar.
+    assert.ok(!patch.includes(0x1b), "exported patch must not contain ANSI escapes");
+    const patchText = patch.toString("utf8");
+    assert.ok(patchText.includes("diff --git a/src/a.ts b/src/a.ts"), "a/ b/ prefixed header (modify)");
+    assert.ok(patchText.includes("diff --git a/src/new.ts b/src/new.ts"), "a/ b/ prefixed header (create)");
+    assert.ok(!patchText.includes("diff --git src/") && !patchText.includes(" i/") && !patchText.includes(" w/"));
+    // splash_diff çıktısı da temiz.
+    assert.ok(!diff.includes("\u001b"), "diff() must not contain ANSI escapes");
+    assert.ok(diff.includes("diff --git a/src/a.ts b/src/a.ts"));
+
+    // Varsayılan config altında: aynı state'in hash'i birebir; eski argümanların
+    // ürettiği baytlar export ile BİREBİR (mevcut kalıcı hash'ler geçerli kalır).
+    assert.equal(await ws.recoveryStateHash(), hostileHash, "state hash is independent of porcelain config");
+    const legacy = await runGit([...LEGACY_FULL_DIFF_ARGS, ws.baseCommit], { cwd: workspaceDir, config: ["core.hooksPath=/dev/null"] });
+    assert.ok(legacy.stdout.equals(patch), "default-config legacy output === new export bytes");
+    assert.equal(sha256(legacy.stdout), hostileHash, "legacy hash formula === new hash (backward compatible)");
+
+    // YALNIZ test harness'ı: varsayılan config'li tek kullanımlık checkout'ta uygulanır.
+    const second = path.join(fixture.out, "second-checkout");
+    await gitOk(fixture.repo, ["worktree", "add", "--detach", second, ws.baseCommit]);
+    try {
+      const patchPath = path.join(fixture.out, "porcelain.patch");
+      await writeFile(patchPath, patch);
+      await runGit(["apply", "--check", patchPath], { cwd: second, config: ["core.hooksPath=/dev/null"] });
+      await runGit(["apply", patchPath], { cwd: second, config: ["core.hooksPath=/dev/null"] });
+      await treesEqual(second, workspaceDir); // sonuç = worker sonucu, bayt-bayt
+    } finally {
+      await gitOk(fixture.repo, ["worktree", "remove", "--force", second]);
+    }
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("apply.whitespace=error in the user config never breaks base capture; base bytes stay exact (Step 10 M1)", async () => {
+  const fixture = await buildPorcelainRepo("porcelain-ws-error");
+  const mainA = await readFile(path.join(fixture.repo, "src", "a.ts"));
+  await withGlobalGitConfig(fixture.out, "[apply]\n\twhitespace = error\n", async () => {
+    const ws = await createGitWorktreeWorkspace({
+      repoRoot: fixture.repo,
+      workspaceDir: path.join(fixture.out, "ws", "s-ws-error"),
+      sessionId: "s-ws-error",
+      editablePaths: ["src/a.ts", "src/staged-new.ts"],
+    });
+    try {
+      const baseA = ws.readBaseEntry("src/a.ts");
+      assert.ok(baseA.exists && baseA.type === "file" && baseA.content.equals(mainA), "base src/a.ts === main bytes");
+      assert.equal(await readFile(path.join(ws.workspaceDir, "src", "staged-new.ts"), "utf8"), "fresh  \n");
+    } finally {
+      await ws.destroy();
+    }
+  });
+});
+
+// ── 11c) state hash kullanıcının diff BİÇİM config'inden bağımsız (Step 10 H) ──
+// Ölçüldü (Apple Git 2.50.1): aşağıdaki her ayar eski hash diff'inin baytlarını
+// değiştirir (`minimal` ve `relative` hariç) → görev ile restart arasında config
+// değişirse kurtarma uyuşmazlık görür ve oturum kapatılamazdı.
+
+/** Her biçim ayarını tetikleyen fikstür: tam-içerik yeniden yazımları. */
+const FORMAT_FILES: ReadonlyArray<readonly [string, string, string]> = [
+  // diff.context: tek değişiklik, geniş bağlam
+  ["ctx.txt", Array.from({ length: 30 }, (_, i) => `${i + 1}\n`).join(""),
+    Array.from({ length: 30 }, (_, i) => (i + 1 === 15 ? "fifteen\n" : `${i + 1}\n`)).join("")],
+  // diff.interHunkContext: aralarında 8 satır olan iki değişiklik (-U3'te iki hunk)
+  ["gap.txt", Array.from({ length: 30 }, (_, i) => `${i + 1}\n`).join(""),
+    Array.from({ length: 30 }, (_, i) => (i + 1 === 5 ? "five\n" : i + 1 === 14 ? "fourteen\n" : `${i + 1}\n`)).join("")],
+  // diff.algorithm: patience/histogram'ın myers'tan ayrıştığı klasik örnek
+  ["algo.c",
+    "#include <stdio.h>\n\n// Frobs foo heartily\nint frobnitz(int foo)\n{\n    int i;\n    for(i = 0; i < 10; i++)\n    {\n" +
+      '        printf("Your answer is: ");\n        printf("%d\\n", foo);\n    }\n}\n\nint fact(int n)\n{\n    if(n > 1)\n    {\n' +
+      "        return fact(n-1) * n;\n    }\n    return 1;\n}\n\nint main(int argc, char **argv)\n{\n    frobnitz(fact(10));\n}\n",
+    "#include <stdio.h>\n\nint fib(int n)\n{\n    if(n > 2)\n    {\n        return fib(n-1) + fib(n-2);\n    }\n    return 1;\n}\n\n" +
+      "// Frobs foo heartily\nint frobnitz(int foo)\n{\n    int i;\n    for(i = 0; i < 10; i++)\n    {\n" +
+      '        printf("%d\\n", foo);\n    }\n}\n\nint main(int argc, char **argv)\n{\n    frobnitz(fib(10));\n}\n'],
+  // diff.indentHeuristic: git t4061 kayan-blok fikstürü
+  ["slider.txt", "1\n2\na\n\nb\n3\n4\n", "1\n2\na\n\nb\na\n\nb\n3\n4\n"],
+  // diff.suppressBlankEmpty: boş bağlam satırı
+  ["blank.txt", "a\n\nb\n\nc\n", "a\n\nB\n\nc\n"],
+  // core.quotePath: ASCII-dışı yol adı
+  ["src/\u00e7\u011f.txt", "x\n", "y\n"],
+  // diff.orderFile: sıra dosyası bu yolu öne alır
+  ["zz.txt", "z\n", "Z\n"],
+];
+
+async function buildFormatRepo(name: string): Promise<{ fixture: Fixture; orderFile: string }> {
+  const out = path.join(tmp, name);
+  const repo = path.join(out, "repo");
+  await mkdir(path.join(repo, "src"), { recursive: true });
+  await gitOk(repo, ["init", "-b", "main"]);
+  await gitOk(repo, ["config", "user.name", "Fixture User"]);
+  await gitOk(repo, ["config", "user.email", "fixture@local.invalid"]);
+  await gitOk(repo, ["config", "core.autocrlf", "false"]);
+  for (const [file, base] of FORMAT_FILES) {
+    await writeFile(path.join(repo, file), base);
+  }
+  await gitOk(repo, ["add", "-A"]);
+  await gitOk(repo, ["commit", "-m", "format base"]);
+  const orderFile = path.join(out, "order.txt");
+  await writeFile(orderFile, "zz.txt\n");
+  return { fixture: { repo, out }, orderFile };
+}
+
+function formatRewrite(): WorkerResult {
+  return workerResult(
+    FORMAT_FILES.map(([file, base, next]) => ({ kind: "modify", path: file, operations: [{ search: base, replace: next }] })),
+  );
+}
+
+/** [ad, global config içeriği, eski formül bu ayarla DEĞİŞİR mi ("changes" | "same" | "unchecked")] */
+function formatSettings(orderFile: string): Array<readonly [string, string, "changes" | "same" | "unchecked"]> {
+  return [
+    ["diff.context=7", "[diff]\n\tcontext = 7\n", "changes"],
+    ["diff.algorithm=patience", "[diff]\n\talgorithm = patience\n", "changes"],
+    ["diff.algorithm=histogram", "[diff]\n\talgorithm = histogram\n", "changes"],
+    ["diff.algorithm=minimal", "[diff]\n\talgorithm = minimal\n", "unchecked"],
+    ["diff.indentHeuristic=false", "[diff]\n\tindentHeuristic = false\n", "changes"],
+    ["diff.interHunkContext=10", "[diff]\n\tinterHunkContext = 10\n", "changes"],
+    ["diff.suppressBlankEmpty=true", "[diff]\n\tsuppressBlankEmpty = true\n", "changes"],
+    ["core.quotePath=false", "[core]\n\tquotePath = false\n", "changes"],
+    ["diff.orderFile", `[diff]\n\torderFile = ${orderFile}\n`, "changes"],
+    // Ölçüldü: Splash git'i worktree KÖKÜNDE çalıştırır → `relative` etkisiz (sabitleyici eklenmedi).
+    ["diff.relative=true", "[diff]\n\trelative = true\n", "same"],
+  ];
+}
+
+function allFormatSettings(orderFile: string): string {
+  return (
+    "[diff]\n\tcontext = 7\n\talgorithm = histogram\n\tindentHeuristic = false\n\tinterHunkContext = 10\n" +
+    `\tsuppressBlankEmpty = true\n\torderFile = ${orderFile}\n\trelative = true\n[core]\n\tquotePath = false\n`
+  );
+}
+
+test("recoveryStateHash is independent of every diff-format setting; legacy bytes unchanged in the default config (Step 10 H)", async () => {
+  const { fixture, orderFile } = await buildFormatRepo("hash-format");
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-format"),
+    sessionId: "s-format",
+    editablePaths: FORMAT_FILES.map(([file]) => file),
+  });
+  try {
+    const applied = await ws.applyPatchSet(formatRewrite());
+    assert.equal(applied.validation.editsApplied, FORMAT_FILES.length);
+    const legacyHash = async (): Promise<string> =>
+      sha256((await runGit([...LEGACY_FULL_DIFF_ARGS, ws.baseCommit], { cwd: ws.workspaceDir, config: ["core.hooksPath=/dev/null"] })).stdout);
+
+    // Varsayılan config: yeni hash = eski formülün baytlarının özeti (geriye uyum).
+    const defaultHash = await ws.recoveryStateHash();
+    const defaultLegacy = await legacyHash();
+    assert.equal(defaultHash, defaultLegacy, "default config: new hash diff === legacy bytes");
+
+    for (const [name, content, legacyEffect] of formatSettings(orderFile)) {
+      await withGlobalGitConfig(fixture.out, content, async () => {
+        // Pozitif kontrol: fikstür bu ayarı GERÇEKTEN tetikler (test boş değildir).
+        if (legacyEffect === "changes") {
+          assert.notEqual(await legacyHash(), defaultLegacy, `${name}: legacy formula must change (fixture exercises it)`);
+        } else if (legacyEffect === "same") {
+          assert.equal(await legacyHash(), defaultLegacy, `${name}: measured no effect at the worktree root`);
+        }
+        assert.equal(await ws.recoveryStateHash(), defaultHash, `${name}: state hash must not depend on it`);
+      });
+    }
+    await withGlobalGitConfig(fixture.out, allFormatSettings(orderFile), async () => {
+      assert.equal(await ws.recoveryStateHash(), defaultHash, "all settings combined");
+    });
+  } finally {
+    await ws.destroy();
+  }
+});
+
+test("restart under a changed diff-format config: restore (surviving + recreated worktree) + reapply reproduce the persisted hash (Step 10 H)", async () => {
+  const { fixture, orderFile } = await buildFormatRepo("hash-format-e2e");
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-format-e2e"),
+    sessionId: "s-format-e2e",
+    editablePaths: FORMAT_FILES.map(([file]) => file),
+  });
+  const round = await ws.applyPatchSet(formatRewrite());
+  const persistedHash = await ws.recoveryStateHash(); // varsayılan config'de kaydedildi
+  const state = await ws.snapshotRecoveryState();
+  assert.equal(state.recoveryStateHash, persistedHash);
+  const sentinel = path.join(ws.workspaceDir, "sentinel.txt");
+  await writeFile(sentinel, "keep\n"); // untracked — hash'i etkilemez; reuse kanıtı
+
+  await withGlobalGitConfig(fixture.out, allFormatSettings(orderFile), async () => {
+    // (a) Hayatta worktree: hash config'ten bağımsız → kimlik + hash eşleşir → REUSE.
+    const reused = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    assert.ok(await stat(sentinel).then(() => true, () => false), "surviving worktree reused (hash matched)");
+    const again = await reused.applyPatchSet(formatRewrite());
+    assert.deepEqual(again.validation, round.validation);
+    assert.deepEqual(again.diffStats, round.diffStats);
+    assert.equal(await reused.recoveryStateHash(), persistedHash, "reuse + reapply → persisted hash");
+    await reused.destroy();
+
+    // (b) Worktree yok: yeniden kurulum + yeniden-uygulama → aynı kalıcı hash.
+    const recreated = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      await recreated.applyPatchSet(formatRewrite());
+      assert.equal(await recreated.recoveryStateHash(), persistedHash, "recreate + reapply → persisted hash");
+    } finally {
+      await recreated.destroy();
+    }
+  });
+  await ws.destroy().catch(() => undefined);
 });
 
 // ── 12) imha (spec 73) ──────────────────────────────────────────────────────
@@ -2996,6 +3404,173 @@ test("recovery: missing worktree, no main drift, reapply reconstructs (spec 125)
   } finally {
     await ws.destroy().catch(() => undefined);
   }
+});
+
+/** `git worktree list --porcelain` kayıtları: yol + `prunable` (dizini eksik) işareti. */
+async function worktreeRegistrations(repo: string): Promise<Array<{ path: string; prunable: boolean }>> {
+  const out = await gitText(repo, ["worktree", "list", "--porcelain"]);
+  return out
+    .split(/\n\n+/)
+    .map((block) => block.split("\n"))
+    .map((lines) => ({
+      path: (lines.find((line) => line.startsWith("worktree ")) ?? "").slice("worktree ".length),
+      prunable: lines.some((line) => line.startsWith("prunable")),
+    }));
+}
+
+test("recovery: worktree dir deleted OUTSIDE git (stale registration left) is recreated via targeted cleanup", async () => {
+  const fixture = await buildRecFixture("rec-extdel");
+  const input = recInput(fixture, "s-extdel");
+  const ws = await createGitWorktreeWorkspace(input);
+  const canonicalDir = await realpath(ws.workspaceDir);
+  try {
+    const state = await ws.snapshotRecoveryState();
+
+    // git DIŞI silme (rm -rf/Finder/temizlik aracı): `.git/worktrees/<n>` kaydı KALIR.
+    await rm(ws.workspaceDir, { recursive: true, force: true });
+    assert.deepEqual(
+      (await worktreeRegistrations(fixture.repo)).filter((r) => r.path === canonicalDir),
+      [{ path: canonicalDir, prunable: true }],
+      "precondition: the missing dir must still be registered (prunable)",
+    );
+
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      assert.equal(await gitText(ws2.workspaceDir, ["rev-parse", "HEAD"]), state.baseCommit);
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+      // Tek, canlı kayıt: eski kayıt temizlendi, yenisi eklendi (çift kayıt YOK).
+      assert.deepEqual(
+        (await worktreeRegistrations(fixture.repo)).filter((r) => r.path === canonicalDir),
+        [{ path: canonicalDir, prunable: false }],
+      );
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: targeted cleanup keeps a foreign missing worktree registration (no global prune); reapply hash matches", async () => {
+  const fixture = await buildRecFixture("rec-foreign");
+  const input = recInput(fixture, "s-foreign");
+  const ws = await createGitWorktreeWorkspace(input);
+  const canonicalDir = await realpath(ws.workspaceDir);
+  // Splash'a ait OLMAYAN worktree (kullanıcının çıkarılmış diskteki worktree'si
+  // gibi): eklenir, sonra dizini git DIŞINDA kaybolur → kayıt `prunable` kalır.
+  const foreignDir = path.join(fixture.out, "foreign-wt");
+  await gitOk(fixture.repo, ["worktree", "add", "--detach", foreignDir, "HEAD"]);
+  const canonicalForeign = await realpath(foreignDir);
+  await rm(foreignDir, { recursive: true, force: true });
+  try {
+    const edits: WorkerEdit[] = [
+      { kind: "modify", path: "src/plain.ts", operations: [{ search: "v2-UNSTAGED", replace: "v3" }] },
+      { kind: "create", path: "src/new.ts", content: "created\n" },
+    ];
+    const round1 = await ws.applyPatchSet(workerResult(edits));
+    assert.equal(round1.validation.editsApplied, 2);
+    const state = await ws.snapshotRecoveryState();
+
+    // Splash worktree'si de git DIŞINDA silinir (kaydı kalır).
+    await rm(ws.workspaceDir, { recursive: true, force: true });
+
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      assert.equal(await gitText(ws2.workspaceDir, ["rev-parse", "HEAD"]), state.baseCommit);
+      // reapply → önceki tam patch; sonuç + kalıcı hash BİREBİR.
+      const round2 = await ws2.applyPatchSet(workerResult(edits));
+      assert.deepEqual(round2.validation, round1.validation);
+      assert.deepEqual(round2.diffStats, round1.diffStats);
+      assert.deepEqual(round2.createdPaths, round1.createdPaths);
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+
+      const registrations = await worktreeRegistrations(fixture.repo);
+      // Yabancı eksik kayıt DOKUNULMADAN durur (global prune YAPILMADI).
+      assert.deepEqual(
+        registrations.filter((r) => r.path === canonicalForeign),
+        [{ path: canonicalForeign, prunable: true }],
+      );
+      assert.deepEqual(
+        registrations.filter((r) => r.path === canonicalDir),
+        [{ path: canonicalDir, prunable: false }],
+      );
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+/** Splash'a ait OLMAYAN, dizini git DIŞINDA silinmiş (kaydı `prunable` kalan, kilitsiz) worktree. */
+async function addForeignMissingWorktree(fixture: RecFixture): Promise<string> {
+  const foreignDir = path.join(fixture.out, "foreign-wt");
+  await gitOk(fixture.repo, ["worktree", "add", "--detach", foreignDir, "HEAD"]);
+  const canonicalForeign = await realpath(foreignDir);
+  await rm(foreignDir, { recursive: true, force: true });
+  assert.deepEqual(
+    (await worktreeRegistrations(fixture.repo)).filter((r) => r.path === canonicalForeign),
+    [{ path: canonicalForeign, prunable: true }],
+    "precondition: the foreign missing worktree must still be registered (prunable)",
+  );
+  return canonicalForeign;
+}
+
+test("recovery: hash-mismatch cleanup of a live worktree keeps a foreign missing registration (no global prune, audit MEDIUM-1)", async () => {
+  const fixture = await buildRecFixture("rec-mismatch-foreign");
+  const input = recInput(fixture, "s-mismatch-foreign");
+  const ws = await createGitWorktreeWorkspace(input);
+  const canonicalDir = await realpath(ws.workspaceDir);
+  const canonicalForeign = await addForeignMissingWorktree(fixture);
+  try {
+    const state = await ws.snapshotRecoveryState();
+    // Canlı ama güvenilmez: TRACKED dosya out-of-band değişir → state hash çelişki
+    // → `destroyWorktreeSafely` yolu (kimlik/hash uyuşmazlığı).
+    await writeFile(path.join(ws.workspaceDir, "src", "plain.ts"), "C-CORRUPT\n");
+
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v2-UNSTAGED\n");
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+      const registrations = await worktreeRegistrations(fixture.repo);
+      // Yabancı eksik kayıt DOKUNULMADAN durur (global prune YAPILMADI).
+      assert.deepEqual(
+        registrations.filter((r) => r.path === canonicalForeign),
+        [{ path: canonicalForeign, prunable: true }],
+      );
+      assert.deepEqual(
+        registrations.filter((r) => r.path === canonicalDir),
+        [{ path: canonicalDir, prunable: false }],
+      );
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("destroy: fallback for an already-gone, unregistered worktree resolves and keeps a foreign missing registration (no global prune, audit MEDIUM-1)", async () => {
+  const fixture = await buildRecFixture("destroy-foreign");
+  const ws = await createGitWorktreeWorkspace(recInput(fixture, "s-destroy-foreign"));
+  const canonicalDir = await realpath(ws.workspaceDir);
+  const canonicalForeign = await addForeignMissingWorktree(fixture);
+
+  // Splash worktree'sinin hem dizini hem kaydı dışarıda kaldırılır → `destroy()`'un
+  // ilk `remove --force`'u hata verir ve geri dönüş yoluna düşer.
+  await rm(ws.workspaceDir, { recursive: true, force: true });
+  await gitOk(fixture.repo, ["worktree", "remove", "--force", canonicalDir]);
+  assert.deepEqual((await worktreeRegistrations(fixture.repo)).filter((r) => r.path === canonicalDir), []);
+
+  await ws.destroy(); // RESOLVE etmeli (kayıt da dizin de yok → imha tamam)
+  await ws.destroy(); // idempotent
+
+  // Yabancı eksik kayıt DOKUNULMADAN durur (global prune YAPILMADI).
+  assert.deepEqual(
+    (await worktreeRegistrations(fixture.repo)).filter((r) => r.path === canonicalForeign),
+    [{ path: canonicalForeign, prunable: true }],
+  );
+  await expectWorkspaceError("workspace_destroyed", () => ws.diff());
 });
 
 test("recovery: surviving worktree with matching identity+hash is reused (spec 126)", async () => {

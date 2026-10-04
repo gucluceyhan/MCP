@@ -87,9 +87,19 @@ export interface LiveBaseCaptureInput {
 /**
  * `captureLiveBase` sonucu — oturumun immutable tabanına karşı stale
  * KARARINI veren saf karşılaştırıcının girdisi (karşılaştırma YAPMAZ;
- * yalnız güvenli canlı ölçümü taşır, spec 53):
- * - `baseFingerprints`: kanonik yol → strict canlı parmak izi.
- * - `createdExists`: kanonik yol → ana ağaçta var mı (içeriksiz).
+ * yalnız güvenli canlı ölçümü taşır, spec 53). Anahtarlar MUTLAK yollardır
+ * (`repoRoot` + kanonik yol). Sürüklenme (varlık/tip) burada ÖLÇÜMDÜR, hata
+ * değil (DESIGN §7.5 — stale bir taban close'u engellemez):
+ * - `baseFingerprints`: mutlak yol → strict canlı parmak izi. Önekteki bir
+ *   bileşen artık dizin değilse (ENOTDIR) → `{ exists: false }`; repo
+ *   içindeki bir atal SYMLINK ise → `SYMLINKED_ANCESTOR_FINGERPRINT`
+ *   (`{ exists: true, type: "other", mode: "symlinked-ancestor" }` — hiçbir
+ *   base parmak iziyle eşit olamaz; link üzerinden hiçbir şey okunmaz).
+ * - `createdExists`: mutlak yol → worker'ın `create`'i main'le ÇAKIŞIYOR mu
+ *   (içeriksiz): yol var → `true`; önekteki bir bileşen dizin değilse
+ *   (ENOTDIR) → `true` (create uygulanamaz); atal SYMLINK ise → `true`
+ *   (varlık doğrulanamaz + patch hedefi symlink'li dizine düşer); yalnız
+ *   gerçek yokluk (ENOENT) → `false`.
  */
 export interface LiveBaseState {
   readonly baseFingerprints: ReadonlyMap<string, PathFingerprint>;

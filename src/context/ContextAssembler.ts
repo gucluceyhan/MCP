@@ -101,6 +101,23 @@ export const ABSENT_MARKER = "[ABSENT IN IMMUTABLE BASE]";
 /** Tabanda temsil edilemeyen tip (dizin/özel nesne). */
 export const NOT_REPRESENTABLE_MARKER = "[NOT REPRESENTABLE IN IMMUTABLE BASE]";
 
+// ── Canlı taban sürüklenme işareti (Step 9/10 stale ölçümü) ─────────────────
+
+/**
+ * `captureLiveBase` sentinel parmak izi: düzenlenebilir bir taban yolunun
+ * repo içindeki atalarından biri CANLI ağaçta sembolik bağlantı (ör.
+ * `src -> elsewhere`) → yol link ÜZERİNDEN ulaşılır; link üzerinden HİÇBİR şey
+ * okunmaz/izlenmez, ölçüm bu işarettir. Base modları git modlarıdır
+ * (`100644`/`100755`/`120000`/`160000`... ya da `exists:false`) →
+ * `fingerprintsEqual` ile HİÇBİR base parmak iziyle eşit olamaz → stale
+ * (DESIGN §7.5: tip sürüklenmesi = stale; işletim hatası DEĞİL).
+ */
+export const SYMLINKED_ANCESTOR_FINGERPRINT: PathFingerprint = Object.freeze({
+  exists: true,
+  type: "other",
+  mode: "symlinked-ancestor",
+});
+
 // ── Sabit uyarı sözlüğü (kaynak/secret/path YOK) ─────────────────────────────
 
 export const SECRET_FILE_WARNING = "Secret files were omitted from the context.";
@@ -697,35 +714,52 @@ export class ContextAssembler {
    * directly throughout SessionManager"). SessionManager bu yöntemi çağırır;
    * ham fs okumaları BU modüldedir. Karşılaştırma/MANTIK YAPMAZ (saf karar
    * `session/stale.ts`'tadır) — yalnız güvenli strict yakalamayı taşır.
+   * Refine ve close AYNI ölçümü kullanır: stale bir taban close'u ASLA
+   * engellemez (DESIGN §7.5) — bu yüzden sürüklenme burada HATA olarak
+   * değil, ÖLÇÜM olarak döner.
    *
-   * Yol güvenliği zinciri (salt-okunur okumalarla BİREBİR — spec 50/52):
-   * `normalizeRepoPath` (`.git`/`..`/mutlak/backslash/NUL → `unsafe_path`) →
-   * `resolveContained` (containment) → atal symlink taramı (fail-closed:
-   * I/O → `assembly_failed`; symlink → `unsafe_path`).
+   * Yol güvenliği zinciri (`#liveBaseTarget`): `normalizeRepoPath`
+   * (`.git`/`..`/mutlak/backslash/NUL → `unsafe_path`) → `resolveContained`
+   * (containment → `unsafe_path`; kalıcı yollar zaten doğrulanmış — savunma)
+   * → atal symlink taraması (fail-closed: belirsiz I/O → `assembly_failed`).
+   * Salt-okunur okumalardan TEK farkı: atal SYMLINK hata DEĞİL, sürüklenmedir
+   * (ör. `src` → harici dizin) — link üzerinden HİÇBİR şey okunmaz/izlenmez:
+   * - taban yolu → `SYMLINKED_ANCESTOR_FINGERPRINT` (hiçbir base parmak
+   *   iziyle eşit olamaz → stale);
+   * - worker-oluşturulan yol → `true` (varlık link üzerinden doğrulanamaz +
+   *   main'de patch hedefi symlink'li dizine düşer → çakışma/stale).
    *
    * Yakalama (spec 45-52, strict):
    * - `basePaths`: `captureStrictLiveFingerprint` — varlık/tip/mod/içerik
    *   SHA-256 (düzenli dosya no-follow okuma; link → hedef metni; dereferans
-   *   YOK). `ENOENT` → `exists:false`; her başka I/O → `assembly_failed`
+   *   YOK). `ENOENT`/`ENOTDIR` (önekteki bir bileşen artık dizin değil — yol
+   *   var olamaz) → `exists:false`; her başka I/O → `assembly_failed`
    *   (fail-closed; "yok" sayılmaz — spec 47/48/51).
    * - `createdPaths`: `captureStrictLiveExistence` — YALNIZ `lstat` varlık
    *   (içerik ASLA okunmaz — spec 171/266: worker-oluşturulan yolun main'de
-   *   var olması yeter); aynı fail-closed hata sözleşmesi.
+   *   var olması yeter). ÇAKIŞMA semantiği: `ENOENT` → `false`; `ENOTDIR`
+   *   (önekteki bileşen dizin değil → `create` main'e uygulanamaz) → `true`;
+   *   her başka I/O → `assembly_failed`.
    *
    * git YOK (spec 265), saat YOK, yazma YOK, backend çağrısı YOK.
    */
   async captureLiveBase(input: LiveBaseCaptureInput): Promise<LiveBaseState> {
     const baseFingerprints = new Map<string, PathFingerprint>();
     for (const raw of input.basePaths) {
-      const canonical = await this.#safeCanonical(input.repoRoot, raw);
-      const fingerprint = await this.#strictCapture(canonical);
-      baseFingerprints.set(canonical, fingerprint);
+      const target = await this.#liveBaseTarget(input.repoRoot, raw);
+      // Atal symlink = sürüklenme: link üzerinden okuma YOK, ölçüm sentinel'dir.
+      const fingerprint = target.symlinkedAncestor
+        ? SYMLINKED_ANCESTOR_FINGERPRINT
+        : await this.#strictCapture(target.absolute);
+      baseFingerprints.set(target.absolute, fingerprint);
     }
     const createdExists = new Map<string, boolean>();
     for (const raw of input.createdPaths) {
-      const canonical = await this.#safeCanonical(input.repoRoot, raw);
-      const exists = await this.#strictExistence(canonical);
-      createdExists.set(canonical, exists);
+      const target = await this.#liveBaseTarget(input.repoRoot, raw);
+      // Atal symlink: varlık doğrulanamaz (izlenmez) + patch hedefi symlink'li
+      // dizine düşer → çakışma (`true` = stale).
+      const exists = target.symlinkedAncestor ? true : await this.#strictExistence(target.absolute);
+      createdExists.set(target.absolute, exists);
     }
     return { baseFingerprints, createdExists };
   }
@@ -733,33 +767,37 @@ export class ContextAssembler {
   // ── iç yardımcılar ───────────────────────────────────────────────────────
 
   /**
-   * Bir seçili yolun güvenli kanonik mutlak formu (yol zincisi —
-   * `#readReadonlyBody` ile aynı): normalize → containment → atal symlink
-   * (fail-closed). Güvenli değilse / belirsizse tip'li `ContextAssemblyError`
-   * (`unsafe_path` / `assembly_failed`).
+   * `captureLiveBase`'e özel yol zinciri: normalize → containment → atal
+   * symlink taraması (fail-closed). Güvenli değilse `unsafe_path`; atal
+   * taramasında belirsiz I/O (EACCES/EIO/ELOOP/...) → `assembly_failed`.
+   * Atal SYMLINK hata DEĞİL: `symlinkedAncestor: true` döner (sürüklenme —
+   * çağıran link üzerinden hiçbir şey okumaz). Salt-okunur okuma zinciri
+   * (`#readReadonlyBody`) bundan etkilenmez — orada atal symlink `unsafe_path`
+   * kalır. (`hasSymlinkInPath`'in containment-ihlali `true` dalı burada
+   * ulaşılmazdır: `resolveContained` aynı yüklemi önce uygular.)
    */
-  async #safeCanonical(root: string, raw: string): Promise<string> {
+  async #liveBaseTarget(
+    root: string,
+    raw: string,
+  ): Promise<{ absolute: string; symlinkedAncestor: boolean }> {
     const canonical = normalizeRepoPath(raw);
     if (canonical === null) {
       throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
     }
-    const abs = resolveContained(root, canonical);
-    if (abs === null) {
+    const absolute = resolveContained(root, canonical);
+    if (absolute === null) {
       throw new ContextAssemblyError("unsafe_path", "A selected path is unsafe");
     }
     try {
-      if (
-        await hasSymlinkInPath(abs, root, { includeTarget: false, lstatFn: this.#fs.lstat, failClosed: true })
-      ) {
-        throw new ContextAssemblyError("unsafe_path", "A selected path is an unsafe symlink");
-      }
+      const symlinkedAncestor = await hasSymlinkInPath(absolute, root, {
+        includeTarget: false,
+        lstatFn: this.#fs.lstat,
+        failClosed: true,
+      });
+      return { absolute, symlinkedAncestor };
     } catch (err) {
-      if (err instanceof ContextAssemblyError) {
-        throw err;
-      }
       throw new ContextAssemblyError("assembly_failed", "Reading the live base failed", { cause: err });
     }
-    return abs;
   }
 
   /** Strict canlı parmak izi (spec 45-52); `StrictReadError` → `assembly_failed`. */

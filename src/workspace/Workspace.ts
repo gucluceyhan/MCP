@@ -132,7 +132,11 @@ export interface WorkspaceCreateInput {
 // ── Diff seçenekleri / sonuçları ────────────────────────────────────────────
 
 export interface WorkspaceDiffOptions {
-  /** Repository-göreceli yol filtreleri (her biri path-güvenliğiyle doğrulanır). */
+  /**
+   * Repository-göreceli yol filtreleri (her biri path-güvenliğiyle doğrulanır;
+   * `:(literal)` — glob/pathspec magic YOK). `diff` ve `stat` aynı filtreyi
+   * kullanır; boş dizi = filtresiz.
+   */
   files?: readonly string[];
 }
 
@@ -368,8 +372,13 @@ export interface Workspace {
    */
   diff(options?: WorkspaceDiffOptions): Promise<string>;
 
-  /** Base → güncel workspace yapısal istatistik (files/insertions/deletions). */
-  stat(): Promise<DiffStats>;
+  /**
+   * Base → güncel workspace yapısal istatistik (files/insertions/deletions).
+   * Varsayılan: tüm workspace. `files` → `diff()` ile BİREBİR aynı güvenli
+   * literal yol filtresi (Step 10 spec 8; güvensiz yol → `unsafe_path`).
+   * Sayılar git numstat'tan gelir — diff metni ASLA parse edilmez.
+   */
+  stat(options?: WorkspaceDiffOptions): Promise<DiffStats>;
 
   /**
    * Tamam patch export'u (`--binary --full-index`, base-göreceli) →

@@ -32,8 +32,12 @@
  *
  * 3. STRICT live yakalama (`captureStrictLiveFingerprint` /
  *    `captureStrictLiveExistence` — Step 9 spec 44-52):
- *    - `lstat`: YALNIZ `ENOENT` → `exists:false`; her başka hata →
+ *    - `lstat`: YALNIZ `ENOENT` / `ENOTDIR` → `exists:false`; her başka hata →
  *      `StrictReadError` (fail-closed; "yok" DEĞİL, belirsiz — spec 47).
+ *      `ENOTDIR` = yol önekindeki bir bileşen dizin DEĞİL (ör. `src` artık
+ *      bir dosya) → yol VAR OLAMAZ: kesin yokluktur, belirsizlik değil
+ *      (DESIGN §7.5: varlık/tip sürüklenmesi = stale, işletim hatası DEĞİL).
+ *      (`captureStrictLiveExistence` İSTİSNA: çakışma semantiği — aşağıda.)
  *    - sembolik bağlantı yaprağı: `lstat` + `readlink` (dereferans YOK);
  *      `readlink` hatası → `StrictReadError` (sahte yokluk DEĞİL — spec 51).
  *    - düzenli dosya: paylaşılacak no-follow okuma
@@ -41,6 +45,8 @@
  *      hata → `StrictReadError` (spec 48).
  *    - `captureStrictLiveExistence`: YALNIZ `lstat` (içerik ASLA okunmaz —
  *      worker-oluşturulan yol çakışması için varlık yeterli, spec 171/266).
+ *      ÇAKIŞMA semantiği: `ENOTDIR` → `true` (önekteki bileşen dizin değil →
+ *      worker'ın `create`'i main'e uygulanamaz).
  *    İki varyantın ALANLARI aynı ölçektedir: base YENİDEN aynı alandan
  *    yakalandığı (PR #24) için karşılaştırma (`fingerprintsEqual`) iki
  *    tarafta da aynı ölçekte çalışır.
@@ -203,6 +209,8 @@ export interface StrictReadSeams {
  * SÖZLEŞMESİ fail-closed'dır:
  *
  * - `lstat` `ENOENT` → `{ exists: false }` (yalnız GERÇEK yokluk, spec 47)
+ * - `lstat` `ENOTDIR` → `{ exists: false }` (yol önekindeki bir bileşen dizin
+ *   değil → yol VAR OLAMAZ; kesin yokluk, belirsizlik değil)
  * - `lstat` başka hata (EACCES/EIO/ELOOP/...) → `StrictReadError`
  * - link yaprağı: `readlink` (dereferans YOK) → hedef metin özeti;
  *   `readlink` hatası → `StrictReadError` (sahte yokluk DEĞİL, spec 51)
@@ -225,8 +233,9 @@ export async function captureStrictLiveFingerprint(
   try {
     stat = await lstatFn(absolutePath);
   } catch (err) {
-    // YALNIZ ENOENT "yoktur"; her başka hata belirsizlik = fail-closed.
-    if (!errnoIs(err, "ENOENT")) {
+    // YALNIZ ENOENT/ENOTDIR "yoktur" (ENOTDIR: önekteki bir bileşen dizin
+    // değil → yol var olamaz); her başka hata belirsizlik = fail-closed.
+    if (!errnoIs(err, "ENOENT") && !errnoIs(err, "ENOTDIR")) {
       throw new StrictReadError(err);
     }
     return { exists: false };
@@ -277,8 +286,18 @@ export async function captureStrictLiveFingerprint(
  * yol çakışması, spec 171/266). İçerik ASLA okunmaz: main'de bağımsız olarak
  * var olması YETMEZ değil — VAR OLMASI (içerik ne olursa) stale üretir;
  * yalnız varlık/tip sorulur, bayt okunmaz (spec 171: "existence alone is
- * enough"). Hata sözleşmesi `captureStrictLiveFingerprint` ile aynıdır:
- * `ENOENT` → `false`; başka `lstat` hatası → `StrictReadError` (fail-closed).
+ * enough").
+ *
+ * ÇAKIŞMA semantiği (YALNIZ worker-oluşturulan yollar için kullanılır):
+ * `true` = "worker'ın `create`'i main'e temiz uygulanamaz".
+ * - `lstat` başarılı → `true` (yol main'de bağımsız olarak var)
+ * - `ENOENT` → `false` (yol yok; create temiz uygulanır)
+ * - `ENOTDIR` → `true` (önekteki bir bileşen artık dizin DEĞİL — ör. `src`
+ *   bir dosya oldu: yol var olamaz ama `create src/new.ts` de uygulanamaz →
+ *   çakışma; `fresh` temiz uygulamayı onaylardı). Taban (editable) yolların
+ *   `captureStrictLiveFingerprint`'ı bundan ETKİLENMEZ: orada ENOTDIR yokluktur
+ *   (taban yokluğuna karşı karşılaştırılır).
+ * - başka `lstat` hatası → `StrictReadError` (fail-closed).
  */
 export async function captureStrictLiveExistence(
   absolutePath: string,
@@ -289,9 +308,13 @@ export async function captureStrictLiveExistence(
     await lstatFn(absolutePath);
     return true;
   } catch (err) {
-    if (!errnoIs(err, "ENOENT")) {
-      throw new StrictReadError(err);
+    if (errnoIs(err, "ENOENT")) {
+      return false;
     }
-    return false;
+    if (errnoIs(err, "ENOTDIR")) {
+      // Önekteki bileşen dizin değil → create uygulanamaz = çakışma.
+      return true;
+    }
+    throw new StrictReadError(err);
   }
 }
