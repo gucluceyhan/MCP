@@ -324,7 +324,7 @@ interface ManagerHarness {
   cwdCalls: { count: number };
   sessionsDir: string;
   processCwd: () => string;
-  restoreWorkspace: (state: WorkspaceRecoveryState) => Promise<Workspace>;
+  restoreWorkspace: (state: WorkspaceRecoveryState, options: { expectedWorkspaceDir: string }) => Promise<Workspace>;
 }
 
 async function makeManagerHarness(t: TestContext, options: ManagerHarnessOptions = {}): Promise<ManagerHarness> {
@@ -350,9 +350,9 @@ async function makeManagerHarness(t: TestContext, options: ManagerHarnessOptions
   const resolver = new CountingRulesResolver(new RulesResolver());
 
   const restoreCalls = { count: 0 };
-  const restoreWorkspace = (state: WorkspaceRecoveryState): Promise<Workspace> => {
+  const restoreWorkspace = (state: WorkspaceRecoveryState, options: { expectedWorkspaceDir: string }): Promise<Workspace> => {
     restoreCalls.count++;
-    return restoreGitWorktreeWorkspace(state);
+    return restoreGitWorktreeWorkspace(state, options);
   };
   const cwdCalls = { count: 0 };
   const processCwd = (): string => {

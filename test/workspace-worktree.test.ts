@@ -2152,7 +2152,8 @@ test("worker-modified TRACKED root .gitattributes: the rollback restores the att
   );
 });
 
-// ── 39) racy pozitif kontrol: HAM reset marker'ı YAZAR; sınıf yolu YAZMAZ ──
+// ── 39) racy pozitif kontrol: HAM reset (pencere kurulursa) marker'ı YAZAR; ──
+//      sınıf yolu ASLA YAZMAZ (koşulsuz) ──
 
 test("racy reset positive control (same-size modify + same-second stat): a RAW reset WOULD execute the planted filter; the class round + resetToBase never do (PR #24 SB-1 m.16)", async () => {
   const { out, repo } = await buildF6Repo("sb1-racy", { "d/.gitattributes": "d-base\n", "d/p.txt": "data\n" });
@@ -2186,14 +2187,46 @@ test("racy reset positive control (same-size modify + same-second stat): a RAW r
     // menin savunacak bir penceresi olduğunu kanıtlar (racy davranış
     // sürüm-bağımlıdır: yalnız 2.50.x'te ölçüldü — başka sürümde marker
     // assert'i atlanır, sınıf-yolu assert'leri koşulsuz devam eder).
-    await plantRacy();
-    await git(ws.workspaceDir, ["reset", "--hard", ws.baseCommit]);
+    //
+    // N-2 toleransı (2026-10-03, mekanizma ölçüldü): pencere, `plantRacy`'nin
+    // `p.txt` mtime'ını INDEX DOSYASI mtime'ına sabitlemesiyle kurulur; git
+    // bunu index ENTRY'sindeki mtime (checkout yazımı) ile SANİYE çözünürlü-
+    // ğünde karşılaştırır. Sınıf, checkout'tan SONRA `git add -A` ile index
+    // dosyasını yeniden yazdığı için (ölçüldü: entry stat korunur, dosya
+    // mtime'ı güncellenir), pencere yalnız checkout→add-A aralığının bir
+    // saniye içinde kalmasıyla hit olur — paralel yükte bu aralık saniye
+    // sınırını aşıp marker'ı YAZDIRAMAZ (yalnız ölçüm flake'lenir). Ham
+    // ölçüm SINIRLI denemeyle denenir (yeniden bitki + ham reset): her
+    // denemede ham reset index'i, taze yazdığın dosyanın mtime'ı ile aynı
+    // saniyede yeniden kaydettiği için 2. deneme pencereyi ~kesin kurar
+    // (ölçüldü: 3/25 ilk deneme miss → 3/3 ikinci deneme hit; 25/25 ≤10
+    // denemede hit). Sınır dolup pencere hâlâ kurulamazsa AÇIK
+    // "pencere kurulamadı" dalı marker assert'ini atlar. Tolerans YALNIZ
+    // ham-bypass ölçümü içindir: alttaki sınıf-yolu assert'leri KOŞULSUZ
+    // kalır — sınıf yolu marker yazdıysa test yine kırmızıdır, bu dal onu
+    // gömez.
+    let positiveWindowHit = false;
     if (/2\.50\./.test(gitVersion)) {
-      await assert.doesNotReject(
-        lstat(marker),
-        `POSITIVE CONTROL (git ${gitVersion.trim()}): a raw reset under the racy condition executes the external filter through the worktree attribute surface`,
-      );
-      await rm(marker);
+      const maxPositiveAttempts = 10;
+      for (let attempt = 1; attempt <= maxPositiveAttempts && !positiveWindowHit; attempt++) {
+        await plantRacy();
+        await git(ws.workspaceDir, ["reset", "--hard", ws.baseCommit]);
+        positiveWindowHit = (await lstat(marker).catch(() => null)) !== null;
+        if (positiveWindowHit) {
+          await assert.doesNotReject(
+            lstat(marker),
+            `POSITIVE CONTROL (git ${gitVersion.trim()}): a raw reset under the racy condition executes the external filter through the worktree attribute surface`,
+          );
+          await rm(marker);
+        }
+      }
+    } else {
+      // Ölçülmemiş git sürümü (2.50.x dışı): racy pencere davranışı
+      // sürüm-bağımlı → marker assert'i atlanır (önceki davranış); ham
+      // reset yine de attr yüzeyini base'e döndürür — alttaki KOŞULSUZ
+      // assert bunu doğrular.
+      await plantRacy();
+      await git(ws.workspaceDir, ["reset", "--hard", ws.baseCommit]);
     }
     // Her durumda: ham reset tracked attr'i base'e döndürdü (tehdit gitti).
     assert.equal(
@@ -2825,7 +2858,7 @@ test("recovery: CRLF base preserved after missing-worktree restore (spec 116)", 
     await ws.destroy();
     assert.equal((await lstat(ws.workspaceDir).catch(() => null)), null, "worktree dir must be gone");
 
-    const ws2 = await restoreGitWorktreeWorkspace(state);
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
     try {
       const entry = ws2.readBaseEntry("src/crlf.ts");
       assert.deepEqual(entry, {
@@ -2853,7 +2886,7 @@ test("recovery: symlink target + absent path restored without recapture (spec 11
     await writeFile(path.join(fixture.repo, "src", "absent.ts"), "newly appeared in main\n");
 
     await ws.destroy();
-    const ws2 = await restoreGitWorktreeWorkspace(state);
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
     try {
       // spec 117: symlink hedef METNİ + 120000, dereferans YOK.
       assert.deepEqual(ws2.readBaseEntry("link"), {
@@ -2889,7 +2922,7 @@ test("recovery: reapply reproduces identical validation/created/hash (spec 119-1
     assert.deepEqual(state.currentCreatedPaths, ["src/new.ts"]);
     await ws.destroy();
 
-    const ws2 = await restoreGitWorktreeWorkspace(state); // base'te (yeniden kuruldu)
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir }); // base'te (yeniden kuruldu)
     try {
       const round2 = await ws2.applyPatchSet(workerResult(edits)); // aynı tam patch
       // spec 120: validation + filesChanged + diffStats + createdPaths birebir.
@@ -2918,7 +2951,7 @@ test("recovery: immutable base survives main drift (spec 124)", async () => {
     await writeFile(path.join(fixture.repo, "src", "plain.ts"), "v3-DRIFT\n");
 
     await ws.destroy();
-    const ws2 = await restoreGitWorktreeWorkspace(state);
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
     try {
       // base BİREBİR korunur (v2-UNSTAGED) — main'den (v3-DRIFT) ASLA değil.
       const entry = ws2.readBaseEntry("src/plain.ts");
@@ -2950,7 +2983,7 @@ test("recovery: missing worktree, no main drift, reapply reconstructs (spec 125)
 
     // main unchanged (v2-UNSTAGED); worktree yok edildi.
     await ws.destroy();
-    const ws2 = await restoreGitWorktreeWorkspace(state);
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
     try {
       // reapply → önceki tam patch yeniden uygulanır; state hash eşleşir.
       const round2 = await ws2.applyPatchSet(workerResult(edits));
@@ -2974,7 +3007,7 @@ test("recovery: surviving worktree with matching identity+hash is reused (spec 1
     const state = await ws.snapshotRecoveryState();
 
     // worktree YIKILMADI — hayatta + kimlik + hash eşleşiyor.
-    const ws2 = await restoreGitWorktreeWorkspace(state);
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
     try {
       // reuse: worktree round-1 hâlinde (v3) KALIR; base'e SIFIRLANMAZ.
       assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v3\n");
@@ -3000,7 +3033,7 @@ test("recovery: surviving mismatched worktree is recreated from persisted state 
     // out-of-band mutasyon → state hash çelişki.
     await writeFile(path.join(ws.workspaceDir, "src", "plain.ts"), "C-CORRUPT\n");
 
-    const ws2 = await restoreGitWorktreeWorkspace(state);
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
     try {
       // güvenilmez worktree → base'e (v2-UNSTAGED) yeniden kurulur; korozyon gider.
       assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v2-UNSTAGED\n");
@@ -3029,7 +3062,7 @@ test("recovery: base object pruned → full reconstruction via mktree/commit-tre
     await ws.destroy();
     await pruneBaseObject(fixture, baseCommit); // base commit + özel blob'ları yok et
 
-    const ws2 = await restoreGitWorktreeWorkspace(state); // case (b): yeniden kur
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir }); // case (b): yeniden kur
     try {
       // özel blob rekonstrüksiyon + snapshot: base BİREBİR (v2-UNSTAGED).
       const entry = ws2.readBaseEntry("src/plain.ts");
@@ -3085,5 +3118,245 @@ test("recovery: snapshotRecoveryState is JSON-safe and content-free (spec 112/11
     }
   } finally {
     await ws.destroy();
+  }
+});
+
+test("recovery: tampered persisted workspaceDir cannot select an external target", async () => {
+  const fixture = await buildRecFixture("rec-tampered");
+  const input = recInput(fixture, "s-tampered");
+  const ws = await createGitWorktreeWorkspace(input);
+  const external = path.join(fixture.out, "external-target");
+  const sentinel = path.join(external, "sentinel.txt");
+  try {
+    const state = await ws.snapshotRecoveryState();
+    await mkdir(external, { recursive: true });
+    await writeFile(sentinel, "do-not-touch\n");
+
+    const tampered = { ...state, workspaceDir: external } as WorkspaceRecoveryState;
+    await assert.rejects(
+      restoreGitWorktreeWorkspace(tampered, { expectedWorkspaceDir: state.workspaceDir }),
+      (e: unknown) => {
+        assert.ok(e instanceof WorkspaceError);
+        assert.equal(e.kind, "invalid_input");
+        return true;
+      },
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "do-not-touch\n");
+
+    const restored = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      assert.equal(await readFile(path.join(restored.workspaceDir, "src", "plain.ts"), "utf8"), "v2-UNSTAGED\n");
+    } finally {
+      await restored.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+    await rm(external, { recursive: true, force: true });
+  }
+});
+
+test("recovery: lexical expected dir through a symlinked ancestor restores the same canonical workspace (audit F-1)", async () => {
+  const fixture = await buildRecFixture("rec-f1-alias");
+  const input = recInput(fixture, "s-f1-alias");
+  const ws = await createGitWorktreeWorkspace(input);
+  const alias = path.join(tmp, "rec-f1-alias-link");
+  try {
+    const state = await ws.snapshotRecoveryState();
+    await ws.destroy();
+
+    // `fixture.out`'a SYMLINK alias — atal sembolik bağlantının platformdan
+    // bağımsız kontrollü karşılığı (macOS `/var` → `/private/var`, CI tmp kökleri).
+    await symlink(fixture.out, alias);
+
+    // Sözdizimsel form KALICI kanonik formdan FARKLI — ama AYNI fiziksel dizin.
+    const lexicalExpected = path.join(alias, "ws", "s-f1-alias");
+    assert.notEqual(path.resolve(lexicalExpected), path.resolve(state.workspaceDir));
+
+    // Kanonik karşılaştırma: restore REDDETMEZ (eski sözdizimsel karşılaştırma
+    // bu senaryoda meşru oturumu sahte pozitif reddediyordu).
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: lexicalExpected });
+    try {
+      // Çalışır dizin = güvenilen formun KANONİĞİ = kalıcı (state) form.
+      assert.equal(ws2.workspaceDir, state.workspaceDir);
+      assert.deepEqual(ws2.readBaseEntry("src/plain.ts"), {
+        exists: true,
+        type: "file",
+        mode: "100644",
+        content: Buffer.from("v2-UNSTAGED\n"),
+      });
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+    await rm(alias, { force: true }); // symlink (dizin değil) — rm -f yeterli
+  }
+});
+
+test("recovery: lstat error (non-ENOENT) on the persisted dir fails closed with a fixed safe message (audit F-3)", async () => {
+  const fixture = await buildRecFixture("rec-f3-errno");
+  const input = recInput(fixture, "s-f3-errno");
+  const ws = await createGitWorktreeWorkspace(input);
+  const anonFile = path.join(fixture.out, "anon-file.txt");
+  try {
+    const state = await ws.snapshotRecoveryState();
+    // Güvenilen workspace'te sentinel — hiçbir işlemede dokunulmamalı.
+    const sentinel = path.join(ws.workspaceDir, "sentinel.txt");
+    await writeFile(sentinel, "do-not-touch\n");
+
+    // Kalıcı `workspaceDir` bir DÜZENLİ DOSYA'nın altına yönlendirilir:
+    // `lstat` deterministik NON-ENOENT (ENOTDIR) verir. Yalnız ENOENT "yok"
+    // sayılır; diğer hata fail-closed SABİТ güvenli mesajla red.
+    await writeFile(anonFile, "file\n");
+    const tampered = { ...state, workspaceDir: path.join(anonFile, "inner") } as WorkspaceRecoveryState;
+
+    await assert.rejects(
+      restoreGitWorktreeWorkspace(tampered, { expectedWorkspaceDir: state.workspaceDir }),
+      (e: unknown) => {
+        assert.ok(e instanceof WorkspaceError);
+        assert.equal(e.kind, "unsafe_path");
+        assert.equal(e.message, "The workspace directory must be a real directory");
+        // Yol/İÇERİK mesajda YOK.
+        assert.ok(!e.message.includes("anon-file"));
+        return true;
+      },
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "do-not-touch\n");
+  } finally {
+    await ws.destroy().catch(() => undefined);
+    await rm(anonFile, { force: true });
+  }
+});
+
+// ── Step 9 audit düzeltmeleri (2026-10-03) ──────────────────────────────────
+//
+// Düzeltme A: backslash'li dosya adlarını takip EDEN dürüst repository
+// (POSIX'te yasal ad) — tam ağacını (basePaths/immutableBaseEntries) taşıyan
+// oturumun worktree'si BİREBİR restore edilebilir.
+// Düzeltme B: repo İÇİNE düşen workspaceDir (kalıcı ya da beklenen) →
+// creation yoluyla BİREBİR stabil `unsafe_path` kind.
+
+test("recovery: honest repo with backslash file names restores (audit A — surviving base object)", async () => {
+  const fixture = await buildRecFixture("rec-backslash");
+  // Dürüst repo: backslash'li dosya adı (POSIX'te normal karakter) — tracked +
+  // committed. SEÇİM YAPILMAZ (güvenilmez alan STRICT kalır); yalnız TAM AĞAÇ
+  // (self-captured alan) taşır.
+  await writeFile(path.join(fixture.repo, "src", "weird\\name.ts"), "backslash-file\n");
+  await gitOk(fixture.repo, ["add", "src/weird\\name.ts"]);
+  await gitOk(fixture.repo, ["commit", "-m", "backslash name tracked"]);
+
+  const input = recInput(fixture, "s-backslash");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+    // Tam ağaç haritası: backslash'li anahtar AYNEN (normalizasyon YOK).
+    const baseKeys = state.basePaths.map(([gitPath]) => gitPath);
+    assert.ok(baseKeys.includes("src/weird\\name.ts"), "basePaths must carry the raw ls-tree name");
+    const src = state.immutableBaseEntries.find((entry) => entry.path === "src");
+    assert.ok(src?.children?.some((child) => child.path === "weird\\name.ts"), "tree entry keeps the raw name");
+
+    await ws.destroy();
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      // Worktree BİREBİR: backslash dosyası + seçili dosya içeriği.
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "weird\\name.ts"), "utf8"), "backslash-file\n");
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v2-UNSTAGED\n");
+      assert.deepEqual(ws2.readBaseEntry("src/plain.ts"), {
+        exists: true,
+        type: "file",
+        mode: "100644",
+        content: Buffer.from("v2-UNSTAGED\n"),
+      });
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+      // Doğrulama tabanı: backslash'li anahtar aynen taşınır (canonical worker
+      // yolu asla eşleşemez → create/delete denetimi fail-closed).
+      assert.ok(ws2.base.basePaths.has("src/weird\\name.ts"));
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: honest repo with backslash file names, base object pruned → mktree reconstruction (audit A, case b)", async () => {
+  const fixture = await buildRecFixture("rec-backslash-pruned");
+  await writeFile(path.join(fixture.repo, "src", "weird\\name.ts"), "backslash-file\n");
+  await gitOk(fixture.repo, ["add", "src/weird\\name.ts"]);
+  await gitOk(fixture.repo, ["commit", "-m", "backslash name tracked"]);
+
+  const input = recInput(fixture, "s-b-backslash");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+    await ws.destroy();
+    await pruneBaseObject(fixture, state.baseCommit); // base nesnesi yok → mktree+commit-tree yolu
+
+    const ws2 = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      // `mktree`, backslash'li TEK bileşenli adı kabul eder (ölçüldü: aynı
+      // tree SHA) → alt-ağaç birebir, checkout backslash dosyasını materyalize
+      // eder (blob'u main'den ulaşılabilir — pruneden etkilenmez).
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "weird\\name.ts"), "utf8"), "backslash-file\n");
+      assert.equal(await readFile(path.join(ws2.workspaceDir, "src", "plain.ts"), "utf8"), "v2-UNSTAGED\n");
+      assert.equal(await ws2.recoveryStateHash(), state.recoveryStateHash);
+    } finally {
+      await ws2.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: persisted workspaceDir inside the repo fails with the stable unsafe_path kind (audit B)", async () => {
+  const fixture = await buildRecFixture("rec-b-inside");
+  const input = recInput(fixture, "s-b-inside");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+    // Tamper: kalıcı `workspaceDir` repository İÇİNE düşer (kaçış denemesi).
+    const tampered = { ...state, workspaceDir: path.join(fixture.repo, "inside", "ws") } as WorkspaceRecoveryState;
+    await assert.rejects(
+      restoreGitWorktreeWorkspace(tampered, { expectedWorkspaceDir: state.workspaceDir }),
+      (e: unknown) => {
+        assert.ok(e instanceof WorkspaceError);
+        // Stabil kind: creation yolundaki aynı koşul `unsafe_path` üretir —
+        // restore bunu `invalid_input` ile ikame edemezdi.
+        assert.equal(e.kind, "unsafe_path");
+        assert.equal(e.message, "The workspace directory must be outside the repository");
+        assert.ok(!e.message.includes("inside"), "yol mesajda YOK");
+        return true;
+      },
+    );
+    // Güvenilen (beklenen) workspace etkilenmez — meşru restore yürür.
+    const restored = await restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      assert.equal(await readFile(path.join(restored.workspaceDir, "src", "plain.ts"), "utf8"), "v2-UNSTAGED\n");
+    } finally {
+      await restored.destroy();
+    }
+  } finally {
+    await ws.destroy().catch(() => undefined);
+  }
+});
+
+test("recovery: expected workspaceDir inside the repo fails with the stable unsafe_path kind (audit B)", async () => {
+  const fixture = await buildRecFixture("rec-b-expected");
+  const input = recInput(fixture, "s-b-expected");
+  const ws = await createGitWorktreeWorkspace(input);
+  try {
+    const state = await ws.snapshotRecoveryState();
+    // Çağrıcının "güvenilen" beklenen dizini repository İÇİNE düşer.
+    await assert.rejects(
+      restoreGitWorktreeWorkspace(state, { expectedWorkspaceDir: path.join(fixture.repo, "expected") }),
+      (e: unknown) => {
+        assert.ok(e instanceof WorkspaceError);
+        assert.equal(e.kind, "unsafe_path");
+        assert.equal(e.message, "The workspace directory must be outside the repository");
+        return true;
+      },
+    );
+  } finally {
+    await ws.destroy().catch(() => undefined);
   }
 });

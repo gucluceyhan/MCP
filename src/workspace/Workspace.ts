@@ -174,6 +174,11 @@ export type { ValidationRejection, ValidationResult };
  * böylece base nesnesi yok sayıldığında ağaç `git mktree` ile alttan-üst
  * BİREBİR (aynı `tree` SHA'sı) yeniden kurulur. İçerik YOK (yalnız git
  * metadata) — session.json'ı boyut olarak dosya sayısı sınırlı tutar.
+ *
+ * `path` git'in KENDİ ürettiği bir adımdır (self-captured) — kalıcılık
+ * doğrulaması (SessionStore) YAPISEL güven alanı kuralıyla denetlenir
+ * (Step 9 audit düzeltme A): backslash'li yasal adlar kabul, yalnız
+ * kaçış/`.git` formları red.
  */
 export interface BaseTreeEntry {
   mode: string;
@@ -244,7 +249,11 @@ export interface WorkspaceRecoveryState {
   readonly readonlyPaths: string[];
   /** Seçili yolların immutable base parmak izleri (path → fingerprint). */
   readonly baseFingerprints: ReadonlyArray<readonly [string, PathFingerprint]>;
-  /** Base ağacının TAM yol → git modu haritası (create/varlık denetimi). */
+  /**
+   * Base ağacının TAM yol → git modu haritası (create/varlık denetimi).
+   * Yollar `git ls-tree` çıktısıdır (self-captured) — kalıcılık doğrulaması
+   * yapısal güven alanı kuralıyla (Step 9 audit düzeltme A).
+   */
   readonly basePaths: ReadonlyArray<readonly [string, string]>;
   /** Base commit'in TAM ağacı (mode/oid/path) — `mktree` için. */
   readonly immutableBaseEntries: BaseTreeEntry[];

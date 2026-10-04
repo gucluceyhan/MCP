@@ -172,3 +172,26 @@
   step9-integration (6). Final toplam: **591**.
 - Kalite kapısı: her katman sonra `npm test`; commit öncesi `code-audit-sentinel` +
   `testing-qa-architect` (bağımsız).
+
+## Kapanış turu — 2026-10-03
+- 3 merge-blocker kapatıldı:
+  1. Recovery workspace path trusted runtime session yolundan türetildi; persisted `workspaceDir` destructive target olamaz.
+  2. Persisted state deep/exact validation eklendi; unsupported nested values typed state olamaz.
+  3. `SessionStore` no-follow/exclusive seam’e geçti; symlinked `session.json`/tmp/dir takip edilmez.
+- Audit düzeltmeleri:
+  - F-1: canonical persisted/expected workspace-dir karşılaştırması (symlinked `outputRoot` ancestor’ında sahte-pozitif red düzeltildi).
+  - F-2: `repoRoot` absolute + `workspaceRecovery.repoRoot` eşitliği.
+  - F-3: `lstat` errno sınıflaması (yalnız ENOENT “absent”, diğerleri fail-closed).
+  - A: self-captured git tree path’leri için yapısal trusted-tree validation; backslash’lı dürüst repo adı yanlış `session_corrupt` üretmez.
+  - B: `canonicalizeOutside === null` için stabil `unsafe_path` kind.
+- QA:
+  - N-2 racy-reset positive control load-tolerant yapıldı; sınıf-yolu güvenlik assert’leri koşulsuz korundu.
+  - Final gate: `npm run build` exit 0, `npm run typecheck` exit 0, `npm test` = **618 PASS / 0 FAIL** (3 ardışık + mutation-sonrası final).
+  - Bağımsız `code-audit-sentinel` re-audit = **PASS**; yeni Critical/High/Medium yok.
+- 47-bölümlü final rapor: `docs/step9-final-report.md` (spec 469).
+- PR dışı takip issue adayları:
+  - N-1: `recreateWorktree` → `git worktree add` öncesi F-6 tarzı external-filter re-check.
+  - M8: manager-seviye symlinked-ancestor `outputRoot` restore testi.
+  - N-3/N-4: trusted tree path inert forms + lstat error-kind semantiği (INFO).
+  - M7: `O_EXCL` TOCTOU residual (dokümantasyon, issue zorunlu değil).
+- Commit mesajında AI/Co-Author imza YOK.

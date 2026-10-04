@@ -26,10 +26,10 @@
  * (bu dosyadaki gerçek adapter), testler deterministik sahte.
  */
 
-import { chmod, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { constants, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { computeRepoId } from "../workspace/git.js";
-import { isSafeSessionId, normalizeRepoPath } from "../workspace/pathSafety.js";
+import { isSafeSessionId, isTrustedTreePath, normalizeRepoPath } from "../workspace/pathSafety.js";
 import {
   RULES_SOURCES,
   SESSION_SCHEMA_VERSION,
@@ -38,19 +38,31 @@ import {
   type PersistedRound,
   type PersistedSession,
   type SessionOptions,
+  type SessionDirHandle,
+  type SessionReadHandle,
+  type SessionStat,
   type SessionStoreFs,
   type SessionWriteHandle,
 } from "./types.js";
 import type { ResolvedRules, RuleDocumentSource } from "../rules/types.js";
 import type {
   CompactResult,
+  CompactStatus,
   RulesSource,
   SelectedContextTier,
   ValidationResult,
+  WorkerEdit,
   WorkerResult,
 } from "../worker/result.js";
 import type { ReasoningEffort } from "../backend/InferenceBackend.js";
-import type { WorkspaceRecoveryState } from "../workspace/Workspace.js";
+import type { InferenceConflict } from "../backend/InferenceCoordinator.js";
+import type {
+  BaseCommitIdentity,
+  BaseContentValue,
+  BaseTreeEntry,
+  PathFingerprint,
+  WorkspaceRecoveryState,
+} from "../workspace/Workspace.js";
 
 /** Oturum dizin modu (spec 7). */
 const DIR_MODE = 0o700;
@@ -68,21 +80,96 @@ function errnoIs(err: unknown, code: string): boolean {
   );
 }
 
+async function lstatOptional(fs: SessionStoreFs, target: string): Promise<SessionStat | null> {
+  try {
+    return await fs.lstat(target);
+  } catch (err) {
+    if (errnoIs(err, "ENOENT")) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function setDirectoryModeNoFollow(fs: SessionStoreFs, dir: string, mode: number): Promise<void> {
+  const handle = await fs.openDir(dir);
+  try {
+    await handle.chmod(mode);
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function ensureDirectoryNoFollow(fs: SessionStoreFs, dir: string, mode: number): Promise<void> {
+  const existing = await lstatOptional(fs, dir);
+  if (existing !== null) {
+    if (existing.isSymbolicLink() || !existing.isDirectory()) {
+      throw sessionError("session_operation_failed", "unsafe session directory");
+    }
+  } else {
+    await fs.mkdir(dir, mode, true);
+  }
+  await setDirectoryModeNoFollow(fs, dir, mode);
+}
+
+async function removeStaleTmpNoFollow(fs: SessionStoreFs, tmp: string): Promise<void> {
+  let existing: SessionStat | null;
+  try {
+    existing = await fs.lstat(tmp);
+  } catch (err) {
+    if (errnoIs(err, "ENOENT")) {
+      return;
+    }
+    throw err;
+  }
+  if (existing === null) {
+    return;
+  }
+  if (existing.isSymbolicLink() || !existing.isFile()) {
+    throw sessionError("session_persistence_failed", "unsafe session temp entry");
+  }
+  await fs.removeFile(tmp);
+}
+
 // ── Gerçek dosya sistemi adapter'i (node:fs/promises) ───────────────────────
 
 const realFs: SessionStoreFs = {
   async mkdir(dir, mode, recursive) {
     await mkdir(dir, { recursive, mode });
   },
-  async chmod(dir, mode) {
-    await chmod(dir, mode);
+  async lstat(file) {
+    const s = await lstat(file);
+    return {
+      isFile: () => s.isFile(),
+      isDirectory: () => s.isDirectory(),
+      isSymbolicLink: () => s.isSymbolicLink(),
+      mode: s.mode,
+    };
   },
-  async readFile(file) {
-    return (await readFile(file, "utf8")) as string;
+  async openReadNoFollow(file) {
+    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    return {
+      stat: async () => {
+        const s = await handle.stat();
+        return {
+          isFile: () => s.isFile(),
+          isDirectory: () => s.isDirectory(),
+          isSymbolicLink: () => s.isSymbolicLink(),
+          mode: s.mode,
+        };
+      },
+      readFile: async () => (await handle.readFile("utf8")) as string,
+      close: () => handle.close(),
+    };
   },
   async openWrite(file, mode): Promise<SessionWriteHandle> {
-    const handle = await open(file, "w", mode);
+    const handle = await open(
+      file,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      mode,
+    );
     return {
+      chmod: (nextMode) => handle.chmod(nextMode),
       writeFile: (data) => handle.writeFile(data),
       sync: () => handle.sync(),
       close: () => handle.close(),
@@ -92,15 +179,21 @@ const realFs: SessionStoreFs = {
     await rename(from, to);
   },
   async removeFile(file) {
-    await rm(file, { force: true });
-  },
-  async stat(file) {
-    const s = await stat(file);
-    return { isFile: () => s.isFile(), isDirectory: () => s.isDirectory(), mode: s.mode };
+    try {
+      await unlink(file);
+    } catch (err) {
+      if (!errnoIs(err, "ENOENT")) {
+        throw err;
+      }
+    }
   },
   async openDir(dir) {
-    const handle = await open(dir, "r");
-    return { sync: () => handle.sync(), close: () => handle.close() };
+    const handle = await open(dir, constants.O_RDONLY | constants.O_NOFOLLOW);
+    return {
+      chmod: (mode) => handle.chmod(mode),
+      sync: () => handle.sync(),
+      close: () => handle.close(),
+    };
   },
 };
 
@@ -118,6 +211,33 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
+function hasExactKeySet(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  if (Object.keys(value).length !== keys.length) {
+    return false;
+  }
+  return keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function isShaObject(value: unknown): value is string {
+  return typeof value === "string" && (value.length === 40 || value.length === 64) && /^[0-9a-f]+$/.test(value);
+}
+
+function isSha256Hex(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
 function corruptFail(tag: string): never {
   throw new SessionError("session_corrupt", undefined, { cause: `session_corrupt:${tag}` });
 }
@@ -126,6 +246,9 @@ function validateRules(value: unknown): ResolvedRules {
   if (!isPlainObject(value)) {
     corruptFail("rules:shape");
   }
+  if (!hasExactKeySet(value, ["source", "documents"])) {
+    corruptFail("rules:keys");
+  }
   if (typeof value["source"] !== "string" || !(RULES_SOURCES as readonly string[]).includes(value["source"])) {
     corruptFail("rules:source");
   }
@@ -133,16 +256,19 @@ function validateRules(value: unknown): ResolvedRules {
   if (!Array.isArray(documents)) {
     corruptFail("rules:documents");
   }
-  for (const document of documents) {
+  for (const [index, document] of documents.entries()) {
     if (!isPlainObject(document)) {
-      corruptFail("rules:document");
+      corruptFail(`rules:documents[${index}]:object`);
+    }
+    if (!hasExactKeySet(document, ["source", "content"])) {
+      corruptFail(`rules:documents[${index}]:keys`);
     }
     const source = document["source"];
     if (source !== "hook" && source !== "CLAUDE.md" && source !== "AGENTS.md") {
-      corruptFail("rules:document-source");
+      corruptFail(`rules:documents[${index}]:source`);
     }
     if (typeof document["content"] !== "string") {
-      corruptFail("rules:content");
+      corruptFail(`rules:documents[${index}]:content`);
     }
   }
   return value as unknown as ResolvedRules;
@@ -151,6 +277,14 @@ function validateRules(value: unknown): ResolvedRules {
 function validateOptions(value: unknown): SessionOptions {
   if (!isPlainObject(value)) {
     corruptFail("options:shape");
+  }
+  const expectedOptions = [
+    ...("reasoningEffort" in value ? ["reasoningEffort"] : []),
+    ...("contextTier" in value ? ["contextTier"] : []),
+    ...("outputReserveTokens" in value ? ["outputReserveTokens"] : []),
+  ];
+  if (!hasExactKeySet(value, expectedOptions)) {
+    corruptFail("options:keys");
   }
   const options: SessionOptions = {};
   if (value["reasoningEffort"] !== undefined) {
@@ -186,6 +320,9 @@ function validateWorkerResult(value: unknown): WorkerResult {
   if (!isPlainObject(value)) {
     corruptFail("workerResult:shape");
   }
+  if (!hasExactKeySet(value, ["schemaVersion", "summary", "edits"])) {
+    corruptFail("workerResult:keys");
+  }
   if (value["schemaVersion"] !== 1) {
     corruptFail("workerResult:schema");
   }
@@ -195,35 +332,275 @@ function validateWorkerResult(value: unknown): WorkerResult {
   if (!Array.isArray(value["edits"])) {
     corruptFail("workerResult:edits");
   }
-  return value as unknown as WorkerResult;
+
+  const edits: WorkerEdit[] = [];
+  const seenPaths = new Set<string>();
+  for (let index = 0; index < value["edits"].length; index++) {
+    const edit = value["edits"][index];
+    if (!isPlainObject(edit)) {
+      corruptFail(`workerResult:edits[${index}]:object`);
+    }
+    const kind = edit["kind"];
+    if (kind === "modify") {
+      if (!hasExactKeySet(edit, ["kind", "path", "operations"])) {
+        corruptFail(`workerResult:edits[${index}]:keys`);
+      }
+      const editPath = edit["path"];
+      if (typeof editPath !== "string" || editPath === "") {
+        corruptFail(`workerResult:edits[${index}]:path`);
+      }
+      if (seenPaths.has(editPath)) {
+        corruptFail(`workerResult:edits[${index}]:duplicate-path`);
+      }
+      seenPaths.add(editPath);
+      if (!Array.isArray(edit["operations"]) || edit["operations"].length === 0) {
+        corruptFail(`workerResult:edits[${index}]:operations`);
+      }
+      const operations = edit["operations"].map((operation, operationIndex) => {
+        if (!isPlainObject(operation)) {
+          corruptFail(`workerResult:edits[${index}].operations[${operationIndex}]:object`);
+        }
+        if (!hasExactKeySet(operation, ["search", "replace"])) {
+          corruptFail(`workerResult:edits[${index}].operations[${operationIndex}]:keys`);
+        }
+        if (typeof operation["search"] !== "string" || operation["search"] === "") {
+          corruptFail(`workerResult:edits[${index}].operations[${operationIndex}]:search`);
+        }
+        if (typeof operation["replace"] !== "string") {
+          corruptFail(`workerResult:edits[${index}].operations[${operationIndex}]:replace`);
+        }
+        return { search: operation["search"] as string, replace: operation["replace"] as string };
+      });
+      edits.push({ kind: "modify", path: editPath, operations });
+    } else if (kind === "create") {
+      if (!hasExactKeySet(edit, ["kind", "path", "content"])) {
+        corruptFail(`workerResult:edits[${index}]:keys`);
+      }
+      const editPath = edit["path"];
+      if (typeof editPath !== "string" || editPath === "") {
+        corruptFail(`workerResult:edits[${index}]:path`);
+      }
+      if (seenPaths.has(editPath)) {
+        corruptFail(`workerResult:edits[${index}]:duplicate-path`);
+      }
+      seenPaths.add(editPath);
+      if (typeof edit["content"] !== "string") {
+        corruptFail(`workerResult:edits[${index}]:content`);
+      }
+      edits.push({ kind: "create", path: editPath, content: edit["content"] as string });
+    } else if (kind === "delete") {
+      if (!hasExactKeySet(edit, ["kind", "path"])) {
+        corruptFail(`workerResult:edits[${index}]:keys`);
+      }
+      const editPath = edit["path"];
+      if (typeof editPath !== "string" || editPath === "") {
+        corruptFail(`workerResult:edits[${index}]:path`);
+      }
+      if (seenPaths.has(editPath)) {
+        corruptFail(`workerResult:edits[${index}]:duplicate-path`);
+      }
+      seenPaths.add(editPath);
+      edits.push({ kind: "delete", path: editPath });
+    } else {
+      corruptFail(`workerResult:edits[${index}]:kind`);
+    }
+  }
+
+  return {
+    schemaVersion: 1,
+    summary: (value["summary"] as string).trim(),
+    edits,
+  };
 }
 
 function validateValidation(value: unknown): ValidationResult {
   if (!isPlainObject(value)) {
     corruptFail("validation:shape");
   }
-  if (typeof value["editsRequested"] !== "number" || typeof value["editsApplied"] !== "number") {
+  if (!hasExactKeySet(value, ["editsRequested", "editsApplied", "rejected"])) {
+    corruptFail("validation:keys");
+  }
+  if (!isNonNegativeInteger(value["editsRequested"]) || !isNonNegativeInteger(value["editsApplied"])) {
     corruptFail("validation:count");
   }
   if (!Array.isArray(value["rejected"])) {
     corruptFail("validation:rejected");
   }
-  return value as unknown as ValidationResult;
+  const rejected = (value["rejected"] as unknown[]).map((entry, index) => {
+    if (!isPlainObject(entry)) {
+      corruptFail(`validation:rejected[${index}]:object`);
+    }
+    if (!hasExactKeySet(entry, ["file", "edit", "reason"])) {
+      corruptFail(`validation:rejected[${index}]:keys`);
+    }
+    if (typeof entry["file"] !== "string" || entry["file"] === "") {
+      corruptFail(`validation:rejected[${index}]:file`);
+    }
+    if (!isNonNegativeInteger(entry["edit"])) {
+      corruptFail(`validation:rejected[${index}]:edit`);
+    }
+    if (typeof entry["reason"] !== "string") {
+      corruptFail(`validation:rejected[${index}]:reason`);
+    }
+    return {
+      file: entry["file"] as string,
+      edit: entry["edit"] as number,
+      reason: entry["reason"] as string,
+    };
+  });
+  return {
+    editsRequested: value["editsRequested"] as number,
+    editsApplied: value["editsApplied"] as number,
+    rejected,
+  };
 }
 
-function validateResult(value: unknown, sessionId: string): CompactResult {
+function validateContextMetadata(value: unknown): void {
+  if (!isPlainObject(value) || !hasExactKeySet(value, ["runtimeMaxTokens", "inputTokens", "outputReserveTokens", "selectedContextTier", "truncatedReadonlyContext"])) {
+    corruptFail("result:context");
+  }
+  if (!isNonNegativeInteger(value["runtimeMaxTokens"]) || !isNonNegativeInteger(value["inputTokens"]) || !isNonNegativeInteger(value["outputReserveTokens"])) {
+    corruptFail("result:context-tokens");
+  }
+  if (!isContextTier(value["selectedContextTier"])) {
+    corruptFail("result:context-tier");
+  }
+  if (typeof value["truncatedReadonlyContext"] !== "boolean") {
+    corruptFail("result:context-truncated");
+  }
+}
+
+function validateDiffStats(value: unknown): void {
+  if (!isPlainObject(value) || !hasExactKeySet(value, ["files", "insertions", "deletions"])) {
+    corruptFail("result:diffStats");
+  }
+  if (!isNonNegativeInteger(value["files"]) || !isNonNegativeInteger(value["insertions"]) || !isNonNegativeInteger(value["deletions"])) {
+    corruptFail("result:diffStats-values");
+  }
+}
+
+function validateUsage(value: unknown): void {
+  if (!isPlainObject(value) || !hasExactKeySet(value, ["in", "out"])) {
+    corruptFail("result:usage");
+  }
+  if (!isNonNegativeInteger(value["in"]) || !isNonNegativeInteger(value["out"])) {
+    corruptFail("result:usage-values");
+  }
+}
+
+function validateSplitHint(value: unknown): void {
+  if (!isPlainObject(value)) {
+    corruptFail("result:splitHint");
+  }
+  const withoutGroups = ["availableMaxTokens", "outputReserveTokens", "pressureFiles", "requiredInputTokens"];
+  const withGroups = ["availableMaxTokens", "outputReserveTokens", "pressureFiles", "requiredInputTokens", "suggestedGroups"];
+  if (!hasExactKeySet(value, withoutGroups) && !hasExactKeySet(value, withGroups)) {
+    corruptFail("result:splitHint-keys");
+  }
+  if (!isNonNegativeInteger(value["requiredInputTokens"]) || !isNonNegativeInteger(value["availableMaxTokens"]) || !isNonNegativeInteger(value["outputReserveTokens"])) {
+    corruptFail("result:splitHint-tokens");
+  }
+  if (!isStringArray(value["pressureFiles"])) {
+    corruptFail("result:splitHint-pressureFiles");
+  }
+  if (Object.hasOwn(value, "suggestedGroups")) {
+    if (!Array.isArray(value["suggestedGroups"])) {
+      corruptFail("result:splitHint-suggestedGroups");
+    }
+    for (const group of value["suggestedGroups"] as unknown[]) {
+      if (!isStringArray(group)) {
+        corruptFail("result:splitHint-suggestedGroup");
+      }
+    }
+  }
+}
+
+function validateInferenceMetadata(value: unknown): void {
+  if (!isPlainObject(value) || !hasExactKeySet(value, ["conflict"])) {
+    corruptFail("result:inference");
+  }
+  const conflict = value["conflict"] as InferenceConflict;
+  if (conflict !== "splash" && conflict !== "mlx" && conflict !== "ollama" && conflict !== "unknown") {
+    corruptFail("result:inference-conflict");
+  }
+}
+
+function validateResult(value: unknown, sessionId: string, expectedRound?: number): CompactResult {
   if (!isPlainObject(value)) {
     corruptFail("result:shape");
   }
   if (value["sessionId"] !== sessionId) {
     corruptFail("result:sessionId");
   }
-  if (typeof value["round"] !== "number" || !Number.isInteger(value["round"]) || (value["round"] as number) < 1) {
+  if (!isPositiveInteger(value["round"])) {
     corruptFail("result:round");
+  }
+  if (expectedRound !== undefined && value["round"] !== expectedRound) {
+    corruptFail("result:round-mismatch");
   }
   if (typeof value["status"] !== "string" || !isCompactStatus(value["status"])) {
     corruptFail("result:status");
   }
+  if (!isString(value["rulesSource"]) || !(RULES_SOURCES as readonly string[]).includes(value["rulesSource"])) {
+    corruptFail("result:rulesSource");
+  }
+  if (!isStringArray(value["warnings"])) {
+    corruptFail("result:warnings");
+  }
+  if (typeof value["summary"] !== "string") {
+    corruptFail("result:summary");
+  }
+  if (!isStringArray(value["filesChanged"])) {
+    corruptFail("result:filesChanged");
+  }
+  validateContextMetadata(value["context"]);
+  validateDiffStats(value["diffStats"]);
+  validateValidation(value["validation"]);
+  validateUsage(value["usage"]);
+
+  const baseStatus = value["baseStatus"];
+  if (baseStatus !== "fresh" && baseStatus !== "stale") {
+    corruptFail("result:baseStatus");
+  }
+  const hasStaleFiles = Object.hasOwn(value, "staleFiles");
+  if (baseStatus === "stale" && !hasStaleFiles) {
+    corruptFail("result:staleFiles-missing");
+  }
+  if (baseStatus === "fresh" && hasStaleFiles) {
+    corruptFail("result:staleFiles-forbidden");
+  }
+  if (hasStaleFiles && !isStringArray(value["staleFiles"])) {
+    corruptFail("result:staleFiles");
+  }
+
+  const status = value["status"] as CompactStatus;
+  if (status === "stale_base" && baseStatus !== "stale") {
+    corruptFail("result:stale-base-status");
+  }
+  if ((status === "needs_split" || status === "inference_busy") && baseStatus !== "fresh") {
+    corruptFail("result:pre-inference-base-status");
+  }
+
+  const commonKeys = ["sessionId", "round", "status", "rulesSource", "context", "warnings", "baseStatus"];
+  const outcomeKeys = ["summary", "filesChanged", "diffStats", "validation", "usage"];
+  const expectedKeys = [
+    ...commonKeys,
+    ...(baseStatus === "stale" ? ["staleFiles"] : []),
+    ...outcomeKeys,
+    ...(status === "needs_split" ? ["splitHint"] : []),
+    ...(status === "inference_busy" ? ["inference"] : []),
+  ];
+  if (!hasExactKeySet(value, expectedKeys)) {
+    corruptFail("result:keys");
+  }
+
+  if (status === "needs_split") {
+    validateSplitHint(value["splitHint"]);
+  }
+  if (status === "inference_busy") {
+    validateInferenceMetadata(value["inference"]);
+  }
+
   return value as unknown as CompactResult;
 }
 
@@ -243,36 +620,277 @@ function validateRound(value: unknown, sessionId: string): PersistedRound {
   if (!isPlainObject(value)) {
     corruptFail("round:shape");
   }
-  if (typeof value["round"] !== "number" || !Number.isInteger(value["round"]) || (value["round"] as number) < 1) {
+  const hasFeedback = Object.hasOwn(value, "feedback");
+  if (!hasExactKeySet(value, hasFeedback ? ["round", "feedback", "workerResult", "validation", "result"] : ["round", "workerResult", "validation", "result"])) {
+    corruptFail("round:keys");
+  }
+  if (!isPositiveInteger(value["round"])) {
     corruptFail("round:round");
   }
-  if (value["feedback"] !== undefined && typeof value["feedback"] !== "string") {
+  if (value["round"] === 1 && hasFeedback) {
+    corruptFail("round:first-feedback");
+  }
+  if (value["round"] > 1 && !hasFeedback) {
+    corruptFail("round:refine-feedback-missing");
+  }
+  if (hasFeedback && typeof value["feedback"] !== "string") {
     corruptFail("round:feedback");
   }
-  validateWorkerResult(value["workerResult"]);
-  validateValidation(value["validation"]);
-  const result = validateResult(value["result"], sessionId);
-  if (result.round !== (value["round"] as number)) {
+  const workerResult = validateWorkerResult(value["workerResult"]);
+  const validation = validateValidation(value["validation"]);
+  const result = validateResult(value["result"], sessionId, value["round"]);
+  if (result.round !== value["round"]) {
     corruptFail("round:consistency");
   }
   const round: PersistedRound = {
     round: value["round"] as number,
-    workerResult: value["workerResult"] as unknown as WorkerResult,
-    validation: value["validation"] as unknown as ValidationResult,
+    workerResult,
+    validation,
     result,
   };
-  if (value["feedback"] !== undefined) {
+  if (hasFeedback) {
     round.feedback = value["feedback"] as string;
   }
   return round;
 }
 
+function isBase64(value: unknown): value is string {
+  return typeof value === "string" && value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value);
+}
+
+function validateCanonicalRepoPath(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    corruptFail(`${field}:type`);
+  }
+  const normalized = normalizeRepoPath(value);
+  if (normalized === null) {
+    corruptFail(`${field}:unsafe`);
+  }
+  return normalized;
+}
+
+/**
+ * Güvenli (KENDİ-yakaladığı) git-tree yoluna YAPISEL doğrulama — Step 9
+ * audit düzeltme A. `workspaceRecovery.basePaths` (tam `git ls-tree -r -z`
+ * haritası) ve `immutableBaseEntries`'in `path` alanları KULLANICI/WORKER
+ * girdisi DEĞİLDİR; bunlar için `normalizeRepoPath`'ın karakter-kümesi
+ * kuralı (backslash'ı her yerde red) POSIX'te backslash'li dosya adını
+ * takip EDEN dürüst repository'ların oturumlarını kalıcı `session_corrupt`
+ * yapardı (git: `ls-tree` aynen basar, `mktree` birebir aynı `tree`
+ * SHA'sını yeniden kurar — ölçüldü).
+ *
+ * Yapısal kural yalnızca repository dışına kaçış ya da `.git` yönetim
+ * alanı müdahalesi potansiyeli taşıyan formları reddeder (boş, NUL,
+ * mutlak, `..` bileşeni, tam `.git` bileşeni — bkz. `isTrustedTreePath`):
+ * değer AYNEN döner, alias normalizasyonu YOK (sessiz yeniden yazım
+ * fail-closed disiplinine aykırı).
+ *
+ * Güvenilmez (seçili/worker) yollar STRICT küme kuralında kalır
+ * (`validateCanonicalRepoPath`): `editablePaths`, `readonlyPaths`,
+ * `baseFingerprints`, `baseContents`, `currentCreatedPaths` — iki güven
+ * alanı, iki kural.
+ */
+function validateTrustedTreePath(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    corruptFail(`${field}:type`);
+  }
+  if (!isTrustedTreePath(value)) {
+    corruptFail(`${field}:path-unsafe`);
+  }
+  return value;
+}
+
+function validatePathFingerprint(value: unknown, field: string): PathFingerprint {
+  if (!isPlainObject(value)) {
+    corruptFail(`${field}:object`);
+  }
+  if (value["exists"] === false) {
+    if (!hasExactKeySet(value, ["exists"])) {
+      corruptFail(`${field}:absent-keys`);
+    }
+    return { exists: false };
+  }
+  if (value["exists"] !== true) {
+    corruptFail(`${field}:exists`);
+  }
+  const hasContent = Object.hasOwn(value, "contentSha256");
+  if (!hasExactKeySet(value, hasContent ? ["exists", "type", "mode", "contentSha256"] : ["exists", "type", "mode"])) {
+    corruptFail(`${field}:keys`);
+  }
+  const type = value["type"];
+  if (type !== "file" && type !== "symlink" && type !== "directory" && type !== "other") {
+    corruptFail(`${field}:type`);
+  }
+  const mode = value["mode"];
+  if (typeof mode !== "string" || mode === "") {
+    corruptFail(`${field}:mode`);
+  }
+  if (type === "file" || type === "symlink") {
+    if (!isSha256Hex(value["contentSha256"])) {
+      corruptFail(`${field}:content`);
+    }
+    return { exists: true, type, mode, contentSha256: value["contentSha256"] as string };
+  }
+  if (hasContent) {
+    corruptFail(`${field}:content-forbidden`);
+  }
+  return { exists: true, type, mode };
+}
+
+function validateBaseContentValue(value: unknown, field: string): BaseContentValue {
+  if (!isPlainObject(value)) {
+    corruptFail(`${field}:object`);
+  }
+  const type = value["type"];
+  if (type === "file") {
+    if (!hasExactKeySet(value, ["type", "base64"]) || !isBase64(value["base64"])) {
+      corruptFail(`${field}:file`);
+    }
+    return { type: "file", base64: value["base64"] as string };
+  }
+  if (type === "symlink") {
+    if (!hasExactKeySet(value, ["type", "target"]) || typeof value["target"] !== "string") {
+      corruptFail(`${field}:symlink`);
+    }
+    return { type: "symlink", target: value["target"] as string };
+  }
+  if (type === "absent") {
+    if (!hasExactKeySet(value, ["type"])) {
+      corruptFail(`${field}:absent`);
+    }
+    return { type: "absent" };
+  }
+  corruptFail(`${field}:type`);
+}
+
+function validateBaseTreeEntry(value: unknown, field: string): BaseTreeEntry {
+  if (!isPlainObject(value)) {
+    corruptFail(`${field}:object`);
+  }
+  const hasChildren = Object.hasOwn(value, "children");
+  if (!hasExactKeySet(value, hasChildren ? ["mode", "oid", "path", "children"] : ["mode", "oid", "path"])) {
+    corruptFail(`${field}:keys`);
+  }
+  const mode = value["mode"];
+  if (typeof mode !== "string" || mode === "") {
+    corruptFail(`${field}:mode`);
+  }
+  if (!isShaObject(value["oid"])) {
+    corruptFail(`${field}:oid`);
+  }
+  const entryPath = value["path"];
+  if (typeof entryPath !== "string" || entryPath === "") {
+    corruptFail(`${field}:path`);
+  }
+  // Self-captured ağaç girişi → yapısal güven alanı (audit düzeltme A):
+  // backslash'li yasal ad kabul; yalnız kaçış/`.git` formları red (bkz.
+  // `validateTrustedTreePath` dokümanı).
+  if (!isTrustedTreePath(entryPath)) {
+    corruptFail(`${field}:path-unsafe`);
+  }
+  if (mode === "040000") {
+    if (!hasChildren || !Array.isArray(value["children"])) {
+      corruptFail(`${field}:children-required`);
+    }
+    const children = (value["children"] as unknown[]).map((child, index) =>
+      validateBaseTreeEntry(child, `${field}.children[${index}]`),
+    );
+    return { mode, oid: value["oid"] as string, path: entryPath, children };
+  }
+  if (hasChildren) {
+    corruptFail(`${field}:children-forbidden`);
+  }
+  return { mode, oid: value["oid"] as string, path: entryPath };
+}
+
+function validateBaseCommitIdentity(value: unknown): BaseCommitIdentity {
+  if (
+    !isPlainObject(value) ||
+    !hasExactKeySet(value, [
+      "tree",
+      "parents",
+      "authorName",
+      "authorEmail",
+      "authorDate",
+      "committerName",
+      "committerEmail",
+      "committerDate",
+      "message",
+    ])
+  ) {
+    corruptFail("workspaceRecovery:baseCommitIdentity");
+  }
+  if (!isShaObject(value["tree"]) || !Array.isArray(value["parents"]) || (value["parents"] as unknown[]).some((entry) => !isShaObject(entry))) {
+    corruptFail("workspaceRecovery:baseCommitIdentity-oids");
+  }
+  const identity: BaseCommitIdentity = {
+    tree: value["tree"] as string,
+    parents: [...(value["parents"] as string[])],
+    authorName: value["authorName"] as string,
+    authorEmail: value["authorEmail"] as string,
+    authorDate: value["authorDate"] as string,
+    committerName: value["committerName"] as string,
+    committerEmail: value["committerEmail"] as string,
+    committerDate: value["committerDate"] as string,
+    message: value["message"] as string,
+  };
+  for (const field of ["authorName", "authorEmail", "authorDate", "committerName", "committerEmail", "committerDate"] as const) {
+    if ((identity[field] as string) === "") {
+      corruptFail(`workspaceRecovery:baseCommitIdentity:${field}`);
+    }
+  }
+  if (typeof identity.message !== "string") {
+    corruptFail("workspaceRecovery:baseCommitIdentity:message");
+  }
+  return identity;
+}
+
+function validateStringTupleArray(value: unknown, field: string): Array<readonly [string, string]> {
+  if (!Array.isArray(value)) {
+    corruptFail(`${field}:array`);
+  }
+  return (value as unknown[]).map((entry, index) => {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string" || typeof entry[1] !== "string") {
+      corruptFail(`${field}[${index}]:tuple`);
+    }
+    return [entry[0], entry[1]] as const;
+  });
+}
+
+/**
+ * `workspaceRecovery` durumunun fail-closed doğrulaması.
+ *
+ * İki güven alanı (Step 9 audit düzeltme A):
+ * - **Güvenli (self-captured)**: `basePaths` (tam `git ls-tree -r -z`) +
+ *   `immutableBaseEntries.path` → yapısal doğrulama (`validateTrustedTreePath`)
+ *   — backslash'li yasal POSIX adları kabul; yalnız kaçış/`.git` formları red.
+ * - **Güvenilmez (seçili/worker)**: `editablePaths`, `readonlyPaths`,
+ *   `baseFingerprints`, `baseContents`, `currentCreatedPaths` → STRICT
+ *   karakter-kümesi kuralı (`validateCanonicalRepoPath`), değer kanonikleştirilir.
+ */
 function validateWorkspaceRecovery(value: unknown, sessionId: string): WorkspaceRecoveryState {
-  // Hafif denetim: varlık + şema + kimlik + taban SHA. Derin git-ağaç
-  // doğrulaması Workspace'in `restoreGitWorktreeWorkspace` katmanındadır
-  // (spec 113: SessionManager/store Git iç mantığını bilmez).
   if (!isPlainObject(value)) {
     corruptFail("workspaceRecovery:shape");
+  }
+  if (
+    !hasExactKeySet(value, [
+      "schemaVersion",
+      "repoRoot",
+      "workspaceDir",
+      "sessionId",
+      "baseCommit",
+      "editablePaths",
+      "readonlyPaths",
+      "baseFingerprints",
+      "basePaths",
+      "immutableBaseEntries",
+      "baseCommitIdentity",
+      "baseContents",
+      "currentCreatedPaths",
+      "recoveryStateHash",
+    ])
+  ) {
+    corruptFail("workspaceRecovery:keys");
   }
   if (value["schemaVersion"] !== 1) {
     corruptFail("workspaceRecovery:schema");
@@ -280,10 +898,74 @@ function validateWorkspaceRecovery(value: unknown, sessionId: string): Workspace
   if (value["sessionId"] !== sessionId) {
     corruptFail("workspaceRecovery:sessionId");
   }
-  if (typeof value["baseCommit"] !== "string" || (value["baseCommit"] as string) === "") {
+  if (!isSafeSessionId(sessionId)) {
+    corruptFail("workspaceRecovery:sessionId-unsafe");
+  }
+  const repoRoot = value["repoRoot"];
+  if (typeof repoRoot !== "string" || !path.isAbsolute(repoRoot)) {
+    corruptFail("workspaceRecovery:repoRoot");
+  }
+  const workspaceDir = value["workspaceDir"];
+  if (typeof workspaceDir !== "string" || !path.isAbsolute(workspaceDir)) {
+    corruptFail("workspaceRecovery:workspaceDir");
+  }
+  if (!isShaObject(value["baseCommit"])) {
     corruptFail("workspaceRecovery:baseCommit");
   }
-  return value as unknown as WorkspaceRecoveryState;
+  if (!isStringArray(value["editablePaths"]) || !isStringArray(value["readonlyPaths"]) || !isStringArray(value["currentCreatedPaths"])) {
+    corruptFail("workspaceRecovery:paths");
+  }
+  if (!Array.isArray(value["baseFingerprints"]) || !Array.isArray(value["immutableBaseEntries"]) || !Array.isArray(value["baseContents"])) {
+    corruptFail("workspaceRecovery:arrays");
+  }
+  if (!isSha256Hex(value["recoveryStateHash"])) {
+    corruptFail("workspaceRecovery:hash");
+  }
+
+  const baseFingerprints = (value["baseFingerprints"] as unknown[]).map((entry, index) => {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string") {
+      corruptFail(`workspaceRecovery:baseFingerprints[${index}]`);
+    }
+    const fingerprint = validatePathFingerprint(entry[1], `workspaceRecovery:baseFingerprints[${index}]`);
+    return [validateCanonicalRepoPath(entry[0], `workspaceRecovery:baseFingerprints[${index}].path`), fingerprint] as const;
+  });
+  // Self-captured tam ağaç → YAPISEL güven alanı (audit düzeltme A):
+  // `validateTrustedTreePath` — karakter-kümesi kuralı, dürüst repository'daki
+  // backslash'li dosya adlarını kalıcı `session_corrupt` yapıyordu.
+  const basePaths = validateStringTupleArray(value["basePaths"], "workspaceRecovery:basePaths").map(
+    ([gitPath, mode], index) => [validateTrustedTreePath(gitPath, `workspaceRecovery:basePaths[${index}].path`), mode] as const,
+  );
+  const immutableBaseEntries = (value["immutableBaseEntries"] as unknown[]).map((entry, index) =>
+    validateBaseTreeEntry(entry, `workspaceRecovery:immutableBaseEntries[${index}]`),
+  );
+  const baseContents = (value["baseContents"] as unknown[]).map((entry, index) => {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string") {
+      corruptFail(`workspaceRecovery:baseContents[${index}]`);
+    }
+    return [
+      validateCanonicalRepoPath(entry[0], `workspaceRecovery:baseContents[${index}].path`),
+      validateBaseContentValue(entry[1], `workspaceRecovery:baseContents[${index}]`),
+    ] as const;
+  });
+
+  return {
+    schemaVersion: 1,
+    repoRoot,
+    workspaceDir,
+    sessionId,
+    baseCommit: value["baseCommit"] as string,
+    editablePaths: (value["editablePaths"] as string[]).map((entry) => validateCanonicalRepoPath(entry, "workspaceRecovery:editablePaths")),
+    readonlyPaths: (value["readonlyPaths"] as string[]).map((entry) => validateCanonicalRepoPath(entry, "workspaceRecovery:readonlyPaths")),
+    baseFingerprints,
+    basePaths,
+    immutableBaseEntries,
+    baseCommitIdentity: validateBaseCommitIdentity(value["baseCommitIdentity"]),
+    baseContents,
+    currentCreatedPaths: (value["currentCreatedPaths"] as string[]).map((entry) =>
+      validateCanonicalRepoPath(entry, "workspaceRecovery:currentCreatedPaths"),
+    ),
+    recoveryStateHash: value["recoveryStateHash"] as string,
+  };
 }
 
 // ── Depo ─────────────────────────────────────────────────────────────────────
@@ -355,11 +1037,20 @@ export class SessionStore {
     }
     const dir = this.#sessionDirFor(sessionId);
     try {
-      await this.#fs.mkdir(this.#sessionsDir, DIR_MODE, true);
-      await this.#fs.chmod(this.#sessionsDir, DIR_MODE);
+      await ensureDirectoryNoFollow(this.#fs, this.#sessionsDir, DIR_MODE);
+      const existing = await lstatOptional(this.#fs, dir);
+      if (existing !== null) {
+        if (existing.isSymbolicLink() || !existing.isDirectory()) {
+          throw sessionError("session_operation_failed", "unsafe session directory");
+        }
+        throw sessionError("session_conflict");
+      }
       await this.#fs.mkdir(dir, DIR_MODE, false); // exclusive: mevcut → EEXIST
-      await this.#fs.chmod(dir, DIR_MODE);
+      await setDirectoryModeNoFollow(this.#fs, dir, DIR_MODE);
     } catch (err) {
+      if (err instanceof SessionError) {
+        throw err;
+      }
       if (errnoIs(err, "EEXIST")) {
         throw sessionError("session_conflict");
       }
@@ -381,17 +1072,46 @@ export class SessionStore {
     if (!isSafeSessionId(sessionId)) {
       throw sessionError("session_not_found");
     }
-    const file = this.sessionFileFor(sessionId);
-    let raw: string;
+    const dir = this.#sessionDirFor(sessionId);
+    let dirStat: SessionStat;
     try {
-      raw = await this.#fs.readFile(file);
+      dirStat = await this.#fs.lstat(dir);
     } catch (err) {
-      // Dosya yok → henüz böyle bir oturum yok. Diğer I/O (EACCES/EIO...) →
-      // yetkili durum okunamıyor → bozuk (fail-closed); errno yüzeye taşınmaz.
       if (errnoIs(err, "ENOENT")) {
         throw sessionError("session_not_found");
       }
       throw sessionError("session_corrupt", err);
+    }
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      throw sessionError("session_corrupt", "unsafe session directory");
+    }
+
+    const file = this.sessionFileFor(sessionId);
+    let raw: string;
+    let handle: SessionReadHandle;
+    try {
+      handle = await this.#fs.openReadNoFollow(file);
+    } catch (err) {
+      // Dosya yok → henüz böyle bir oturum yok. Symlink (ELOOP) veya başka
+      // I/O (EACCES/EIO...) → yetkili durum güvenle okunamıyor → bozuk.
+      if (errnoIs(err, "ENOENT")) {
+        throw sessionError("session_not_found");
+      }
+      throw sessionError("session_corrupt", err);
+    }
+    try {
+      const fileStat = await handle.stat();
+      if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+        throw sessionError("session_corrupt", "session file is not a regular file");
+      }
+      raw = await handle.readFile();
+    } catch (err) {
+      if (err instanceof SessionError) {
+        throw err;
+      }
+      throw sessionError("session_corrupt", err);
+    } finally {
+      await handle.close().catch(() => undefined);
     }
 
     let parsed: unknown;
@@ -424,12 +1144,13 @@ export class SessionStore {
     const tmp = path.join(dir, SESSION_TMP);
 
     try {
-      await fs.mkdir(dir, DIR_MODE, true);
-      await fs.chmod(this.#sessionsDir, DIR_MODE);
-      await fs.chmod(dir, DIR_MODE);
+      await ensureDirectoryNoFollow(fs, this.#sessionsDir, DIR_MODE);
+      await ensureDirectoryNoFollow(fs, dir, DIR_MODE);
+      await removeStaleTmpNoFollow(fs, tmp);
 
       const handle = await fs.openWrite(tmp, FILE_MODE);
       try {
+        await handle.chmod(FILE_MODE);
         await handle.writeFile(JSON.stringify(session, null, 2));
         await handle.sync();
       } finally {
@@ -437,10 +1158,15 @@ export class SessionStore {
       }
       await fs.rename(tmp, file);
 
+      const fileStat = await fs.lstat(file);
+      if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+        throw sessionError("session_persistence_failed", "session file is not a regular file");
+      }
+
       // Dizin fsync'i — "where supported": desteklemeyen dosya sistemlerinde
       // (ör. bazı ağ/paylaşımlı FS'ler) sessizce geçilir; dosya fsync'i +
       // rename zaten yetkili içeriği sağlamıştır.
-      let dirHandle: { sync(): Promise<void>; close(): Promise<void> } | undefined;
+      let dirHandle: SessionDirHandle | undefined;
       try {
         dirHandle = await fs.openDir(dir);
         await dirHandle.sync();
@@ -450,7 +1176,7 @@ export class SessionStore {
         await dirHandle?.close().catch(() => undefined);
       }
     } catch (err) {
-      await fs.removeFile(tmp).catch(() => undefined);
+      await removeStaleTmpNoFollow(fs, tmp).catch(() => undefined);
       throw sessionError("session_persistence_failed", err);
     }
   }
@@ -464,6 +1190,31 @@ export class SessionStore {
   #validate(raw: unknown, requestedId: string): PersistedSession {
     if (!isPlainObject(raw)) {
       corruptFail("root:shape");
+    }
+    const requiredKeys = [
+      "schemaVersion",
+      "sessionId",
+      "repoRoot",
+      "repoId",
+      "task",
+      "rules",
+      "options",
+      "editablePaths",
+      "readonlyPaths",
+      "workspaceRecovery",
+      "round",
+      "maxRoundsAcknowledged",
+      "rounds",
+      "currentCreatedPaths",
+    ];
+    const expectedKeys = [
+      ...requiredKeys,
+      ...(raw["latestResult"] !== undefined ? ["latestResult"] : []),
+      ...(raw["latestWorkerResult"] !== undefined ? ["latestWorkerResult"] : []),
+      ...(raw["latestWorkspaceStateHash"] !== undefined ? ["latestWorkspaceStateHash"] : []),
+    ];
+    if (!hasExactKeySet(raw, expectedKeys)) {
+      corruptFail("root:keys");
     }
     if (raw["schemaVersion"] !== SESSION_SCHEMA_VERSION) {
       corruptFail("schemaVersion");
@@ -480,6 +1231,10 @@ export class SessionStore {
     const repoRoot = raw["repoRoot"];
     if (typeof repoRoot !== "string" || repoRoot === "") {
       corruptFail("repoRoot:type");
+    }
+    // F-2: repo kökü mutlak olmalı (bağlamsal/özel kök — bozuk durum).
+    if (!path.isAbsolute(repoRoot)) {
+      corruptFail("repoRoot:not-absolute");
     }
     const repoId = raw["repoId"];
     if (typeof repoId !== "string" || repoId === "") {
@@ -501,6 +1256,12 @@ export class SessionStore {
     const readonlyPaths = this.#validateCanonicalPathArray(raw["readonlyPaths"], "readonlyPaths");
 
     const workspaceRecovery = validateWorkspaceRecovery(raw["workspaceRecovery"], sessionId);
+    // F-2: kurtarma durumu BİREBİR aynı repo kökünü taşımalı — oturum köküyle
+    // ayrışan çift, kurtarma sırasında yanlış repo'ya işletebilir (bozuk durum).
+    // Mesaj/yol YOK: yalnız neden etiketi (spec 12/17).
+    if (workspaceRecovery.repoRoot !== repoRoot) {
+      corruptFail("workspaceRecovery:repoRoot-mismatch");
+    }
 
     const round = raw["round"];
     if (typeof round !== "number" || !Number.isInteger(round) || round < 0) {
@@ -563,13 +1324,13 @@ export class SessionStore {
     // İsteğe bağlı son-durum alanları — yalnız var olduğunda (boşta `undefined`
     // değil). Her biri yapısal olarak doğrulanır (spec 317).
     if (raw["latestResult"] !== undefined) {
-      session.latestResult = validateResult(raw["latestResult"], sessionId);
+      session.latestResult = validateResult(raw["latestResult"], sessionId, round > 0 ? round : undefined);
     }
     if (raw["latestWorkerResult"] !== undefined) {
       session.latestWorkerResult = validateWorkerResult(raw["latestWorkerResult"]);
     }
     if (raw["latestWorkspaceStateHash"] !== undefined) {
-      if (typeof raw["latestWorkspaceStateHash"] !== "string" || !/^[0-9a-f]{64}$/.test(raw["latestWorkspaceStateHash"] as string)) {
+      if (!isSha256Hex(raw["latestWorkspaceStateHash"])) {
         corruptFail("latestWorkspaceStateHash:format");
       }
       session.latestWorkspaceStateHash = raw["latestWorkspaceStateHash"] as string;

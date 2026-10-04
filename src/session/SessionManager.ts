@@ -174,7 +174,7 @@ export interface SessionManagerDeps {
    * Worktree kurtarma (varsayılan: `restoreGitWorktreeWorkspace`). Testler
    * instrument edilmiş restorer enjekte eder.
    */
-  restoreWorkspace?: (state: WorkspaceRecoveryState) => Promise<Workspace>;
+  restoreWorkspace?: (state: WorkspaceRecoveryState, options: { expectedWorkspaceDir: string }) => Promise<Workspace>;
   /**
    * Kalıcılık deposu (varsayılan: gerçek `SessionStore` —
    * `node:fs/promises`). Testler sahte `SessionStoreFs` ile kurar.
@@ -232,7 +232,7 @@ export class SessionManager {
   #workerContract: RoundWorkerContract;
   #rulesResolver: RulesResolverLike;
   #createWorkspace: WorkspaceFactory;
-  #restoreWorkspace: (state: WorkspaceRecoveryState) => Promise<Workspace>;
+  #restoreWorkspace: (state: WorkspaceRecoveryState, options: { expectedWorkspaceDir: string }) => Promise<Workspace>;
   #store: SessionStoreLike;
   #repoIdentity: (canonicalRepoRoot: string) => string;
   #newSessionId: () => string;
@@ -263,7 +263,8 @@ export class SessionManager {
     this.#workerContract = deps.workerContract ?? new WorkerContract();
     this.#rulesResolver = deps.rulesResolver ?? new RulesResolver();
     this.#createWorkspace = deps.createWorkspace ?? ((input) => createGitWorktreeWorkspace(input));
-    this.#restoreWorkspace = deps.restoreWorkspace ?? ((state) => restoreGitWorktreeWorkspace(state));
+    this.#restoreWorkspace =
+      deps.restoreWorkspace ?? ((state, options) => restoreGitWorktreeWorkspace(state, options));
     this.#repoIdentity = deps.repoIdentity ?? computeRepoId;
     this.#store = deps.store ?? new SessionStore(deps.config.outputRoot, { repoIdentity: this.#repoIdentity });
     this.#newSessionId = deps.newSessionId ?? (() => randomUUID());
@@ -773,7 +774,8 @@ export class SessionManager {
     // Worktree kurtarma (kimlik + hash → reuse / mismatch → recreate).
     let workspace: Workspace;
     try {
-      workspace = await this.#restoreWorkspace(session.workspaceRecovery);
+      const expectedWorkspaceDir = path.join(this.#store.sessionDirFor(session.sessionId), "workspace");
+      workspace = await this.#restoreWorkspace(session.workspaceRecovery, { expectedWorkspaceDir });
     } catch (err) {
       if (err instanceof WorkspaceError) {
         throw sessionError("session_recovery_failed", err);

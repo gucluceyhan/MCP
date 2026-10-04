@@ -1209,6 +1209,22 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
     patch, check the base before every refine, accumulate read-only references,
     reduce history by the fixed priority, and keep `max_rounds`
     acknowledgement durable. `dispose()` preserves durable sessions.
+    **Security-audit fixes (2026-10-03):** the persisted `workspaceRecovery`
+    has **two trust domains**. Self-captured tree data — `basePaths` (the
+    full `git ls-tree -r -z` map) and the `path` fields of
+    `immutableBaseEntries` (git's own names) — is validated
+    **structurally** on load: only escape / management-area forms (empty,
+    NUL, absolute, `..` segment, exact `.git` segment) fail closed with
+    `session_corrupt`; a backslash inside a file name is legal (POSIX), so a
+    session of an honest repository that merely *tracks* a backslash-named
+    file round-trips instead of being permanently unloadable. The
+    user/worker-selected fields (`editablePaths`, `readonlyPaths`,
+    `baseFingerprints`, `baseContents`, `currentCreatedPaths`) keep the
+    strict character-set rule (`normalizeRepoPath`) — no untrusted input is
+    ever relaxed. `restoreGitWorktreeWorkspace` emits the same stable
+    `unsafe_path` kind as creation when `canonicalizeOutside` rejects a
+    directory that falls inside the repository (the canonical-mismatch case
+    stays `invalid_input`).
 10. **`splash_diff` + `splash_close`** — on-demand diff; **complete
     `--binary --full-index`** patch export; destroy (stale never blocks; an
     export failure preserves the session).

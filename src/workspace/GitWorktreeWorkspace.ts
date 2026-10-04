@@ -120,6 +120,7 @@ import {
   resolveContained,
   symlinkTargetStaysInside,
 } from "./pathSafety.js";
+import { errnoIs } from "./SafeRepoReader.js";
 import { captureLiveFingerprint, gitModeType, normalizeGitFileMode, sha256Hex } from "./fingerprint.js";
 import { validateWorkerResult, type EditPlan, type WorkspaceBase } from "./validate.js";
 
@@ -2160,7 +2161,10 @@ async function captureBase(
  * kalıcının kendisidir. SessionManager `recoveryStateHash()`'ı kalıcı hash'le
  * karşılaştırıp (spec 120/121) gerekirse son worker sonucunu yeniden uygular.
  */
-export async function restoreGitWorktreeWorkspace(state: WorkspaceRecoveryState): Promise<GitWorktreeWorkspace> {
+export async function restoreGitWorktreeWorkspace(
+  state: WorkspaceRecoveryState,
+  options: { expectedWorkspaceDir: string },
+): Promise<GitWorktreeWorkspace> {
   // ── kimlik + yol güvenliği (spec 106/190) ─────────────────────────────────
   if (state.schemaVersion !== 1) {
     throw new WorkspaceError("invalid_input", "The recovery state has an unsupported schema version");
@@ -2171,14 +2175,47 @@ export async function restoreGitWorktreeWorkspace(state: WorkspaceRecoveryState)
   if (typeof state.workspaceDir !== "string" || !path.isAbsolute(state.workspaceDir)) {
     throw new WorkspaceError("invalid_input", "The workspace directory must be an absolute path");
   }
+  if (typeof options.expectedWorkspaceDir !== "string" || !path.isAbsolute(options.expectedWorkspaceDir)) {
+    throw new WorkspaceError("invalid_input", "The expected workspace directory must be an absolute path");
+  }
   if (!isSafeSessionId(state.sessionId)) {
     throw new WorkspaceError("invalid_input", "The session id is not a safe identifier");
   }
   const repoRoot = path.resolve(state.repoRoot);
-  const workspaceDir = await canonicalizeOutside(path.resolve(state.workspaceDir), repoRoot);
-  if (workspaceDir === null) {
+  const persistedWorkspaceDir = path.resolve(state.workspaceDir);
+  const expectedWorkspaceDir = path.resolve(options.expectedWorkspaceDir);
+  const persistedStat = await lstatWorkspaceDirectory(persistedWorkspaceDir);
+  if (persistedStat !== null && (persistedStat.isSymbolicLink() || !persistedStat.isDirectory())) {
+    throw new WorkspaceError("unsafe_path", "The workspace directory must be a real directory");
+  }
+  // F-1: KANONIK (realpath) karşılaştırma. Sözdizimsel karşılaştırma, bir
+  // `outputRoot` atalı sembolik bağlantı olduğunda (macOS `/var` →
+  // `/private/var`, CI tmp kökleri) AYNI fiziksel dizinin kalıcı (kanonik)
+  // formunu güvenilen (sözdizimsel) formundan farklı görürdü ve meşru
+  // oturumu sahte pozitif REDDEDİYORDU. İki form da `canonicalizeOutside`
+  // ile kanonikleştirilir; kanonik formlar EŞİT olmalı.
+  // Step 9 audit düzeltme B: `canonicalizeOutside`'in `null` sonucu BİR
+  // YOL GÜVENLİĞİ İHLALİDİR (repo içine/üstüne düşen dizin) — creation
+  // yolundaki (bkz. `createGitWorktreeWorkspace`) ile BİREBİR aynı
+  // `unsafe_path` kind'ı. Stabil kind: "girdi sözleşmesine uymuyor"
+  // (`invalid_input`) ile "güvenlik sınırı aşıldı" (`unsafe_path`)
+  // ayrımı — aynı ihlal, iki çağrı yolunda iki farklı kind üretmemeli.
+  const canonicalPersisted = await canonicalizeOutside(persistedWorkspaceDir, repoRoot);
+  if (canonicalPersisted === null) {
     throw new WorkspaceError("unsafe_path", "The workspace directory must be outside the repository");
   }
+  const canonicalExpected = await canonicalizeOutside(expectedWorkspaceDir, repoRoot);
+  if (canonicalExpected === null) {
+    throw new WorkspaceError("unsafe_path", "The workspace directory must be outside the repository");
+  }
+  // Kanonik formlar farklı → kimlik uyuşmazlığı (güvenlik ihlali DEĞİL —
+  // her iki yol da repo dışında, yalnız farklı dizinler) → `invalid_input`.
+  if (canonicalPersisted !== canonicalExpected) {
+    throw new WorkspaceError("invalid_input", "The recovery state does not match the trusted workspace path");
+  }
+  // Güvenilen (trusted) tarafın kanonik formu çalışır dizindir: sonraki
+  // tüm kontrol/operasyon (materialize/destroy/recreate) bunu kullanır.
+  const workspaceDir = canonicalExpected;
 
   // ── immutable snapshot yeniden kurulumu (spec 105/115: main'den YOK) ──────
   const baseFingerprints = new Map<string, PathFingerprint>(state.baseFingerprints);
@@ -2247,12 +2284,39 @@ export async function restoreGitWorktreeWorkspace(state: WorkspaceRecoveryState)
  * Ana depoya ASLA yazmaz; yalnız `git worktree add/remove` (paylaşılan
  * `.git/worktrees/` yönetim alanı) + izolö worktree dizini.
  */
+/**
+ * `lstat` için errno sınıflaması (F-3): YALNIZ `ENOENT` "yok" (null) sayılır.
+ * Diğer her hata (EACCES/EIO/ELOOP/ENOTDIR/...) "bilinmeyen durum"dur ve
+ * fail-closed: durum doğrulanamayan dizin ASLA yokmuş gibi işlenemez — yok
+ * saymak, sonradaki yıkıcı işlemleri (remove/rm/recreate) doğrulanmamış bir
+ * hedefe yürütürdü. Hata SABİТ güvenli mesajla WorkspaceError'a çevrilir
+ * (yol/errno/İÇERİK mesajda YOK).
+ */
+async function lstatWorkspaceDirectory(target: string): Promise<Stats | null> {
+  try {
+    return await lstat(target);
+  } catch (err) {
+    if (errnoIs(err, "ENOENT")) {
+      return null;
+    }
+    throw new WorkspaceError("unsafe_path", "The workspace directory must be a real directory");
+  }
+}
+
+async function assertRealWorkspaceDirectory(workspaceDir: string): Promise<void> {
+  const dirStat = await lstatWorkspaceDirectory(workspaceDir);
+  if (dirStat !== null && (dirStat.isSymbolicLink() || !dirStat.isDirectory())) {
+    throw new WorkspaceError("unsafe_path", "The workspace directory must be a real directory");
+  }
+}
+
 async function materializeWorkspace(
   workspace: GitWorktreeWorkspace,
   state: WorkspaceRecoveryState,
   repoRoot: string,
   workspaceDir: string,
 ): Promise<void> {
+  await assertRealWorkspaceDirectory(workspaceDir);
   const dirStat = await lstat(workspaceDir).catch(() => null);
   const dirExists = dirStat !== null && dirStat.isDirectory();
 
@@ -2293,6 +2357,7 @@ async function worktreeIdentityMatches(workspaceDir: string, baseCommit: string)
  * repo-DIŞI worktree dizinidir — kullanıcı verisi DEĞİLDİR.
  */
 async function destroyWorktreeSafely(repoRoot: string, workspaceDir: string): Promise<void> {
+  await assertRealWorkspaceDirectory(workspaceDir);
   await runGit(["worktree", "remove", "--force", workspaceDir], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] }).catch(
     () => undefined,
   );
@@ -2307,6 +2372,7 @@ async function destroyWorktreeSafely(repoRoot: string, workspaceDir: string): Pr
  * tamamlanamazsa fail-closed (kısmi rekonstrüksiyon YOK, spec 275).
  */
 async function recreateWorktree(state: WorkspaceRecoveryState, repoRoot: string, workspaceDir: string): Promise<void> {
+  await assertRealWorkspaceDirectory(workspaceDir);
   // `git worktree add` hedef dizinin yok/boş olmasını şart koşar.
   await rm(workspaceDir, { recursive: true, force: true }).catch(() => undefined);
 

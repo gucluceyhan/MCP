@@ -226,7 +226,9 @@ export const COMPACT_STATUSES: readonly string[] = [
 
 /** Atomik yazım için dosya kolu — `node:fs/promises` `FileHandle` yapısal eşleşir. */
 export interface SessionWriteHandle {
-  /** Tüm veriyi yazar (handle 'w' ile açıldı → truncate). */
+  /** Açılan kolu üzerinden izinleri zorlar (yol tekrar çözülmez). */
+  chmod(mode: number): Promise<void>;
+  /** Tüm veriyi yazar (handle exclusive/no-follow ile açıldı → truncate). */
   writeFile(data: string): Promise<void>;
   /** Dosya içeriğini depolamaya yansıtır (spec 14: fsync file). */
   sync(): Promise<void>;
@@ -234,16 +236,29 @@ export interface SessionWriteHandle {
   close(): Promise<void>;
 }
 
-/** Dizin fsync'i için kolu (spec 14: fsync directory where supported). */
-export interface SessionSyncHandle {
+/** Yetkili oturum dosyası için salt-okunur, no-follow kolu. */
+export interface SessionReadHandle {
+  /** Açılan kol üzerinden stat alır; symlink takibi `open` aşamasında reddedilir. */
+  stat(): Promise<SessionStat>;
+  /** Açılan kol üzerinden UTF-8 içerik okur. */
+  readFile(): Promise<string>;
+  /** Kolu kapatır (her yolda, `finally`). */
+  close(): Promise<void>;
+}
+
+/** Dizin fsync/izin için no-follow kolu (spec 14: fsync directory where supported). */
+export interface SessionDirHandle {
+  /** Açılan dizin kolundan izinleri zorlar (yol tekrar çözülmez). */
+  chmod(mode: number): Promise<void>;
   sync(): Promise<void>;
   close(): Promise<void>;
 }
 
-/** `stat` için minimal görünüm — `node:fs` `Stats` yapısal eşleşir. */
+/** `lstat`/handle-stat için minimal görünüm — `node:fs` `Stats` yapısal eşleşir. */
 export interface SessionStat {
   isFile(): boolean;
   isDirectory(): boolean;
+  isSymbolicLink(): boolean;
   /** `stat.st_mode` (izin bitleri alt 12 bit). */
   readonly mode: number;
 }
@@ -264,18 +279,22 @@ export interface SessionStoreFs {
    * `mode` (0700) yaprağa uygulanır.
    */
   mkdir(dir: string, mode: number, recursive: boolean): Promise<void>;
-  /** Mevcut dizinin `mode`'unu (0700) zorlar. */
-  chmod(dir: string, mode: number): Promise<void>;
-  /** Metin dosyasını okur (UTF-8); dosya yoksa/okunamıyorsa hatayı aynen atar. */
-  readFile(path: string): Promise<string>;
-  /** `path`'i yazmak için `mode` (0600) ile açar. */
+  /** `path`'in son bileşenini stat'ler; symlink takip ETMEZ; yoksa hatayı aynen atar. */
+  lstat(path: string): Promise<SessionStat>;
+  /**
+   * `path`'i salt-okunur ve `O_NOFOLLOW` ile açar; symlink/düzenli-dışı hedef
+   * open'da reddedilir. İzin/okuma/tip denetimi açılan kol üzerinden yapılır.
+   */
+  openReadNoFollow(path: string): Promise<SessionReadHandle>;
+  /**
+   * `path`'i `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` + `mode` (0600) ile
+   * exclusive açar; var olan dosya/dosya-dışı hedef izlenmez/ezilmez.
+   */
   openWrite(path: string, mode: number): Promise<SessionWriteHandle>;
   /** `from`'ı `to`'ya atomik olarak yeniden adlandırır (spec 14: rename). */
   rename(from: string, to: string): Promise<void>;
-  /** `path`'i siler; `force` — yoksa (ENOENT) sessizce geçer. */
+  /** `path`'i `unlink` ile siler; yoksa (ENOENT) sessizce geçer, symlink takibi YOK. */
   removeFile(path: string): Promise<void>;
-  /** `path`'in durumunu döndürür; var değilse hatayı aynen atar. */
-  stat(path: string): Promise<SessionStat>;
-  /** Dizin fsync'i için `dir`'ı salt-okunur açar (spec 14: fsync directory). */
-  openDir(dir: string): Promise<SessionSyncHandle>;
+  /** Dizin fsync/izin için `dir`'ı no-follow salt-okunur açar (spec 14). */
+  openDir(dir: string): Promise<SessionDirHandle>;
 }
