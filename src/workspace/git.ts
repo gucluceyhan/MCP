@@ -8,6 +8,10 @@
  *
  * Ortam güvenliği (spec 6): her çağrıya deterministik, etkileşimsiz ortam
  * verilir (`GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`) — git asla prompt açmaz.
+ * Miras alınan repo-yerel değişkenler (`GIT_DIR`, `GIT_WORK_TREE`,
+ * `GIT_INDEX_FILE`, … — `--local-env-vars`) süzülür; tembel promisor çekme
+ * kapalıdır (`GIT_NO_LAZY_FETCH=1`; git < 2.44 bunu yok sayar → promisor'lı
+ * repo oluşturma/kurtarmada `assertPartialCloneSupported` ile reddedilir).
  * Hook çalıştırabilecek her komuta `-c core.hooksPath=<devnull>` verilir;
  * repo-tanımı hook'lar ve kullanıcı shell komutları asla çalıştırılmaz.
  * `core.fsmonitor` da her çağrıya merkezi olarak devre dışı verilir
@@ -60,6 +64,169 @@ export function literalPathspec(p: string): string {
   return `:(literal)${p}`;
 }
 
+/**
+ * Miras alınan ortamdan süzülen repo-yerel değişkenler — `git rev-parse
+ * --local-env-vars` listesi (ölçüldü, Apple Git 2.50.1). `GIT_CONFIG_GLOBAL`
+ * / `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM` listede DEĞİL ve korunur
+ * (kullanıcı/sistem-düzeyi config). Komut kapsamı config
+ * (`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` — `safe.directory` dahil)
+ * ortamdan VERİLEMEZ: `core.worktree` gibi bir ayar çalışma ağacını
+ * yönlendirebilir; global/sistem config kullanılmalı.
+ */
+const REPO_LOCAL_ENV_VARS: ReadonlySet<string> = new Set([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_GRAFT_FILE",
+  "GIT_INDEX_FILE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
+  "GIT_COMMON_DIR",
+]);
+
+/** `GIT_CONFIG_COUNT`'un eşlikçileri (`GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`). */
+const GIT_CONFIG_PAIR_ENV = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/;
+
+/**
+ * Git çocuk süreç ortamını kurar (SAF — inceleme W-H1/W-M2/LOW-3): `base`
+ * kopyalanır (DEĞİŞTİRİLMEZ), repo-yerel miras değişkenleri silinir, sonra
+ * `extra` (çağrı noktası) ve EN SON güvenlik sabitleri yazılır — `extra`
+ * sabitleri gölgeleyemez.
+ *
+ * Süzme gerekçesi: MCP süreci mutlak `GIT_DIR`/`GIT_WORK_TREE` (vb.) ile
+ * başlatılmışsa worktree komutları (`add -A`, `commit`, `reset --hard`)
+ * `cwd`'yi yok sayıp ANA repoya giderdi (ölçüldü: ana dala commit + index
+ * kirlenmesi). Repo her zaman `cwd`'den keşfedilir.
+ */
+export function buildGitEnv(base: NodeJS.ProcessEnv, extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const key of Object.keys(env)) {
+    if (REPO_LOCAL_ENV_VARS.has(key) || GIT_CONFIG_PAIR_ENV.test(key)) {
+      delete env[key];
+    }
+  }
+  return Object.assign(env, extra, {
+    // Etkileşimsiz + deterministik (spec 6): asla prompt, asla yerel format.
+    GIT_TERMINAL_PROMPT: "0",
+    LC_ALL: "C",
+    // Partial clone'da eksik nesne promisor remote'tan TEMBEL çekilmez
+    // (inceleme W-M2): okuma komutu ağa/transport'a (repo config'indeki
+    // `remote.*.uploadpack`/`core.sshCommand` vb.) çıkamaz; repo config'i
+    // bunu ezemez. YALNIZ git ≥ 2.44'te etkilidir — eski git sessizce yok
+    // sayar; o durum `assertPartialCloneSupported` ile kapatılır. BEDELİ:
+    // yerelde olmayan bir nesneye ihtiyaç duyan komut (örn. `worktree add`
+    // checkout'u) fail-closed hata verir.
+    GIT_NO_LAZY_FETCH: "1",
+  });
+}
+
+/** `git --version` çıktısından `[major, minor, patch]`; ayrıştırılamazsa `null`. */
+export function parseGitVersion(output: string): readonly [number, number, number] | null {
+  const match = /^git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(output.trim());
+  if (match === null) {
+    return null;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? "0")];
+}
+
+/**
+ * SAF karar (inceleme MEDIUM-1): bu git + bu repo için tembel promisor
+ * çekme KAPATILAMIYOR mu? `true` → oluşturma/kurtarma reddedilir.
+ * - promisor yok → `false` (çekilecek remote yok);
+ * - promisor var + git ≥ 2.44 → `false` (`GIT_NO_LAZY_FETCH` etkili);
+ * - promisor var + git < 2.44 ya da sürüm AYRIŞTIRILAMADI → `true`
+ *   (güvenli taraf: eski say).
+ */
+export function partialCloneUnsupported(gitVersionOutput: string, promisorConfigured: boolean): boolean {
+  if (!promisorConfigured) {
+    return false;
+  }
+  const version = parseGitVersion(gitVersionOutput);
+  if (version === null) {
+    return true;
+  }
+  const [major, minor] = version;
+  return major !== 2 ? major < 2 : minor < 44;
+}
+
+/**
+ * `git --version` önbelleği — anahtar `PATH`: `spawn("git")` ikiliyi ortamın
+ * `PATH`'iyle çözer; farklı `PATH` farklı git olabilir. Yalnız BAŞARILI
+ * okumalar önbelleğe girer (hata → boş metin → ayrıştırılamaz → eski say).
+ */
+const gitVersionCache = new Map<string, string>();
+
+async function readGitVersion(): Promise<string> {
+  const key = process.env.PATH ?? "";
+  const cached = gitVersionCache.get(key);
+  if (cached !== undefined) {
+    return cached;
+  }
+  try {
+    // `--version` repo gerektirmez; `cwd` repo yolundan bağımsız (var olmayan
+    // bir kurtarma kökü sürüm okumasını bozmasın).
+    const text = (await runGit(["--version"], { cwd: os.tmpdir() })).stdout.toString("utf8").trim();
+    gitVersionCache.set(key, text);
+    return text;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Salt-okunur `git config` okuması (ana repoda): çıkış 1 = anahtar yok →
+ * `null`; başka her hata ATILIR (çağıran güvenli tarafa düşer).
+ */
+async function readRepoConfig(repoRoot: string, args: readonly string[]): Promise<string | null> {
+  try {
+    return (await runGit(["config", ...args], { cwd: repoRoot })).stdout.toString("utf8");
+  } catch (err) {
+    if (err instanceof WorkspaceError && (err.cause as { exitCode?: unknown } | undefined)?.exitCode === 1) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Repo bir promisor remote taşıyor mu? `extensions.partialClone` (eski
+ * biçim) ya da herhangi bir `remote.<ad>.promisor=true` (ölçüldü, Git
+ * 2.50.1 `--filter=blob:none` klonu yalnız ikincisini yazar). Okunamazsa
+ * → `true` (güvenli taraf; yalnız eski git'te redde dönüşür).
+ */
+async function promisorConfigured(repoRoot: string): Promise<boolean> {
+  try {
+    const extension = await readRepoConfig(repoRoot, ["--get", "extensions.partialclone"]);
+    if (extension !== null && extension.trim() !== "") {
+      return true;
+    }
+    const remotes = await readRepoConfig(repoRoot, ["--bool", "--get-regexp", "^remote\\..*\\.promisor$"]);
+    return remotes !== null && remotes.split("\n").some((line) => line.trimEnd().endsWith(" true"));
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Oluşturma + kurtarma kapısı (inceleme MEDIUM-1): git < 2.44
+ * `GIT_NO_LAZY_FETCH`'i sessizce yok sayar → promisor'lı bir repoda eksik
+ * nesne okuması repo config'indeki transport programlarını
+ * (`remote.*.uploadpack`, `core.sshCommand`) host'ta çalıştırabilir. Böyle
+ * bir repo SABİT güvenli mesajla reddedilir; ≥ 2.44 → davranış değişmez.
+ */
+export async function assertPartialCloneSupported(repoRoot: string): Promise<void> {
+  if (partialCloneUnsupported(await readGitVersion(), await promisorConfigured(repoRoot))) {
+    throw new WorkspaceError("invalid_repository", "Partial clone repositories require Git 2.44 or newer");
+  }
+}
+
 /** Varsayılan git çağrı zaman aşımı (büyük repo diff'leri için cömert). */
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -76,7 +243,7 @@ export interface GitRunOptions {
   config?: readonly string[];
   /** Stdin yükü (örn. `git apply` için patch baytları) — shell pipeline YOK. */
   stdin?: Buffer | string;
-  /** `process.env` üzerine merge edilen ek ortam değişkenleri. */
+  /** `process.env` (repo-yerel değişkenleri süzülmüş) üzerine merge edilen ek ortam değişkenleri. */
   env?: NodeJS.ProcessEnv;
   /** ms; aşılırsa çocuk süreç öldürülür. Varsayılan 5 dk. */
   timeoutMs?: number;
@@ -119,13 +286,8 @@ export function runGit(args: readonly string[], options: GitRunOptions): Promise
   gitArgs.push("-c", HOOKS_DISABLED_CONFIG, "-c", FSMONITOR_DISABLED_CONFIG);
   gitArgs.push(...args);
 
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...options.env,
-    // Etkileşimsiz + deterministik (spec 6): asla prompt, asla yerel format.
-    GIT_TERMINAL_PROMPT: "0",
-    LC_ALL: "C",
-  };
+  // Repo-yerel miras değişkenleri süzülür + güvenlik sabitleri (buildGitEnv).
+  const env = buildGitEnv(process.env, options.env);
 
   return new Promise<GitRunResult>((resolve, reject) => {
     const child = spawn("git", gitArgs, {

@@ -106,6 +106,7 @@ import type {
 import { WorkspaceError } from "./Workspace.js";
 import {
   HOOKS_DISABLED_CONFIG,
+  assertPartialCloneSupported,
   computeRepoId,
   literalPathspec,
   runGit,
@@ -1261,12 +1262,29 @@ export class GitWorktreeWorkspace implements Workspace {
    * - yolun üstünde DİZİN/özel nesne → aynı tip'li hata: RECURSIVE silme
    *   YOK, `rm -rf` YOK, `git clean` YOK (geniş temizlik yasağı, spec 37)
    * - kümeyi kapsamayan hiçbir dosya dokunulmaz (spec 89 test'i)
+   * - ATAL bileşende sembolik bağlantı (ya da atal `lstat`'ında belirsiz
+   *   I/O) → aynı tip'li hata, `lstat`/`unlink` YÜRÜTÜLMEZ (inceleme W-M5):
+   *   kurcalanmış kalıcı küme (`lnk/x`, base'te `lnk` → dış dizin) link'i
+   *   takip edip workspace DIŞINDA silemez. Denetim GERÇEK fs'tir (seam
+   *   yalnız temizlik arızası enjekte eder — `restoreBaseAttributeFiles`
+   *   ile aynı ilke); yol kümede kalıntı olarak kalır.
    */
   private async removeWorkerCreatedPaths(paths: Iterable<string>): Promise<void> {
     for (const canonical of paths) {
       const abs = resolveContained(this.workspaceDir, canonical);
       if (abs === null) {
         continue; // defensive: yol doğrulaması oluşumda yapılmıştı
+      }
+      let ancestorLink: boolean;
+      try {
+        ancestorLink = await hasSymlinkInPath(abs, this.workspaceDir, { includeTarget: false, failClosed: true });
+      } catch (err) {
+        throw new WorkspaceError("workspace_operation_failed", "Cleaning the worker-created paths failed", {
+          cause: err,
+        });
+      }
+      if (ancestorLink) {
+        throw new WorkspaceError("workspace_operation_failed", "Cleaning the worker-created paths failed");
       }
       let stat: Stats;
       try {
@@ -1506,7 +1524,10 @@ async function copySelectedUntrackedFile(
   if (stat.isSymbolicLink()) {
     // Link'in KENDİSİ kopyalanır; hedef İÇERİK okunmaz/takip edilmez (spec 21/50).
     const target = await readlink(mainAbs);
-    if (!symlinkTargetStaysInside(repoRoot, mainAbs, target)) {
+    // `await` ZORUNLU (inceleme L4): Promise daima truthy'dir — eksikken bu
+    // kopya-anı kontrolü ölüydü; birincil kontrol ile kopya arasında dışa
+    // çevrilen link (TOCTOU) base'e taşınırdı.
+    if (!(await symlinkTargetStaysInside(repoRoot, mainAbs, target))) {
       throw new WorkspaceError("unsafe_path", "A selected path is an unsafe symlink");
     }
     // Taze checkout: yol zaten yok; yine de üstü üstüne yazmaya karşı atomik ol.
@@ -1798,6 +1819,11 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
     }
   }
 
+  // ── tembel promisor çekme kapatılabilir mi (inceleme MEDIUM-1) ───────────
+  // İlk nesne okuyan git komutundan ÖNCE: git < 2.44 + promisor'lı repo →
+  // sabit `invalid_repository` (yukarıdaki adımlar yalnız fs'tir).
+  await assertPartialCloneSupported(repoRoot);
+
   // ── ana depo: HEAD commit'i zorunlu (v1 worktree tabanı, spec 7) ──────────
   // Çözümleme F3 denetiminden ÖNCE: HEAD-ağacı attribute pass'i bu SHA'yı
   // `check-attr --source` değeri olarak kullanır.
@@ -1833,10 +1859,16 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
 
   // ── (1) tracked delta: staged + unstaged, binary, tam index (spec 19) ────
   // `git diff` (düz) KULLANILMAZ — yalnızca staged değişiklikleri kaçırır.
+  // Karşılaştırma tabanı ÇÖZÜLMÜŞ `headSha`'dır, sembolik `HEAD` DEĞİL
+  // (inceleme L3): `rev-parse` ile bu komut arasında HEAD ilerlerse delta
+  // yeni HEAD'e göre alınır, worktree ise `headSha`'dan kurulur → base ana
+  // working-tree'den sapardı. Delta ile checkout AYNI commit'e dayanır.
   let trackedDelta: Buffer;
   try {
     const diff = await runGit(
-      ["diff", "HEAD", ...PATCH_FORMAT_ARGS, "--binary", "--full-index", "--no-ext-diff", "--no-textconv"],
+      // Sondaki `--`: çalışma ağacında sha adlı bir dosya revizyonu belirsiz
+      // ("both revision and filename") yapamaz (ölçüldü, Git 2.50.1).
+      ["diff", headSha, ...PATCH_FORMAT_ARGS, "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--"],
       { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] },
     );
     trackedDelta = diff.stdout;
@@ -2370,6 +2402,9 @@ export async function restoreGitWorktreeWorkspace(
     state.currentCreatedPaths,
   );
 
+  // İlk git komutundan ÖNCE (inceleme MEDIUM-1): git < 2.44 + promisor'lı
+  // repo → sabit `invalid_repository` (oluşturmayla aynı kapı).
+  await assertPartialCloneSupported(repoRoot);
   await materializeWorkspace(workspace, state, repoRoot, workspaceDir);
   return workspace;
 }
@@ -2565,9 +2600,16 @@ async function baseObjectPresent(repoRoot: string, sha: string): Promise<boolean
 
 /**
  * Seçili yolların base içerik blob'larını object DB'ye geri yazar
- * (`git hash-object -w --stdin`). `mktree` blob'ların VAR olmasını gerektirmez
- * (yalnız oid referansı); ancak `worktree add` checkout'u blob'ları gerektirir.
- * `absent` yol için yazılacak şey yok.
+ * (`git hash-object -w --stdin`). `absent` yol için yazılacak şey yok.
+ *
+ * SINIR (inceleme L6): `git mktree` (`--missing` olmadan) her blob/tree
+ * girdisinin nesnesinin VAR olduğunu doğrular — eksik nesnede ölür (ölçüldü,
+ * Apple Git 2.50.1: "object … is unavailable", çıkış 128); gitlink
+ * (`160000 commit`) girdileri denetlenMEZ (ölçüldü). Yalnız SEÇİLİ yolların
+ * kalıcı içeriği geri yazılabilir; base ağacının başka bir blob'u yalnız
+ * budanmış base'ten erişilebiliyorsa (örn. seçilmemiş tracked bir dosyanın
+ * commit'lenmemiş delta blob'u) yeniden kurulamaz → `mktree` hatası →
+ * fail-closed (kısmi rekonstrüksiyon YOK, spec 275; worktree eklenmez).
  */
 async function recreateBaseBlobs(repoRoot: string, state: WorkspaceRecoveryState): Promise<void> {
   for (const [, value] of state.baseContents) {

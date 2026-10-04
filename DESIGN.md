@@ -789,6 +789,28 @@ deterministic Splash-local identity instead); remain on a detached HEAD; use
 exact Node/git invocation is an implementation detail; the behavior is
 required.
 
+**Git process environment (required).** Every git command runs with the
+inherited repository-local variables removed (the
+`git rev-parse --local-env-vars` set — `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_COMMON_DIR`,
+`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`, …), so the repository is always
+discovered from the command's working directory — a Splash process started
+with an absolute `GIT_DIR`/`GIT_WORK_TREE` can never stage, commit, or reset
+in the main checkout. User/system-level config (`GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`) is kept; command-scope config
+(incl. `safe.directory`) cannot be supplied through the environment — use
+global/system config. Lazy promisor fetches are disabled
+(`GIT_NO_LAZY_FETCH=1`): in a partial clone, a command that needs an object
+that is not present locally fails closed (creation/recovery error) instead
+of contacting the remote. The variable only takes effect on git ≥ 2.44; on
+older git (or an unparseable `git --version`) a repository with a promisor
+remote (`extensions.partialClone` or any `remote.*.promisor=true`) is
+rejected at workspace creation and recovery (`invalid_repository`), because
+a lazy fetch could run repository-configured transport programs on the
+host. The tracked delta (`git diff <sha> … --`) is captured against the
+**resolved** HEAD commit the worktree is created from, never the symbolic
+`HEAD` (a commit landing in between cannot skew the base).
+
 **Selected-path symlink policy (required, fail-closed).** When copying
 selected untracked files (step 4), the source path in the main working
 tree and the target path in the workspace must contain **no symlink
@@ -809,7 +831,10 @@ recorded as the known residue set** (union with the previous set) and are
 retried by the next reset/apply; the set is cleared only when a cleanup
 completes entirely. A failed round is never reported as a successful
 reset, no broad `git clean` and no recursive deletion is attempted, and
-the main checkout is never touched.
+the main checkout is never touched. A known path whose workspace ancestor
+is a symbolic link (reachable only through a tampered persisted set) is
+never followed: the cleanup fails with the same safe error and the path
+stays in the residue set.
 
 ### 7.4 Patch validation (the safety boundary)
 
