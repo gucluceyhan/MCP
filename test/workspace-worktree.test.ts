@@ -1189,6 +1189,52 @@ test("restart under a changed diff-format config: restore (surviving + recreated
   await ws.destroy().catch(() => undefined);
 });
 
+test("Step 9 state hash recorded under a non-default diff config is still accepted: matchesRecoveryStateHash + surviving-worktree reuse; a wrong hash is not (Step 10 hardening e)", async () => {
+  const { fixture, orderFile } = await buildFormatRepo("hash-legacy");
+  const ws = await createGitWorktreeWorkspace({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", "s-legacy"),
+    sessionId: "s-legacy",
+    editablePaths: FORMAT_FILES.map(([file]) => file),
+  });
+  await ws.applyPatchSet(formatRewrite());
+  const state = await ws.snapshotRecoveryState(); // güncel formül
+  const sentinel = path.join(ws.workspaceDir, "sentinel.txt");
+  await writeFile(sentinel, "keep\n"); // untracked — reuse kanıtı
+  const exists = (p: string): Promise<boolean> => stat(p).then(() => true, () => false);
+  const legacyConfig = `${allFormatSettings(orderFile)}[diff]\n\tnoprefix = true\n[color]\n\tui = always\n`;
+
+  await withGlobalGitConfig(fixture.out, legacyConfig, async () => {
+    // Step 9 sürecinin bu config'te kalıcılaştırdığı hash (pin'siz eski formül).
+    const legacyHash = sha256(
+      (await runGit([...LEGACY_FULL_DIFF_ARGS, ws.baseCommit], { cwd: ws.workspaceDir, config: ["core.hooksPath=/dev/null"] })).stdout,
+    );
+    assert.notEqual(legacyHash, state.recoveryStateHash, "fixture: the legacy formula differs under this config");
+    assert.equal(await ws.matchesRecoveryStateHash(state.recoveryStateHash), true, "current formula");
+    assert.equal(await ws.matchesRecoveryStateHash(legacyHash), true, "Step 9 formula accepted");
+    assert.equal(await ws.matchesRecoveryStateHash("0".repeat(64)), false, "wrong hash rejected");
+
+    // (a) Hayatta worktree + kalıcı ESKİ hash → REUSE; yeniden-uygulama sonrası da eşleşir.
+    const reused = await restoreGitWorktreeWorkspace({ ...state, recoveryStateHash: legacyHash }, { expectedWorkspaceDir: state.workspaceDir });
+    assert.ok(await exists(sentinel), "legacy hash matched → surviving worktree reused");
+    await reused.applyPatchSet(formatRewrite());
+    assert.equal(await reused.matchesRecoveryStateHash(legacyHash), true, "reuse + reapply → legacy hash");
+
+    // (b) Yanlış hash → güvenilmez → yeniden kurulum; eşleşme YOK.
+    const wrong = "f".repeat(64);
+    const recreated = await restoreGitWorktreeWorkspace({ ...state, recoveryStateHash: wrong }, { expectedWorkspaceDir: state.workspaceDir });
+    try {
+      assert.ok(!(await exists(sentinel)), "wrong hash → worktree recreated");
+      await recreated.applyPatchSet(formatRewrite());
+      assert.equal(await recreated.matchesRecoveryStateHash(wrong), false);
+      assert.equal(await recreated.matchesRecoveryStateHash(legacyHash), true, "recreate + reapply → legacy hash");
+    } finally {
+      await recreated.destroy();
+    }
+  });
+  await ws.destroy().catch(() => undefined);
+});
+
 // ── 12) imha (spec 73) ──────────────────────────────────────────────────────
 
 test("destroy: worktree removed, subsequent ops reject, patch file remains (spec 73)", async () => {

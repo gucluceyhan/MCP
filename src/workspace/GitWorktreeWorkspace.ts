@@ -454,11 +454,32 @@ export class GitWorktreeWorkspace implements Workspace {
     // filter re-check (PR #24 audit F-6): diff, içerik değiştirmiş tracked
     // dosyaları worktree attribute yüzeyiyle okur → içerikten ÖNCE.
     await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    return this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+  }
+
+  /**
+   * Güncel state kalıcı hash'le eşleşiyor mu? Önce güncel formül; eşleşmezse
+   * Step 9 formülü (biçim bayrağı/pin YOK, kullanıcının config'i altında):
+   * Step 9 ile varsayılan-DIŞI config'te kaydedilmiş açık oturumların hash'i
+   * yükseltme sonrası da tanınır (Codex P2 — PR #34). Kalıcı durum yeniden
+   * YAZILMAZ; sonraki üretilmiş tur güncel formülle yazar. İmha → red.
+   */
+  async matchesRecoveryStateHash(expected: string): Promise<boolean> {
+    this.assertUsable();
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    const current = await this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+    if (current === expected) {
+      return true;
+    }
+    return (await this.stateDiffHash([], [])) === expected; // Step 9 (e746e8f) formülü
+  }
+
+  /** Base-göreceli tam diff'in SHA-256'sı (filter re-check ÇAĞIRANDA). */
+  private async stateDiffHash(formatArgs: readonly string[], config: readonly string[]): Promise<string> {
     const result = await this.git(
       [
         "diff",
-        ...PATCH_FORMAT_ARGS,
-        ...STATE_HASH_DIFF_ARGS,
+        ...formatArgs,
         "--binary",
         "--full-index",
         "--no-ext-diff",
@@ -466,7 +487,7 @@ export class GitWorktreeWorkspace implements Workspace {
         "--no-renames",
         this.baseCommit,
       ],
-      { config: STATE_HASH_DIFF_CONFIG },
+      { config },
     );
     return createHash("sha256").update(result.stdout).digest("hex");
   }
@@ -2453,8 +2474,8 @@ async function materializeWorkspace(
   if (dirExists) {
     // Hayatta worktree: kimlik (HEAD==base + toplevel) + state hash.
     if (await worktreeIdentityMatches(workspaceDir, state.baseCommit)) {
-      const hash = await workspace.recoveryStateHash().catch(() => null);
-      if (hash !== null && hash === state.recoveryStateHash) {
+      // Step 9 formülüyle kaydedilmiş hash de kabul (matchesRecoveryStateHash).
+      if (await workspace.matchesRecoveryStateHash(state.recoveryStateHash).catch(() => false)) {
         // spec 109/126: BİREBİR eşleşme → REUSE (imha/yeniden kurma YOK).
         return;
       }

@@ -1342,7 +1342,15 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
     `diff.suppressBlankEmpty=false`), so user porcelain config can neither
     corrupt the patch nor invalidate a persisted session; output under the
     default config is byte-identical to before. The export itself keeps the
-    configured diff context (Section 7.6).
+    configured diff context (Section 7.6). A persisted hash computed with
+    the Step 9 formula (unpinned, under that config) is still accepted
+    (reuse decision + recovery verification; persisted state is not
+    rewritten — the next generated round writes the current formula).
+    Before `splash_diff` / `splash_close` use a RAM-cached workspace, its
+    state is checked against the committed hash; on drift (an external
+    edit after the last round) the committed state is re-applied and
+    verified, and on failure RAM is evicted with `session_recovery_failed`
+    (nothing exported or deleted).
 11. **End-to-end** on a real repo + real local model: verify compact
     responses, on-demand diff, `git apply` merge into the main checkout,
     refine-loop convergence with bounded token growth, the stale-base path
