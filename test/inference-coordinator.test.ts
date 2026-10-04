@@ -1010,15 +1010,98 @@ test("LOW-1 probe: an abort that lands DURING the lock peek → typed 'aborted' 
   assert.equal(h.scannerCounts.count, 0);
 });
 
-test("LOW-2 probe: a same-process dispatch that starts WHILE the peek is in flight is not counted as a foreign owner", async (t) => {
+test("LOW-2 probe: a same-process dispatch that starts WHILE the peek is in flight and holds the lock when the peek returns is not counted as a foreign owner", async (t) => {
   let started: Promise<CoordinatedInferenceResult> | null = null;
-  let coordinatorRef: InferenceCoordinator | null = null;
+  let harnessRef: Harness | null = null;
   const lock: RuntimeLockLike = {
     acquire: async () => ({ acquired: true, token: "own" }),
     release: async () => {},
     peek: async () => {
       // Peek beklenirken bu süreçte bir dispatch başlar ve kilidi alır:
-      // yoklamanın gördüğü sahip BİZİZ.
+      // yoklamanın gördüğü sahip BİZİZ. Sıra açıkça kurulur (microtask
+      // zamanlamasına dayanmaz): peek ancak dispatch kilidi alıp
+      // jenerasyona başladıktan SONRA döner.
+      const harness = harnessRef as Harness;
+      started = harness.coordinator.dispatch(request("A"));
+      await waitFor(() => harness.backend.runStartOrder.includes("A"), "A to hold the lock and start generating");
+      return "busy";
+    },
+  };
+  const h = await makeHarness(t, { lock });
+  harnessRef = h;
+
+  assert.deepEqual(await h.coordinator.probe(), { status: "clear" });
+
+  h.backend.releaseRun("A");
+  assert.equal((await (started as unknown as Promise<CoordinatedInferenceResult>)).status, "completed");
+});
+
+// ── PR #38 inceleme (Codex P2): ön-kapı yalnız FİİLEN alınmış kilide güvenir ──
+
+/** Probe'un bekleyen kendi acquire'ına takılmasına fırsat ver (makro tick). */
+function nextMacrotask(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+test("Codex P2 probe: a dequeued dispatch whose acquire is still PENDING is no proof of ownership — the probe peeks; a foreign owner → inference_busy/splash with no runtime contact", async (t) => {
+  let settleAcquire: (result: LockAcquireResult) => void = () => {};
+  let acquireCalls = 0;
+  let peekCalls = 0;
+  const lock: RuntimeLockLike = {
+    acquire: () => {
+      acquireCalls += 1;
+      // Acquire testin çözdüğü ana dek BEKLER (dequeue ↔ kilit arası pencere).
+      return new Promise<LockAcquireResult>((resolve) => {
+        settleAcquire = resolve;
+      });
+    },
+    release: async () => {},
+    peek: async () => {
+      peekCalls += 1;
+      return "busy"; // kilidi başka bir Splash süreci tutuyor
+    },
+  };
+  const h = await makeHarness(t, { lock });
+
+  const pending = h.coordinator.dispatch(request("A"));
+  await waitFor(() => acquireCalls === 1, "A's acquire to be in flight");
+  assert.equal(h.coordinator.activeOwnerId, "A", "A is dequeued (active) but does not hold the lock yet");
+
+  const gate = h.coordinator.probe();
+  await nextMacrotask();
+  assert.equal(peekCalls, 1, "an in-flight acquire is not ownership — the lock must be peeked");
+  assert.equal(h.backend.refreshCalls, 0, "undecided while our own acquire is pending — no runtime contact");
+
+  // Yabancı sahip kazanır (acquire PROBE beklenmeden ÖNCE çözülür).
+  settleAcquire({ acquired: false, reason: "busy" });
+  assert.deepEqual(await pending, { status: "inference_busy", conflict: "splash" });
+
+  // İkinci yarı: acquire başarısız, iş hâlâ aktif (pump temizliği koşmadı) —
+  // başarısız acquire sahiplik sayılmaz.
+  assert.equal(h.coordinator.activeOwnerId, "A", "precondition: A is still the active (dequeued) job");
+  const after = h.coordinator.probe();
+
+  assert.deepEqual(await gate, { status: "inference_busy", conflict: "splash" });
+  assert.deepEqual(await after, { status: "inference_busy", conflict: "splash" });
+  assert.equal(peekCalls, 2, "a failed acquire never counts as ownership");
+  assert.equal(h.backend.refreshCalls, 0, "no /status, no /v1/models behind a foreign owner");
+  assert.equal(h.scannerCounts.count, 0);
+  assert.equal(h.backend.runStartOrder.length, 0);
+});
+
+test("Codex P2 probe: a dispatch dequeued DURING the peek whose acquire is still pending does not turn a foreign 'busy' into 'clear'", async (t) => {
+  let settleAcquire: (result: LockAcquireResult) => void = () => {};
+  let started: Promise<CoordinatedInferenceResult> | null = null;
+  let coordinatorRef: InferenceCoordinator | null = null;
+  const lock: RuntimeLockLike = {
+    acquire: () =>
+      new Promise<LockAcquireResult>((resolve) => {
+        settleAcquire = resolve;
+      }),
+    release: async () => {},
+    peek: async () => {
+      // Yoklama sürerken bu süreçte bir dispatch dequeue olur; acquire'ı
+      // henüz sonuçlanmadı — yoklamanın gördüğü sahip YABANCI.
       started = (coordinatorRef as InferenceCoordinator).dispatch(request("A"));
       return "busy";
     },
@@ -1026,9 +1109,130 @@ test("LOW-2 probe: a same-process dispatch that starts WHILE the peek is in flig
   const h = await makeHarness(t, { lock });
   coordinatorRef = h.coordinator;
 
-  assert.deepEqual(await h.coordinator.probe(), { status: "clear" });
+  const gate = h.coordinator.probe();
+  await nextMacrotask();
+  assert.equal(h.coordinator.activeOwnerId, "A", "precondition: A is dequeued, its acquire pending");
+  assert.equal(h.backend.refreshCalls, 0, "undecided while our own acquire is pending — no runtime contact");
+
+  settleAcquire({ acquired: false, reason: "busy" });
+  assert.deepEqual(await gate, { status: "inference_busy", conflict: "splash" });
+  assert.equal(h.backend.refreshCalls, 0, "no /status, no /v1/models behind a foreign owner");
+  assert.equal(h.scannerCounts.count, 0);
+
+  assert.deepEqual(await (started as unknown as Promise<CoordinatedInferenceResult>), {
+    status: "inference_busy",
+    conflict: "splash",
+  });
+  assert.equal(h.backend.runStartOrder.length, 0);
+});
+
+test("DESIGN 2.7 probe: the peek sees OUR OWN half-made lock while our acquire is pending → the probe waits for it; acquired → clear and the runtime is contacted (a same-process dispatch is never a conflict)", async (t) => {
+  let settleAcquire: (result: LockAcquireResult) => void = () => {};
+  let acquireCalls = 0;
+  let peekCalls = 0;
+  const lock: RuntimeLockLike = {
+    acquire: () => {
+      acquireCalls += 1;
+      return new Promise<LockAcquireResult>((resolve) => {
+        settleAcquire = resolve;
+      });
+    },
+    release: async () => {},
+    peek: async () => {
+      peekCalls += 1;
+      return "busy"; // gözlenen: KENDİ yarım kilidimiz (mkdir yapıldı, acquire dönmedi)
+    },
+  };
+  const h = await makeHarness(t, { lock });
+
+  const pending = h.coordinator.dispatch(request("A"));
+  await waitFor(() => acquireCalls === 1, "A's acquire to be in flight");
+  assert.equal(h.coordinator.activeOwnerId, "A", "precondition: A is dequeued, its acquire pending");
+
+  const gate = h.coordinator.probe();
+  await nextMacrotask();
+  assert.equal(peekCalls, 1);
+  assert.equal(h.backend.refreshCalls, 0, "undecided while our own acquire is pending");
+
+  settleAcquire({ acquired: true, token: "own-A" });
+  assert.deepEqual(await gate, { status: "clear" }, "our own half-made lock is never a conflict");
 
   await waitFor(() => h.backend.runStartOrder.includes("A"), "A to start generating");
+  assert.equal(h.backend.refreshCalls, 2, "the probe went on to the runtime (plus A's own dispatch refresh)");
   h.backend.releaseRun("A");
-  assert.equal((await (started as unknown as Promise<CoordinatedInferenceResult>)).status, "completed");
+  assert.equal((await pending).status, "completed");
+});
+
+test("Codex P2 probe: an abort while waiting for our own pending acquire → typed 'aborted'; no runtime contact", async (t) => {
+  let settleAcquire: (result: LockAcquireResult) => void = () => {};
+  const lock: RuntimeLockLike = {
+    acquire: () =>
+      new Promise<LockAcquireResult>((resolve) => {
+        settleAcquire = resolve;
+      }),
+    release: async () => {},
+    peek: async () => "busy",
+  };
+  const h = await makeHarness(t, { lock });
+
+  const pending = h.coordinator.dispatch(request("A"));
+  const controller = new AbortController();
+  const gate = h.coordinator.probe(controller.signal);
+  await nextMacrotask();
+  controller.abort();
+
+  await assert.rejects(gate, (err: unknown) => err instanceof CoordinatorError && err.kind === "aborted");
+  assert.equal(h.backend.refreshCalls, 0);
+  assert.equal(h.scannerCounts.count, 0);
+
+  settleAcquire({ acquired: false, reason: "busy" });
+  assert.deepEqual(await pending, { status: "inference_busy", conflict: "splash" });
+});
+
+test("Codex P2 probe: once the acquire has SUCCEEDED the probe still skips the peek (own lock); after release — ok or failed — the peek is back", async (t) => {
+  let peekCalls = 0;
+  let failRelease = false;
+  const lock: RuntimeLockLike = {
+    acquire: async (ownerId) => ({ acquired: true, token: `own-${ownerId}` }),
+    release: async () => {
+      if (failRelease) {
+        throw new LockError("release_failed", "Could not remove the inference lock directory");
+      }
+    },
+    peek: async () => {
+      peekCalls += 1;
+      return "busy"; // kilit bırakıldıktan sonra görülen sahip bizim DEĞİL
+    },
+  };
+  const h = await makeHarness(t, { lock });
+
+  const pending = h.coordinator.dispatch(request("A"));
+  await waitFor(() => h.backend.runStartOrder.includes("A"), "A to start generating");
+  assert.equal(h.coordinator.activeOwnerId, "A", "precondition: A is the active job");
+  assert.deepEqual(await h.coordinator.probe(), { status: "clear" });
+  assert.equal(peekCalls, 0, "the held lock is ours — no peek (same-process FIFO wait)");
+
+  h.backend.releaseRun("A");
+  assert.equal((await pending).status, "completed");
+  // Kilit bırakıldı ama pump temizliği henüz koşmadı (`#active` hâlâ A):
+  // artık yoklanır.
+  assert.equal(h.coordinator.activeOwnerId, "A", "precondition: A is still active (pump cleanup pending)");
+  assert.deepEqual(await h.coordinator.probe(), { status: "inference_busy", conflict: "splash" });
+  assert.equal(peekCalls, 1);
+
+  // Bırakma HATASI: sahiplik kanıtlanamaz → yine yoklanır (fail closed).
+  failRelease = true;
+  const failing = h.coordinator.dispatch(request("B"));
+  await waitFor(() => h.backend.runStartOrder.includes("B"), "B to start generating");
+  h.backend.releaseRun("B");
+  let releaseError: unknown = null;
+  try {
+    await failing; // doğrudan await: pump temizliğinden ÖNCE devam eder
+  } catch (err) {
+    releaseError = err;
+  }
+  assert.ok(releaseError instanceof CoordinatorError && releaseError.kind === "lock_release_failed");
+  assert.equal(h.coordinator.activeOwnerId, "B", "precondition: B is still active (pump cleanup pending)");
+  assert.deepEqual(await h.coordinator.probe(), { status: "inference_busy", conflict: "splash" });
+  assert.equal(peekCalls, 2);
 });
