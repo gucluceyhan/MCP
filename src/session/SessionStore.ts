@@ -823,6 +823,23 @@ function validateBaseCommitIdentity(value: unknown): BaseCommitIdentity {
   if (!isShaObject(value["tree"]) || !Array.isArray(value["parents"]) || (value["parents"] as unknown[]).some((entry) => !isShaObject(entry))) {
     corruptFail("workspaceRecovery:baseCommitIdentity-oids");
   }
+  // Açık çalışma-zamanı tip denetimi KAST'tan ÖNCE (spec 16): string OLMAYAN
+  // kalıcı değer (123 / null / false / [] / {}) typed state olamaz. Yalnız
+  // `=== ""` denetimi yetmez (`null === ""` false) — önce TİP denetlenir,
+  // sonra boşluk; altı kimlik alanı için ikisi de zorunlu. Neden etiketi
+  // kısa + alan bazlı kalır; public mesaj sabit güvenli metindir (spec 17 —
+  // kalıcı içerik ASLA mesajda YOK).
+  for (const field of ["authorName", "authorEmail", "authorDate", "committerName", "committerEmail", "committerDate"] as const) {
+    const fieldValue = value[field];
+    if (typeof fieldValue !== "string" || fieldValue === "") {
+      corruptFail(`workspaceRecovery:baseCommitIdentity:${field}`);
+    }
+  }
+  // `message` BOŞ olabılır (Git commit sözleşmesi/parser boş mesaj kabul
+  // eder) ama her zaman string olmalıdır.
+  if (typeof value["message"] !== "string") {
+    corruptFail("workspaceRecovery:baseCommitIdentity:message");
+  }
   const identity: BaseCommitIdentity = {
     tree: value["tree"] as string,
     parents: [...(value["parents"] as string[])],
@@ -834,14 +851,6 @@ function validateBaseCommitIdentity(value: unknown): BaseCommitIdentity {
     committerDate: value["committerDate"] as string,
     message: value["message"] as string,
   };
-  for (const field of ["authorName", "authorEmail", "authorDate", "committerName", "committerEmail", "committerDate"] as const) {
-    if ((identity[field] as string) === "") {
-      corruptFail(`workspaceRecovery:baseCommitIdentity:${field}`);
-    }
-  }
-  if (typeof identity.message !== "string") {
-    corruptFail("workspaceRecovery:baseCommitIdentity:message");
-  }
   return identity;
 }
 

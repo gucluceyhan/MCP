@@ -195,3 +195,16 @@
   - N-3/N-4: trusted tree path inert forms + lstat error-kind semantiği (INFO).
   - M7: `O_EXCL` TOCTOU residual (dokümantasyon, issue zorunlu değil).
 - Commit mesajında AI/Co-Author imza YOK.
+
+## Final merge-closure — 2026-10-04
+- `validateBaseCommitIdentity()` artık altı kimlik/tarih alanını ve `message` alanını typed state’den ÖNCE runtime string olarak doğrular; altı alan non-empty, `message` empty-allow.
+- `test/session-store.test.ts` +2 test (8 satırlık malformed matris + boş `message`’li pozitif round-trip).
+- Threat Model A `DESIGN.md` + `docs/step9-final-report.md` içinde açıkça kabul edildi:
+  - same-OS-user concurrent ancestor-directory swap race = accepted LOW residual risk, merge blocker değil.
+  - `openat`/`openat2` sınıfı descriptor-relative traversal implement edilmedi.
+  - schema-geçerli `repoRoot`/`baseCommit` tamperi yalnız izole session workspace’inde materyalize edebilir; ana checkout korunur.
+- Final gate: `npm run build` exit 0, `npm run typecheck` exit 0, `npm test` = **620 PASS / 0 FAIL** (3 ardışık + mutation-sonrası final).
+- Bağımsız final audit: **PASS** — BLOCK/HIGH/MEDIUM yok; LOW: rapor sayısı düzeltildi, threat-model nüansı eklendi, outputRoot atal izin hijyeni issue adayı.
+- Bağımsız QA: **PASS** — 3/3 mutasyon kanıtı, 3× gate 620/0.
+- PR #31 body güncellendi; PR merge edilmedi, insan kararı için hazır bırakıldı.
+- PR dışı takip: issue #32 + yeni LOW outputRoot atal izin hijyeni adayı.

@@ -694,6 +694,85 @@ test("deep validation: workspace recovery malformed tree entry fails closed (rea
   });
 });
 
+// ── BaseCommitIdentity runtime-tip doğrulaması (spec 16, 337) ───────────────
+//
+// Kalıcı `baseCommitIdentity` typed state olmadan ÖNCE açık çalışma-zamanı
+// tip denetiminden geçer: altı kimlik alanı string + boş-değil; `message`
+// string (boş KABUL — Git commit sözleşmesi). String OLMAYAN kalıcı değer
+// (123 / null / false / [] / {}) fail-closed `session_corrupt` ile
+// yüklenemez; public mesaj SABİT güvenli metindir ve yerleştirilen kalıcı
+// içeriği taşımaz. (Yalnız `=== ""` denetimi bu değerleri YAKALAYAMAZDI —
+// `null === ""` false; tip denetimi KAST'tan önce zorunlu.)
+
+const MALFORMED_IDENTITY_FIELDS = [
+  { field: "authorName", value: 123 },
+  { field: "authorEmail", value: null },
+  { field: "authorDate", value: {} },
+  { field: "committerName", value: [] },
+  { field: "committerEmail", value: false },
+  { field: "committerDate", value: 123 },
+  { field: "message", value: 123 },
+  { field: "message", value: null },
+] as const;
+
+test("deep validation: malformed baseCommitIdentity values fail closed without content leak (real fs)", async () => {
+  for (const [index, { field, value }] of MALFORMED_IDENTITY_FIELDS.entries()) {
+    await withRealStore(async (store, outputRoot) => {
+      await store.create(SESSION_ID);
+      const session = makeSession();
+      const recovery = { ...session.workspaceRecovery } as Record<string, unknown>;
+      const identity = { ...session.workspaceRecovery.baseCommitIdentity } as Record<string, unknown>;
+      identity[field] = value;
+      // Yerleştirilen kalıcı içerik — public mesajda ASLA görünmemeli.
+      // Tamper edilen alan string ise marker oraya; değilse sağlam string
+      // bir alana yerleştirilir (denetim tamper edilen alanda red eder).
+      const marker = `VERY_SECRET_IDENTITY_MARKER_${index}`;
+      if (field === "message") {
+        identity.authorName = `Test ${marker}`;
+      } else {
+        identity.message = `base ${marker}`;
+      }
+      recovery.baseCommitIdentity = identity;
+      session.workspaceRecovery = recovery as unknown as WorkspaceRecoveryState;
+      await writeRawSessionFile(store, outputRoot, session);
+      // Yerleştirilen içeriğin gerçekte disk'te doğrulanabilir olduğundan emin ol.
+      const raw = await realReadFile(path.join(outputRoot, "sessions", SESSION_ID, "session.json"), "utf8");
+      assert.ok(raw.includes(marker), "planted marker must be persisted");
+
+      await assert.rejects(
+        store.load(SESSION_ID),
+        (e: unknown) => {
+          assert.ok(e instanceof SessionError);
+          assert.equal(e.kind, "session_corrupt");
+          // SABİT güvenli mesaj — ne yol, ne alan, ne yerleştirilen içerik.
+          assert.equal(e.message, "The session state is corrupt and cannot be recovered");
+          assert.ok(!e.message.includes(marker));
+          // `load` red ediyorsa bozuk değer typed state OLMADI (fail-closed).
+          return true;
+        },
+      );
+    });
+  }
+});
+
+test("deep validation: valid baseCommitIdentity (incl. empty message) loads successfully (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.create(SESSION_ID);
+    const session = makeSession();
+    const recovery = { ...session.workspaceRecovery } as Record<string, unknown>;
+    // Boş `message` sözleşmeye uygun (Git commit/parser kabul eder) — yüklenir;
+    // kimlik alanları birebir korunur.
+    recovery.baseCommitIdentity = { ...session.workspaceRecovery.baseCommitIdentity, message: "" };
+    session.workspaceRecovery = recovery as unknown as WorkspaceRecoveryState;
+    await writeRawSessionFile(store, outputRoot, session);
+    const loaded = await store.load(SESSION_ID);
+    assert.deepEqual(loaded, session);
+    assert.equal(loaded.workspaceRecovery.baseCommitIdentity.message, "");
+    assert.equal(loaded.workspaceRecovery.baseCommitIdentity.authorName, "Test");
+    assert.equal(loaded.workspaceRecovery.baseCommitIdentity.authorEmail, "test@example.com");
+  });
+});
+
 // ── Repo-root tutarlılığı (audit F-2, spec 16, 337) ─────────────────────────
 
 test("audit F-2: non-absolute session repo_root fails closed with a fixed safe message (real fs)", async () => {

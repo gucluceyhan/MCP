@@ -90,7 +90,7 @@ State hash, base commit’e karşı binary diff çıktısının SHA-256 özeti o
 Süreç yeniden başladıktan sonra `session_id` ile store load edilir, persisted state deep validation’dan geçer, workspace trusted path üzerinden kurtarılır, son worker sonucu yeniden uygulanır ve state hash doğrulanır.
 
 ## 28. Stale-after-restart behavior
-Recovery完成后, `splash_refine` inference’a gitmeden önce stale-base denetimi yeniden yürütülür. Main tree süreç kapalıyken sürüklenmiş ise compact stale sonucu dönür ve oturum açık kalır.
+Recovery tamamlandıktan sonra, `splash_refine` inference’a gitmeden önce stale-base denetimi yeniden yürütülür. Main tree süreç kapalıyken sürüklenmiş ise compact stale sonucu dönür ve oturum açık kalır.
 
 ## 29. Same-session concurrency behavior
 Aynı oturuma paralel gelen işlemler oturum-level FIFO kuyruğunda sıralanır; refine/stale/workspace/persistence işlemleri aynı oturumda yarışmaz.
@@ -117,7 +117,7 @@ Frontier’ye compact result gider: summary, changed file list, diff stats, vali
 Tüm worker yazmaları izole git-worktree workspace içinde kalır. Splash v1 ana repository working tree’sine apply yapmaz; main checkout testlerle korunur.
 
 ## 37. Previous → final test count
-Step 8 baseline: **487**. Step 9 implementasyonu: **591**. Step 9 güvenlik sertleştirme + audit düzeltmeleri + QA stabilizasyonu sonrası final: **618 PASS / 0 FAIL**.
+Step 8 baseline: **487**. Step 9 implementasyonu: **591**. Step 9 güvenlik sertleştirme + audit düzeltmeleri + QA stabilizasyonu + final `BaseCommitIdentity` runtime-validation düzeltmesi sonrası final: **620 PASS / 0 FAIL**.
 
 ## 38. Build result
 `npm run build` = exit 0.
@@ -126,7 +126,7 @@ Step 8 baseline: **487**. Step 9 implementasyonu: **591**. Step 9 güvenlik sert
 `npm run typecheck` = exit 0.
 
 ## 40. MCP smoke result
-Ayrı bir MCP smoke scripti yok; `npm test` içindeki MCP/server/tool entegrasyon testleri tamamı ile geçti: 618 PASS / 0 FAIL.
+Ayrı bir MCP smoke scripti yok; `npm test` içindeki MCP/server/tool entegrasyon testleri tamamı ile geçti: **620 PASS / 0 FAIL**.
 
 ## 41. Restart integration result
 `test/step9-integration.test.ts` içindeki restart senaryosu geçti: açık oturum süreç yeniden başlatmasından sonra `session_id` ile geri yüklendi.
@@ -141,6 +141,8 @@ Bağımsız `code-audit-sentinel` re-audit **PASS** döndürdü: 3 merge-blocker
 Önceki Step 9 mutasyon auditi 12/12 yakalanmıştı. Sertleştirme turunda 8 mutasyon denendi: 5 yakalandı; 3’ü belgelenen residual/defense-in-depth olarak sınıflandırıldı. Tüm `src/**` dosyaları mutasyon sonrası SHA-256 baseline’ına byte-identical geri alındı.
 
 ## 45. Known Step 9 limitations
+- **Threat Model A — accepted (2026-10-04):** Splash, kullanıcının kendi OS hesabı altında çalışan yerel bir geliştirici aracıdır. Step 9; saldırganca/tamper edilmiş `session.json`, statik symlink ikamesi, stale tmp dosyaları, leaf symlink yarışları, geçersiz şemalar ve güvensiz kurtarma yollarına karşı 0700 oturum dizini, 0600 dosyalar, no-follow leaf erişimi ve exclusive tmp oluşturma ile savunulur. Step 9, **aynı Unix kullanıcı hesabı** altında çalışan ve yol çözümlemesi sırasında **zaten doğrulanmış bir üst dizini aktif olarak değiştiren** saldırgan bir eşzamanlı sürece karşı savunulmaz. Bu, kabul edilmiş **LOW residual risk**tir; merge blocker DEĞİLDİR. Tam olarak ortadan kaldırılması `openat`/`openat2` sınıfı descriptor-göreceli gezinme gerektirir; bu Step 9 için orantısız olduğundan implement edilmedi.
+- Aynı kullanıcı tarafından tamper edilmiş ancak şeması geçerli `repoRoot`/`baseCommit` alanları, recovery’nin saldırgan içeriği yalnız oturumun izole workspace’inde materyalize etmesine yol açabilir; ana checkout korunur ve içerik/kaçak yüzeyi değişmez. Bu da Threat Model A kapsamındaki aynı-kullanıcı residual riskidir.
 - `O_NOFOLLOW` Windows’ta libuv seviyesinde no-op olabilir; mevcut deploy hedefi POSIX/macOS ve handle stat re-check içerik seviyesinde koruma sağlar.
 - `lstat`-tabanlı workspace director assert’i, assert ile destructive işlem arasındaki symlink-swap TOCTOU’sunu handle-based no-follow kadar kesin kapatmaz; mevcut tasarım fail-closed kalır.
 - `recreateWorktree` için session-sonrası trusted-user git config drift’ine karşı F-6 tarzı filter re-check henüz eklenmedi; LOW defense-in-depth takip issue’su olarak ayrıldı.

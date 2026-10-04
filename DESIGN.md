@@ -1225,6 +1225,22 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
     `unsafe_path` kind as creation when `canonicalizeOutside` rejects a
     directory that falls inside the repository (the canonical-mismatch case
     stays `invalid_input`).
+     **Accepted threat model (Threat Model A):** Splash is a local developer
+     tool running under the user's own OS account. Step 9 defends against a
+     malicious or tampered `session.json`, static symlink substitution,
+     stale temporary files, leaf-symlink races, invalid schemas, and unsafe
+     recovery paths using 0700 session directories, 0600 files, no-follow
+     leaf access, and exclusive temporary-file creation. Step 9 does NOT
+     defend against a malicious concurrent process running under the same
+     Unix user account that actively replaces an already-validated ancestor
+     directory during path resolution. This is an accepted **LOW residual
+     risk**, not a merge blocker; fully eliminating it would require
+     descriptor-relative traversal (`openat`/`openat2`-class APIs), which is
+      disproportionate for Step 9. A same-user tamper that remains schema-valid
+      in `repoRoot`/`baseCommit` can only cause recovery to materialize attacker
+      content inside the session's isolated workspace; the main checkout and
+      public leak surface are unchanged, so this remains the same accepted
+      same-user residual class.
 10. **`splash_diff` + `splash_close`** — on-demand diff; **complete
     `--binary --full-index`** patch export; destroy (stale never blocks; an
     export failure preserves the session).
