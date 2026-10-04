@@ -74,14 +74,16 @@ export interface SessionOptions {
 
 /**
  * Bir üretilmiş turun kalıcı kaydı (spec 67). `feedback` yalnız refine
- * turlarında var; 1. turda YOK (spec 67). Worker sonucu NORMALIZE edilmiş,
+ * ile üretilen turlarda var: `splash_task` 1. turunda YOK (spec 67); ilk
+ * çağrısı `needs_split`/`inference_busy` dönen (tur 0) oturumun 1. turunu
+ * `splash_refine` üretirse 1. turda da VAR. Worker sonucu NORMALIZE edilmiş,
  * parse edilmiş haldedir — ham model çıktısı / Markdown / HTTP gövdesi YOK
  * (spec 68). Birebir tam-ikame patch semantiği için deterministik veri.
  */
 export interface PersistedRound {
   /** 1'den başlayan tur numarası. */
   round: number;
-  /** Bu tur için sağlanan geri bildirim (yalnız refine; 1. turda yok). */
+  /** Bu tur için sağlanan geri bildirim (yalnız refine; `splash_task` 1. turunda yok). */
   feedback?: string;
   /** Normalize parse edilmiş worker sonucu (birebir tam-ikame patch seti). */
   workerResult: WorkerResult;
@@ -269,8 +271,8 @@ export interface SessionStat {
  * her senaryoyu (atomik roundtrip, izin, bozuk, geçici-dosya, sürüm/id yol
  * bozma, yazım hatası — spec 337) deterministik olarak modeler.
  *
- * `readFile`/`stat`/`openWrite`/`removeFile` I/O hatasını AYNEN atar (errno
- * korunur) — `SessionStore` hata KODUNA göre fail-closed sınıflandırır.
+ * `readFile`/`stat`/`openWrite`/`removeFile`/`removeDir` I/O hatasını AYNEN atar
+ * (errno korunur) — `SessionStore` hata KODUNA göre fail-closed sınıflandırır.
  */
 export interface SessionStoreFs {
   /**
@@ -295,6 +297,12 @@ export interface SessionStoreFs {
   rename(from: string, to: string): Promise<void>;
   /** `path`'i `unlink` ile siler; yoksa (ENOENT) sessizce geçer, symlink takibi YOK. */
   removeFile(path: string): Promise<void>;
+  /**
+   * TEK bir dizini `rmdir` ile siler (Step 10 spec 18/19) — REKÜRSİF DEĞİL:
+   * boş değilse `ENOTEMPTY`, yoksa `ENOENT`, symlink/dosya ise `ENOTDIR`;
+   * errno AYNEN atılır (sınıflandırma çağıranındır).
+   */
+  removeDir(dir: string): Promise<void>;
   /** Dizin fsync/izin için `dir`'ı no-follow salt-okunur açar (spec 14). */
   openDir(dir: string): Promise<SessionDirHandle>;
 }

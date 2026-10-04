@@ -1,6 +1,6 @@
 # Splash — Architecture & Design (v2)
 
-Status: **Steps 1–9 implemented; rest design-only.**
+Status: **Steps 1–10 implemented; rest design-only.**
 
 Purpose: let a frontier orchestrator (Claude Code, OpenAI Codex) delegate
 *implementation* work to a **local LLM worker** to **significantly reduce
@@ -1244,6 +1244,88 @@ Incremental — the *minimum loop with a real workspace* first, then the rest.
 10. **`splash_diff` + `splash_close`** — on-demand diff; **complete
     `--binary --full-index`** patch export; destroy (stale never blocks; an
     export failure preserves the session).
+    **Implementation-stage note (Step 10):** the final production MCP
+    surface is exactly four tools — `splash_task`, `splash_refine`,
+    `splash_diff`, `splash_close`; the temporary `splash_ping` dev tool is
+    removed. The `splash_diff` / `splash_close` input schemas are strict:
+    unknown keys (e.g. `apply`, `output_path`, `force`) are rejected, never
+    silently dropped.
+    **`splash_diff(session_id, files?, stat?)`** is the only tool that
+    returns generated content. It runs under the same per-session FIFO lock
+    as refine/close (it never observes a half-applied round) and
+    loads/recovers lazily after a restart (model-free); it never calls
+    inference, never assembles context, never runs the stale check, and
+    never mutates or persists session state. Default = whole-workspace
+    unified diff (`-U3`) of immutable base → workspace; `files` = a literal
+    (`:(literal)`) pathspec filter through the canonical path-safety rules
+    (unsafe paths → `invalid_input`; glob-like input never broadens);
+    `stat: true` = `{diff_stats}` only (git numstat, filter-aware —
+    `Workspace.stat(options?)`), no source. A stale main tree does not block
+    inspection.
+    **`splash_close(session_id)`** takes the same FIFO lock, then:
+    load/recover → the SAME stale algorithm as refine (shared helper) →
+    `workspace.stat()` → `exportPatch(config.outputRoot)` → destroy the
+    workspace → delete `session.json` (the logical commit point) → drop the
+    RAM entry. It returns `patch_path` (absolute, under
+    `<outputRoot>/patches/<repo-id>/<session-id>.patch`, never
+    caller-controlled), `files_changed` (the latest persisted generated
+    result; `[]` for a round-0 session), `diff_stats`, `summary` (the
+    persisted compact summary, or a fixed no-result summary), `base_status`,
+    and `stale_files` only when stale — never content. **A stale base never
+    blocks the close:** it exports and reports `stale` (the orchestrator
+    must not auto-apply). Close never calls inference and closes
+    `max_rounds` and round-0 sessions normally (round-0 → empty patch,
+    0/0/0). Splash never applies the patch.
+    **Failure boundaries.** Export failure → nothing is deleted (workspace,
+    `session.json`, and RAM entry stay valid; retryable). Destroy failure →
+    the patch and `session.json` remain, the RAM entry is evicted, and the
+    next call recovers from disk. State-deletion failure (before
+    `session.json` is unlinked) → `session.json` stays authoritative, the
+    RAM entry is evicted, and a retry recreates the workspace and re-exports
+    deterministically. Other operational errors (e.g. live-base capture
+    I/O) also fail the close without losing state — the Section 7.5 failure
+    distinction; only *staleness* is guaranteed not to block. After a
+    successful close every call for that id is `session_not_found`.
+    **Narrow state deletion.** `SessionStore.delete` derives the directory
+    only from the trusted output root + id; rejects a symlinked `sessions/`,
+    session directory, or `session.json`; uses only `unlink` +
+    single-directory `rmdir` (no recursive delete); treats the
+    `session.json` unlink as the commit point (later cosmetic cleanup is
+    best-effort and never fails the close); and never removes the shared
+    `sessions/` parent. The exported patch lives outside the session
+    directory and always survives. Threat Model A is unchanged.
+    **Hardening carried into Step 10** (it affected close correctness):
+    (a) live-base capture treats `ENOTDIR` as absence for base paths and as
+    a collision for worker-created paths, and a path whose ancestor became a
+    symlink as drift (a sentinel fingerprint; nothing is read through the
+    link) — previously these made refine/close fail permanently; (b) a
+    round-1 record carrying refine feedback (a round-0 `needs_split` /
+    `inference_busy` session later refined) is valid persisted state; (c) a
+    worktree deleted outside git is recreated after a targeted
+    `git worktree remove --force <own path>` (no global `prune` anywhere —
+    mismatch cleanup and `destroy()`'s already-gone fallback likewise touch
+    only their own registration, so another missing, unlocked worktree of
+    the same repository keeps its admin entry); (d) a
+    failed refine round restores under the committed read-only set and
+    verifies the re-applied state (validation / files / stats / created
+    paths / state hash), evicting RAM on mismatch; (e) patch-format
+    determinism — export, `splash_diff`, base capture, and the state hash
+    use `--no-color --src-prefix=a/ --dst-prefix=b/` (base capture's apply
+    uses `--whitespace=nowarn`), and the recovery state hash additionally
+    pins its diff format (`-U3`, myers, indent heuristic, inter-hunk
+    context 0, empty order file, `core.quotePath=true`,
+    `diff.suppressBlankEmpty=false`), so user porcelain config can neither
+    corrupt the patch nor invalidate a persisted session; output under the
+    default config is byte-identical to before. The export itself keeps the
+    configured diff context (Section 7.6). A persisted hash computed with
+    the Step 9 formula (unpinned, under that config) is still accepted
+    (reuse decision + recovery verification; persisted state is not
+    rewritten — the next generated round writes the current formula).
+    Before `splash_diff` / `splash_close` use a RAM-cached workspace, its
+    state is checked against the committed hash; on drift (an external
+    edit after the last round) the committed state is re-applied and
+    verified, and on failure RAM is evicted with `session_recovery_failed`
+    (nothing exported or deleted).
 11. **End-to-end** on a real repo + real local model: verify compact
     responses, on-demand diff, `git apply` merge into the main checkout,
     refine-loop convergence with bounded token growth, the stale-base path

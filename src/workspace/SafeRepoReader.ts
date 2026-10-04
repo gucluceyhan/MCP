@@ -72,7 +72,9 @@ export type SafeOpenFn = (target: string, flags: number) => Promise<SafeFileHand
  * Strict live read could not be completed safely (Step 9 spec 44/45/47/51).
  *
  * Raised when a strict capture cannot determine the live state with
- * fail-closed certainty: a non-`ENOENT` `lstat` error (EACCES/EIO/ELOOP/...),
+ * fail-closed certainty: an `lstat` error other than `ENOENT`/`ENOTDIR` (both
+ * are definite answers — the path cannot exist; anything else —
+ * EACCES/EIO/ELOOP/... — is uncertainty),
  * a `readlink` failure on a symlink leaf, or a failed no-follow content read.
  * The caller maps this to its own typed, safe error — it is an OPERATIONAL
  * failure, never "absent" and never "stale" (spec 44/47/51). The `cause`

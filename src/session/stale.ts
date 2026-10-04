@@ -21,9 +21,15 @@
  * Çıktı: kanonik, dedup'lu, leksikografik sıralı stale yollar (spec 37);
  * kaynak içeriği/özet/mod detayı YOK (spec 185).
  *
- * FAIL-CLOSED SINIRI: operasyonel yakalama hatası (EACCES/EIO/swap edilmiş
- * symlink) BU fonksiyona ULAŞMAZ — `captureLiveBase` onu tip'li hata olarak
- * atar (spec 44: işletme hatası stale DEĞİLDİR; oturum korunur). Bu fonksiyon
+ * FAIL-CLOSED SINIRI: operasyonel yakalama hatası (EACCES/EIO; ölçüm
+ * SIRASINDA yaprağın symlink'e takası → ELOOP vb.) BU fonksiyona ULAŞMAZ —
+ * `captureLiveBase` onu tip'li hata olarak atar (spec 44: işletme hatası stale
+ * DEĞİLDİR; oturum korunur). Sürüklenme ise ÖLÇÜM olarak gelir ve burada
+ * stale'e dönüşür: kalıcı olarak symlink olan yaprak = tip/mod sürüklenmesi;
+ * ATASI symlink'e dönüşmüş taban yolu `SYMLINKED_ANCESTOR_FINGERPRINT`
+ * sentinel'ini taşır (hiçbir base parmak iziyle eşit olamaz); `ENOTDIR`
+ * (önekteki bileşen dizin değil) taban yolunda yokluk (`exists:false`),
+ * worker-oluşturulan yolda çakışma (`true`) olarak ölçülür. Bu fonksiyon
  * yalnız güvenli tamamlanmış ölçümlerle çalışır.
  */
 

@@ -21,9 +21,13 @@
  *   düzenlenebilir ASLA kıpırdamaz; tam ölçü + yeniden tam ölçü
  * - dispatch paketi = ölçülen paket (byte-bayt; yeniden derleme YOK)
  * - hata yüzeyi: sabit güvenli mesaj; `cause` public'e taşınmaz
+ * - `captureLiveBase` (stale ölçümü): önekte DOSYA (ENOTDIR) → taban yokluğu /
+ *   created çakışması; atal SYMLINK → sentinel / çakışma (link üzerinden okuma
+ *   YOK); EACCES → fail-closed
  */
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import type { Stats } from "node:fs";
@@ -40,6 +44,7 @@ import {
   REDACTION_WARNING,
   SECRET_FILE_WARNING,
   SYMLINK_MARKER_PREFIX,
+  SYMLINKED_ANCESTOR_FINGERPRINT,
   labelForTier,
 } from "../dist/context/ContextAssembler.js";
 import {
@@ -51,6 +56,7 @@ import {
   type ContextRuntime,
 } from "../dist/context/types.js";
 import { BackendError } from "../dist/backend/errors.js";
+import { decideStale } from "../dist/session/stale.js";
 import type {
   InferenceMessage,
   InferenceRunOptions,
@@ -60,6 +66,7 @@ import type {
 } from "../dist/backend/InferenceBackend.js";
 import {
   WorkspaceError,
+  type PathFingerprint,
   type Workspace,
   type WorkspaceBaseEntry,
 } from "../dist/workspace/Workspace.js";
@@ -136,6 +143,9 @@ function fakeWorkspace(
       throw new Error("fake workspace: no recovery in this test");
     },
     recoveryStateHash: async () => {
+      throw new Error("fake workspace: no recovery in this test");
+    },
+    matchesRecoveryStateHash: async () => {
       throw new Error("fake workspace: no recovery in this test");
     },
     currentCreatedPaths: () => [],
@@ -1242,3 +1252,173 @@ async function chmodRepo(root: string): Promise<void> {
   // (macOS sandbox: chmod gerekmiyor; parite için no-op)
   void root;
 }
+
+// ── captureLiveBase: varlık/tip sürüklenmesi = ÖLÇÜM, işletim hatası DEĞİL ──
+//
+// Refine ve close AYNI `captureLiveBase` + `decideStale` algoritmasını
+// kullanır; stale bir taban close'u ASLA engellemez (DESIGN §7.5). Bu yüzden:
+// önekteki bir bileşenin DOSYA'ya dönüşmesi (lstat ENOTDIR) kesin yokluktur;
+// repo içindeki bir atalın SYMLINK'e dönüşmesi sentinel ölçümdür (link
+// üzerinden HİÇBİR şey okunmaz). Belirsiz I/O (EACCES...) fail-closed kalır.
+
+/** `ContextFs` çağrı KAYDI — link üzerinden okuma/izleme yapılmadığının kanıtı. */
+function recordingLayer(base: ContextFs): { fs: ContextFs; calls: Array<{ op: string; target: string }> } {
+  const calls: Array<{ op: string; target: string }> = [];
+  const rec = <T>(op: string, fn: (p: string) => Promise<T>) => async (p: string): Promise<T> => {
+    calls.push({ op, target: p });
+    return fn(p);
+  };
+  return {
+    fs: {
+      lstat: rec("lstat", base.lstat),
+      readFile: rec("readFile", base.readFile),
+      readlink: rec("readlink", base.readlink),
+      realpath: rec("realpath", base.realpath),
+    },
+    calls,
+  };
+}
+
+/** Repo DIŞINDA gerçek bir dizin (symlink hedefi) — test sonunda silinir. */
+async function outsideDir(t: TestContext): Promise<string> {
+  const dir = await realpath(await mkdtemp(path.join(tmpdir(), "splash-ctx-outside-")));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+test("captureLiveBase (a): base src/a.ts while `src` became a FILE (ENOTDIR) → { exists: false }, not assembly_failed", async (t) => {
+  const h = await realFsHarness(t);
+  await writeFile(path.join(h.root, "src"), "now a file\n");
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: h.fs });
+
+  const live = await assembler.captureLiveBase({ repoRoot: h.root, basePaths: ["src/a.ts"], createdPaths: [] });
+
+  assert.deepEqual(live.baseFingerprints.get(path.join(h.root, "src", "a.ts")), { exists: false });
+});
+
+test("captureLiveBase (b): base src/x/a.ts while `src` became a FILE (ancestor ENOTDIR) → { exists: false }, not assembly_failed", async (t) => {
+  const h = await realFsHarness(t);
+  await writeFile(path.join(h.root, "src"), "now a file\n");
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: h.fs });
+
+  const live = await assembler.captureLiveBase({ repoRoot: h.root, basePaths: ["src/x/a.ts"], createdPaths: [] });
+
+  assert.deepEqual(live.baseFingerprints.get(path.join(h.root, "src", "x", "a.ts")), { exists: false });
+});
+
+test("captureLiveBase (c): base src/a.ts while `src` became a SYMLINK to an outside dir (same name + same bytes there) → sentinel, nothing read through the link", async (t) => {
+  const h = await realFsHarness(t);
+  const outside = await outsideDir(t);
+  const content = "export const a = 1;\n";
+  // Dışarıda AYNI adlı + AYNI içerikli dosya: takip edilseydi parmak izi base'e
+  // eşit çıkardı (sahte "fresh"). Sentinel bunu imkânsız kılar.
+  await writeFile(path.join(outside, "a.ts"), content);
+  await symlink(outside, path.join(h.root, "src"));
+  const recorded = recordingLayer(h.fs);
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: recorded.fs });
+
+  const live = await assembler.captureLiveBase({ repoRoot: h.root, basePaths: ["src/a.ts"], createdPaths: [] });
+
+  const abs = path.join(h.root, "src", "a.ts");
+  const fingerprint = live.baseFingerprints.get(abs);
+  assert.deepEqual(fingerprint, { exists: true, type: "other", mode: "symlinked-ancestor" });
+  assert.deepEqual(fingerprint, SYMLINKED_ANCESTOR_FINGERPRINT);
+
+  // Link üzerinden HİÇBİR şey okunmadı/izlenmedi: yalnız atal link'in KENDİSİ
+  // lstat'lendi (no-follow); `src/` altı ve dış dizin hiç dokunulmadı.
+  assert.deepEqual(recorded.calls, [{ op: "lstat", target: path.join(h.root, "src") }]);
+  assert.ok(!recorded.calls.some((c) => c.target.startsWith(outside)), "dış dizin dokunulmaz");
+
+  // Birebir aynı içerikli base dosyasıyla bile karar STALE (decideStale DEĞİŞMEDİ).
+  const baseFingerprint: PathFingerprint = {
+    exists: true,
+    type: "file",
+    mode: "100644",
+    contentSha256: createHash("sha256").update(content, "utf8").digest("hex"),
+  };
+  const stale = decideStale({
+    repoRoot: h.root,
+    editablePaths: ["src/a.ts"],
+    baseFingerprints: new Map([["src/a.ts", baseFingerprint]]),
+    createdPaths: [],
+    live,
+  });
+  assert.deepEqual(stale, ["src/a.ts"]);
+});
+
+test("captureLiveBase (d): created src/new.ts — `src` SYMLINK → true (nothing read through the link); `src` FILE → true (collision, shallow + deep) → decideStale lists them", async (t) => {
+  // (d1) atal symlink → varlık doğrulanamaz + patch hedefi symlink'li dizine
+  // düşer → çakışma = true.
+  const h = await realFsHarness(t);
+  const outside = await outsideDir(t);
+  await symlink(outside, path.join(h.root, "src"));
+  const recorded = recordingLayer(h.fs);
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: recorded.fs });
+
+  const live = await assembler.captureLiveBase({ repoRoot: h.root, basePaths: [], createdPaths: ["src/new.ts"] });
+
+  assert.equal(live.createdExists.get(path.join(h.root, "src", "new.ts")), true);
+  assert.deepEqual(recorded.calls, [{ op: "lstat", target: path.join(h.root, "src") }]);
+
+  // (d2) atal DOSYA → yol var olamaz AMA worker'ın `create`'i main'e
+  // uygulanamaz → çakışma = true (hem sığ hem derin). `fresh` temiz
+  // uygulamayı onaylardı — bu yüzden stale.
+  const h2 = await realFsHarness(t);
+  await writeFile(path.join(h2.root, "src"), "now a file\n");
+  const assembler2 = new ContextAssembler({ runtime: new FakeRuntime(), fs: h2.fs });
+
+  const live2 = await assembler2.captureLiveBase({
+    repoRoot: h2.root,
+    basePaths: [],
+    createdPaths: ["src/new.ts", "src/y/new.ts"],
+  });
+
+  assert.equal(live2.createdExists.get(path.join(h2.root, "src", "new.ts")), true);
+  assert.equal(live2.createdExists.get(path.join(h2.root, "src", "y", "new.ts")), true);
+  // Uçtan uca karar (decideStale DEĞİŞMEDİ): created yollar stale listesinde.
+  const stale2 = decideStale({
+    repoRoot: h2.root,
+    editablePaths: [],
+    baseFingerprints: new Map(),
+    createdPaths: ["src/new.ts", "src/y/new.ts"],
+    live: live2,
+  });
+  assert.deepEqual(stale2, ["src/new.ts", "src/y/new.ts"]);
+});
+
+test("captureLiveBase (e): EACCES (ancestor walk or leaf lstat; base and created) still fails closed → assembly_failed", async (t) => {
+  const h = await realFsHarness(t);
+  await mkdir(path.join(h.root, "src"), { recursive: true });
+  await writeFile(path.join(h.root, "src", "a.ts"), "x\n");
+  const cases: Array<{ fault: string; basePaths: string[]; createdPaths: string[] }> = [
+    // atal yürüyüşü (hasSymlinkInPath failClosed) — EACCES "symlink yok" sayılmaz
+    { fault: path.join(h.root, "src"), basePaths: ["src/a.ts"], createdPaths: [] },
+    { fault: path.join(h.root, "src"), basePaths: [], createdPaths: ["src/new.ts"] },
+    // yaprak lstat (strict yakalama) — EACCES "yok" sayılmaz
+    { fault: path.join(h.root, "src", "a.ts"), basePaths: ["src/a.ts"], createdPaths: [] },
+    { fault: path.join(h.root, "src", "new.ts"), basePaths: [], createdPaths: ["src/new.ts"] },
+  ];
+  for (const c of cases) {
+    const assembler = new ContextAssembler({
+      runtime: new FakeRuntime(),
+      fs: faultLayer(h.fs, new Map([[c.fault, "EACCES"]])),
+    });
+    await assert.rejects(
+      assembler.captureLiveBase({ repoRoot: h.root, basePaths: c.basePaths, createdPaths: c.createdPaths }),
+      (err: unknown) => err instanceof ContextAssemblyError && err.kind === "assembly_failed",
+    );
+  }
+});
+
+test("read-only read path unchanged: ancestor became a FILE (ENOTDIR) → still assembly_failed (fail-closed not weakened)", async (t) => {
+  const h = await realFsHarness(t);
+  await writeFile(path.join(h.root, "refs"), "now a file\n");
+  const workspace = fakeWorkspace(h.root, ["src/a.ts"], { "src/a.ts": fileEntry("x") });
+  const assembler = new ContextAssembler({ runtime: new FakeRuntime(), fs: h.fs });
+  for (const readonlyPath of ["refs/doc.md", "refs/x/doc.md"]) {
+    await assert.rejects(
+      assembler.assemble(baseInput({ workspace, readonlyPaths: [readonlyPath] })),
+      (err: unknown) => err instanceof ContextAssemblyError && err.kind === "assembly_failed",
+    );
+  }
+});

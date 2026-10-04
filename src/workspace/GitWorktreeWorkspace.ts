@@ -168,6 +168,48 @@ export function setWorkspaceFs(ops: WorkspaceFs | null): void {
   activeFs = ops === null ? realFs : ops;
 }
 
+/**
+ * Patch/diff ÇIKTI biçimi kilidi (Step 10 M1). Kullanıcının porcelain git
+ * config'i ham diff baytlarını değiştirir (ölçüldü, Apple Git 2.50.1):
+ * `color.ui=always` ANSI kaçışı ekler; `diff.noprefix` / `diff.mnemonicPrefix`
+ * / `diff.srcPrefix`+`dstPrefix` başlık öneklerini değiştirir → export patch'i
+ * `git apply` ile uygulanamaz ya da dosyalar yanlış yere düşer; base-capture
+ * delta'sı uygulanamaz; state hash'i config'e bağlanır. Bu argümanlar renksiz
+ * + standart `a/`/`b/` çıktıyı zorlar — VARSAYILAN config'de çıktı BAYT-BAYT
+ * aynıdır (mevcut kalıcı `recoveryStateHash` değerleri geçerli kalır).
+ * Yalnız tam diff metni üreten çağrılara eklenir; `--numstat -z`,
+ * `--name-only -z`, `ls-files`, `ls-tree`, `cat-file`, `check-attr` bu
+ * config'lerden etkilenmez (ölçüldü). `diff.context` bilinçli olarak serbest
+ * bırakılır: export "configured context" kullanır (DESIGN §7.6).
+ */
+const PATCH_FORMAT_ARGS: readonly string[] = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/"];
+
+/**
+ * `recoveryStateHash` diff'inin BİÇİM kilidi (Step 10 H). Hash kalıcı oturum
+ * durumunun kimliğidir: görev ile restart arasında kullanıcının diff biçim
+ * config'i değişirse aynı state farklı hash üretir → kurtarma uyuşmazlık
+ * görür (`session_recovery_failed`) ve oturum KAPATILAMAZ. Ölçüldü (Apple Git
+ * 2.50.1) — çıktıyı DEĞİŞTİREN ayar → sabitleyici:
+ * `diff.context` → `-U3`; `diff.algorithm` (patience/histogram) →
+ * `--diff-algorithm=myers`; `diff.indentHeuristic=false` →
+ * `--indent-heuristic`; `diff.interHunkContext` → `--inter-hunk-context=0`;
+ * `diff.orderFile` → boş sıra dosyası (`-O<devnull>`);
+ * `diff.suppressBlankEmpty` / `core.quotePath` → `-c` ile git varsayılanı.
+ * Hepsi git varsayılanıdır: VARSAYILAN config'de çıktı eski formülle
+ * BAYT-BAYT aynı (mevcut kalıcı hash'ler geçerli kalır). `diff.relative`
+ * worktree kökünde etkisiz (ölçüldü) — eklenmez. YALNIZ hash'e uygulanır:
+ * export "configured context" kullanır (DESIGN §7.6), `diff()` aynen kalır.
+ */
+const STATE_HASH_DIFF_ARGS: readonly string[] = [
+  "-U3",
+  "--diff-algorithm=myers",
+  "--indent-heuristic",
+  "--inter-hunk-context=0",
+  `-O${os.devNull}`,
+];
+/** `STATE_HASH_DIFF_ARGS`'ın bayrağı olmayan ayarları (komut-bazlı `-c`). */
+const STATE_HASH_DIFF_CONFIG: readonly string[] = ["core.quotePath=true", "diff.suppressBlankEmpty=false"];
+
 /** `err`'ın `NodeJS.ErrnoException.code`'u verilen errno'ya eşit mi? */
 function isErrnoCode(err: unknown, code: string): boolean {
   if (typeof err !== "object" || err === null) {
@@ -403,21 +445,49 @@ export class GitWorktreeWorkspace implements Workspace {
    * 107/108): `git diff --binary --full-index <base>` (Step 5 fail-closed
    * filter re-check SONRASI) SHA-256'sı. Worker-oluşturulan dosyaları
    * (intent-to-add) içerir; kaynak/diff içeriği ASLA dönmEZ. İmha → red.
+   * Çıktı biçimi kullanıcının diff config'inden bağımsızdır
+   * (`PATCH_FORMAT_ARGS` + `STATE_HASH_DIFF_ARGS`/`_CONFIG` — Step 10 M1/H).
    */
   async recoveryStateHash(): Promise<string> {
     this.assertUsable();
     // filter re-check (PR #24 audit F-6): diff, içerik değiştirmiş tracked
     // dosyaları worktree attribute yüzeyiyle okur → içerikten ÖNCE.
     await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
-    const result = await this.git([
-      "diff",
-      "--binary",
-      "--full-index",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--no-renames",
-      this.baseCommit,
-    ]);
+    return this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+  }
+
+  /**
+   * Güncel state kalıcı hash'le eşleşiyor mu? Önce güncel formül; eşleşmezse
+   * Step 9 formülü (biçim bayrağı/pin YOK, kullanıcının config'i altında):
+   * Step 9 ile varsayılan-DIŞI config'te kaydedilmiş açık oturumların hash'i
+   * yükseltme sonrası da tanınır (Codex P2 — PR #34). Kalıcı durum yeniden
+   * YAZILMAZ; sonraki üretilmiş tur güncel formülle yazar. İmha → red.
+   */
+  async matchesRecoveryStateHash(expected: string): Promise<boolean> {
+    this.assertUsable();
+    await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
+    const current = await this.stateDiffHash([...PATCH_FORMAT_ARGS, ...STATE_HASH_DIFF_ARGS], STATE_HASH_DIFF_CONFIG);
+    if (current === expected) {
+      return true;
+    }
+    return (await this.stateDiffHash([], [])) === expected; // Step 9 (e746e8f) formülü
+  }
+
+  /** Base-göreceli tam diff'in SHA-256'sı (filter re-check ÇAĞIRANDA). */
+  private async stateDiffHash(formatArgs: readonly string[], config: readonly string[]): Promise<string> {
+    const result = await this.git(
+      [
+        "diff",
+        ...formatArgs,
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        this.baseCommit,
+      ],
+      { config },
+    );
     return createHash("sha256").update(result.stdout).digest("hex");
   }
 
@@ -1000,23 +1070,15 @@ export class GitWorktreeWorkspace implements Workspace {
     await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
     const args: string[] = [
       "diff",
+      ...PATCH_FORMAT_ARGS,
       "--no-ext-diff",
       "--no-textconv",
       "--no-renames",
       "-U3",
       this.baseCommit,
     ];
-    if (options.files !== undefined && options.files.length > 0) {
-      const paths: string[] = [];
-      for (const raw of options.files) {
-        const canonical = normalizeRepoPath(raw);
-        if (canonical === null) {
-          throw new WorkspaceError("unsafe_path", "The diff path filter is unsafe");
-        }
-        // `:(literal)`: filtre yolları pathspec magic'i olarak yorumlanamaz
-        // (audit CRITICAL-1) — `*` glob/genleşme etkisi yapamaz.
-        paths.push(literalPathspec(canonical));
-      }
+    const paths = this.literalPathFilter(options.files);
+    if (paths.length > 0) {
       args.push("--", ...paths);
     }
     const result = await this.git(args);
@@ -1030,11 +1092,37 @@ export class GitWorktreeWorkspace implements Workspace {
    * (`diff()` ile aynı gerekçe) → istatistikten ÖNCE re-check.
    * (`applyPatchSet` içindeki `statInternal` çağrısı 4b re-check'iyle
    * aynı turdur — ara yazar YOK; ikinci çağrı gerekmez.)
+   *
+   * Step 10 spec 8: `files` → `diff()` ile AYNI yol-filtre yardımcısı
+   * (`literalPathFilter`: kanonik güvenli yol + `:(literal)`); boş/yok =
+   * filtresiz. Sayılar git numstat'tan — diff metni parse edilmez.
    */
-  async stat(): Promise<DiffStats> {
+  async stat(options: WorkspaceDiffOptions = {}): Promise<DiffStats> {
     this.assertUsable();
     await assertNoExternalFilters(this.workspaceDir, [...this.workerCreatedPaths], this.baseCommit);
-    return this.statInternal();
+    return this.statInternal(this.literalPathFilter(options.files));
+  }
+
+  /**
+   * `diff()`/`stat()` ortak yol filtresi: her girdi `normalizeRepoPath` ile
+   * kanonikleştirilir (güvensiz → `unsafe_path`), `:(literal)` pathspec'e
+   * çevrilir. Yok/boş dizi → `[]` (filtresiz).
+   */
+  private literalPathFilter(files: readonly string[] | undefined): string[] {
+    if (files === undefined || files.length === 0) {
+      return [];
+    }
+    const paths: string[] = [];
+    for (const raw of files) {
+      const canonical = normalizeRepoPath(raw);
+      if (canonical === null) {
+        throw new WorkspaceError("unsafe_path", "The diff path filter is unsafe");
+      }
+      // `:(literal)`: filtre yolları pathspec magic'i olarak yorumlanamaz
+      // (audit CRITICAL-1) — `*` glob/genleşme etkisi yapamaz.
+      paths.push(literalPathspec(canonical));
+    }
+    return paths;
   }
 
   /**
@@ -1100,6 +1188,7 @@ export class GitWorktreeWorkspace implements Workspace {
 
       const result = await this.git([
         "diff",
+        ...PATCH_FORMAT_ARGS,
         "--binary",
         "--full-index",
         "--no-ext-diff",
@@ -1148,14 +1237,32 @@ export class GitWorktreeWorkspace implements Workspace {
     } catch (err) {
       const stillThere = await lstat(this.workspaceDir).catch(() => null);
       if (stillThere === null) {
-        // Dizin gitmişti; yönetim kaydını (admin metadata) temizle.
-        try {
-          await runGit(["worktree", "prune"], { cwd: this.repoRoot, config: [HOOKS_DISABLED_CONFIG] });
+        // Dizin gitmiş. Global `git worktree prune` KULLANILMAZ: aynı repodaki
+        // başka eksik-ama-kayıtlı, kilitsiz worktree'lerin (ör. kullanıcının
+        // takılı olmayan diskteki worktree'si) `.git/worktrees/<id>/` kaydını
+        // (HEAD+index) da silerdi. Yalnız BU yolun kaydına bakılır.
+        const registered = await isWorktreeRegistered(this.repoRoot, this.workspaceDir).catch(() => null);
+        if (registered === false) {
+          // Ne dizin ne kayıt var → imha zaten tamam.
           this.destroyed = true;
           return;
-        } catch {
-          // prune da başarısız → aşağıdaki güvenli hata.
         }
+        if (registered === true) {
+          // Kayıt kaldı → bir kez daha HEDEFLİ temizlik (eksik-ama-kayıtlı
+          // yolda `remove --force` yalnız o kaydı siler — ölçüldü, Git 2.50.1).
+          const retried = await runGit(["worktree", "remove", "--force", this.workspaceDir], {
+            cwd: this.repoRoot,
+            config: [HOOKS_DISABLED_CONFIG],
+          }).then(
+            () => true,
+            () => false,
+          );
+          if (retried) {
+            this.destroyed = true;
+            return;
+          }
+        }
+        // Liste okunamadı (null) VEYA yeniden deneme başarısız → güvenli hata.
       }
       throw new WorkspaceError("workspace_operation_failed", "Workspace destruction failed", { cause: err });
     }
@@ -1312,9 +1419,11 @@ export class GitWorktreeWorkspace implements Workspace {
    * Binary girdiler (`-`) dosya sayısına dahildir, sayısal katkıları 0'dır.
    * `--no-renames`: worker şemasında rename primitive'i yok (delete + create)
    * — kullanıcının rename config'i sonuç semantiğini değiştiremez (spec 66).
+   * `paths`: önceden doğrulanmış `:(literal)` pathspec'leri (`literalPathFilter`);
+   * boş → filtresiz (`applyPatchSet` çağrısı daima filtresiz).
    */
-  private async statInternal(): Promise<DiffStats> {
-    const result = await this.git([
+  private async statInternal(paths: string[] = []): Promise<DiffStats> {
+    const args: string[] = [
       "diff",
       "--no-ext-diff",
       "--no-textconv",
@@ -1322,7 +1431,11 @@ export class GitWorktreeWorkspace implements Workspace {
       "--numstat",
       "-z",
       this.baseCommit,
-    ]);
+    ];
+    if (paths.length > 0) {
+      args.push("--", ...paths);
+    }
+    const result = await this.git(args);
     let files = 0;
     let insertions = 0;
     let deletions = 0;
@@ -1744,7 +1857,7 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
   let trackedDelta: Buffer;
   try {
     const diff = await runGit(
-      ["diff", "HEAD", "--binary", "--full-index", "--no-ext-diff", "--no-textconv"],
+      ["diff", "HEAD", ...PATCH_FORMAT_ARGS, "--binary", "--full-index", "--no-ext-diff", "--no-textconv"],
       { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] },
     );
     trackedDelta = diff.stdout;
@@ -1768,8 +1881,11 @@ export async function createGitWorktreeWorkspace(input: WorkspaceCreateInput): P
     // ── (3) delta yalnız worktree içine uygulanır ───────────────────────────
     if (trackedDelta.length > 0) {
       try {
+        // `--whitespace=nowarn`: kullanıcının `apply.whitespace=fix` config'i
+        // delta'yı "düzelterek" base'i main'den SAPTIRIR, `=error` yakalamayı
+        // düşürür (ölçüldü) — base, main'in BİREBİR baytları olmalı (spec 19/20).
         await runGit(
-          ["apply", "--index", "--binary"],
+          ["apply", "--index", "--binary", "--whitespace=nowarn"],
           { cwd: workspaceDir, stdin: trackedDelta, config: [HOOKS_DISABLED_CONFIG] },
         );
       } catch (err) {
@@ -2323,8 +2439,8 @@ async function materializeWorkspace(
   if (dirExists) {
     // Hayatta worktree: kimlik (HEAD==base + toplevel) + state hash.
     if (await worktreeIdentityMatches(workspaceDir, state.baseCommit)) {
-      const hash = await workspace.recoveryStateHash().catch(() => null);
-      if (hash !== null && hash === state.recoveryStateHash) {
+      // Step 9 formülüyle kaydedilmiş hash de kabul (matchesRecoveryStateHash).
+      if (await workspace.matchesRecoveryStateHash(state.recoveryStateHash).catch(() => false)) {
         // spec 109/126: BİREBİR eşleşme → REUSE (imha/yeniden kurma YOK).
         return;
       }
@@ -2352,17 +2468,49 @@ async function worktreeIdentityMatches(workspaceDir: string, baseCommit: string)
 }
 
 /**
- * Güvenli imha (spec 192): `git worktree remove --force` + (başarısızsa)
- * `git worktree prune` + kalan izolö dizini `rm`. Bu, SPLASH'ın kendi
- * repo-DIŞI worktree dizinidir — kullanıcı verisi DEĞİLDİR.
+ * Güvenli imha (spec 192): HEDEFLİ `git worktree remove --force <yol>` +
+ * kalan izole dizini `rm`. Bu, SPLASH'ın kendi repo-DIŞI worktree dizinidir —
+ * kullanıcı verisi DEĞİLDİR. Global `git worktree prune` KULLANILMAZ: aynı
+ * repodaki başka eksik-ama-kayıtlı, kilitsiz worktree'lerin (ör. kullanıcının
+ * takılı olmayan diskteki worktree'si) kaydını da silerdi. `remove` başarısız
+ * olup kendi kaydımız kalırsa, ardından gelen `recreateWorktree` `add` öncesi
+ * aynı hedefli `remove --force` ile onu temizler.
  */
 async function destroyWorktreeSafely(repoRoot: string, workspaceDir: string): Promise<void> {
   await assertRealWorkspaceDirectory(workspaceDir);
   await runGit(["worktree", "remove", "--force", workspaceDir], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] }).catch(
     () => undefined,
   );
-  await runGit(["worktree", "prune"], { cwd: repoRoot, config: [HOOKS_DISABLED_CONFIG] }).catch(() => undefined);
   await rm(workspaceDir, { recursive: true, force: true }).catch(() => undefined);
+}
+
+/**
+ * `workspaceDir` bu repoda kayıtlı bir worktree mi (`git worktree list
+ * --porcelain -z`; `-z` yoldaki satır sonlarını da güvenle ayırır)?
+ * Dizin artık YOK olabildiği için kendi yolumuz `realpath` ile çözülemez;
+ * karşılaştırma iki adayla yapılır: (1) `path.resolve(workspaceDir)` — Splash
+ * yolu oluştururken zaten kanonik (`canonicalizeOutside`) verir ve `worktree
+ * add`'e bu biçim geçer; (2) var olan ebeveynin `realpath`'i + son ad (ör.
+ * macOS `/var` → `/private/var` farkına karşı). Git'in listelediği yollar da
+ * `path.resolve` ile normalize edilir. Liste okunamazsa hata YAYILIR (çağıran
+ * güvenli hataya düşer — kayıt "yok" varsayılmaz).
+ */
+async function isWorktreeRegistered(repoRoot: string, workspaceDir: string): Promise<boolean> {
+  const own = path.resolve(workspaceDir);
+  const candidates = new Set<string>([own]);
+  const parent = await realpath(path.dirname(own)).catch(() => null);
+  if (parent !== null) {
+    candidates.add(path.join(parent, path.basename(own)));
+  }
+  const listed = await runGit(["worktree", "list", "--porcelain", "-z"], {
+    cwd: repoRoot,
+    config: [HOOKS_DISABLED_CONFIG],
+  });
+  return listed.stdout
+    .toString("utf8")
+    .split("\0")
+    .filter((field) => field.startsWith("worktree "))
+    .some((field) => candidates.has(path.resolve(field.slice("worktree ".length))));
 }
 
 /**
@@ -2375,6 +2523,19 @@ async function recreateWorktree(state: WorkspaceRecoveryState, repoRoot: string,
   await assertRealWorkspaceDirectory(workspaceDir);
   // `git worktree add` hedef dizinin yok/boş olmasını şart koşar.
   await rm(workspaceDir, { recursive: true, force: true }).catch(() => undefined);
+  // Dizin git DIŞINDA silindiyse (rm -rf/Finder/temizlik aracı) kaydı
+  // `.git/worktrees/<n>` altında kalır; aynı yola `worktree add` "missing but
+  // already registered worktree" ile reddeder (exit 128 — ölçüldü, Git 2.50.1)
+  // ve kurtarma HER denemede başarısız olurdu. Her iki dal için (a/b) `add`
+  // ÖNCESİ, YALNIZ güvenilen kanonik `workspaceDir` kaydı hedefli temizlenir:
+  // eksik-ama-kayıtlı yolda `remove --force` yalnız o kaydı siler (ölçüldü).
+  // Global `git worktree prune` KULLANILMAZ — aynı repodaki başka eksik
+  // kayıtları (ör. kullanıcının çıkarılmış diskteki worktree'si) da silerdi.
+  // Kayıt yoksa git hata verir (beklenen) → yutulur.
+  await runGit(["worktree", "remove", "--force", workspaceDir], {
+    cwd: repoRoot,
+    config: [HOOKS_DISABLED_CONFIG],
+  }).catch(() => undefined);
 
   if (await baseObjectPresent(repoRoot, state.baseCommit)) {
     // case (a): base commit object DB'de → doğrudan checkout (byte-birebir).

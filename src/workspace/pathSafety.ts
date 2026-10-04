@@ -337,9 +337,13 @@ export async function hasSymlinkInPath(
     includeTarget: boolean;
     lstatFn?: (target: string) => Promise<Stats>;
     /**
-     * `true` (Context Assembler live read sınırı): atal `lstat`'ta ENOENT
-     * DIŞINDAKI I/O hatası (EACCES/EPERM/EIO/ELOOP) "sembolik bağlantı yok"
-     * olarak YORUMLANMAZ — hata ATILIR (çağrı tarafı `assembly_failed` yapar).
+     * `true` (Context Assembler live read sınırı): atal `lstat`'ta ENOENT/
+     * ENOTDIR DIŞINDAKI I/O hatası (EACCES/EPERM/EIO/ELOOP) "sembolik
+     * bağlantı yok" olarak YORUMLANMAZ — hata ATILIR (çağrı tarafı
+     * `assembly_failed` yapar). ENOTDIR = önekteki bir bileşen dizin değil
+     * (ör. bir dosya) → gerisi VAR OLAMAZ (kesin yokluk, ENOENT gibi) →
+     * denetim orada durur; sonraki okuma aynı yokluğu kendi sözleşmesiyle
+     * (ENOENT/ENOTDIR) yeniden görür.
      * `false`/verilmezse: atal var değil → denetim orada durar (Step 5).
      */
     failClosed?: boolean;
@@ -365,10 +369,12 @@ export async function hasSymlinkInPath(
     try {
       stat = await probe(current);
     } catch (err) {
-      if (failClosed && !errnoIs(err, "ENOENT")) {
+      if (failClosed && !errnoIs(err, "ENOENT") && !errnoIs(err, "ENOTDIR")) {
         throw err; // Belirsiz I/O → fail-closed (güvenli taraf).
       }
-      break; // Atal var değil (ENOENT) veya legacy → gerisi var olamaz.
+      // Atal var değil (ENOENT) / önekteki bileşen dizin değil (ENOTDIR)
+      // veya legacy → gerisi var olamaz.
+      break;
     }
     if (stat.isSymbolicLink()) {
       return true;

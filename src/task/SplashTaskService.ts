@@ -1,5 +1,6 @@
 /**
- * Step 6-9: `splash_task` + `splash_refine` servis katmanı — İNCE ADAPTÖR.
+ * Step 6-10: `splash_task` + `splash_refine` + `splash_diff` + `splash_close`
+ * servis katmanı — İNCE ADAPTÖR.
  *
  * Step 9'dan itibaren oturum yaşam döngüsünün TEK yetkili sahibi
  * `SessionManager`'dır (`src/session/SessionManager.ts`):
@@ -7,11 +8,14 @@
  *   create → ilk kalıcılık → 1. tur → tur kalıcılığı → RAM önbellek
  *   refine: lazy load + worktree kurtarma + determinizm doğrulaması →
  *   stale denetimi → max-round guard → tur → transactional kalıcılık
+ *   diff (Step 10): kilit + lazy load/kurtarma → workspace diff/stat
+ *   close (Step 10): kilit + lazy load/kurtarma → stale → metadata →
+ *   export → imha → yetkili durum silme → RAM silme
  *
  * Bu sınıf KENDİSİNDE orkestrasyon/defter YOKTUR (spec 4: iki rakip kayıt
  * defteri YOK): yalnız süreç-tek `SessionManager`'ı kurar ve
- * `executeTask` / `executeRefine` / `activeTasks` / `dispose` çağrılarını
- * oraya iletir. Step 6'nın geçici in-memory `ActiveTask` defteri BU ADIMDA
+ * `executeTask` / `executeRefine` / `executeDiff` / `executeClose` /
+ * `activeTasks` / `dispose` çağrılarını oraya iletir. Step 6'nın geçici in-memory `ActiveTask` defteri BU ADIMDA
  * SessionManager'ın RAM önbelleği ile değiştirildi.
  *
  * SORUMLULUK SINIRI (spec 2/5): BU SINIF ORKESTRASYON SAHİBİ DEĞİLDİR —
@@ -41,6 +45,10 @@ import {
   SessionManager,
   type ActiveSessionInfo,
   type SessionManagerDeps,
+  type SplashCloseRequest,
+  type SplashCloseResult,
+  type SplashDiffRequest,
+  type SplashDiffResult,
   type SplashRefineRequest,
   type SplashTaskRequest,
 } from "../session/SessionManager.js";
@@ -97,7 +105,15 @@ export interface SplashTaskServiceDeps {
 }
 
 // API uyumu: istek/görünüm tipleri SessionManager'dan re-export edilir.
-export type { SplashTaskRequest, SplashRefineRequest, ActiveSessionInfo } from "../session/SessionManager.js";
+export type {
+  SplashTaskRequest,
+  SplashRefineRequest,
+  SplashDiffRequest,
+  SplashDiffResult,
+  SplashCloseRequest,
+  SplashCloseResult,
+  ActiveSessionInfo,
+} from "../session/SessionManager.js";
 // Geriye uyum: Step 6-7 import yüzeyi (testler + `wire.ts` buradan alır).
 export { SplashTaskError, type SplashTaskErrorKind } from "./errors.js";
 
@@ -120,7 +136,7 @@ export class SplashTaskService {
     this.#manager = new SessionManager(managerDeps);
   }
 
-  /** Runtime kapatılmış mı? (dispose sonrası yeni görev/refine reddedilir.) */
+  /** Runtime kapatılmış mı? (dispose sonrası yeni görev/refine/diff/close reddedilir.) */
   get disposed(): boolean {
     return this.#manager.disposed;
   }
@@ -150,9 +166,26 @@ export class SplashTaskService {
   }
 
   /**
-   * Step 9 kapatım yaşam döngüsü (spec 128-131): yeni iş reddedilir,
-   * in-flight çalışmalara BEKLENİR, RAM temizlenir; KALICI OTURUMLARA
-   * DOKUNULMAZ (worktree/sessions silinmez — imha Step 10 `splash_close`).
+   * Bir `splash_diff` çağrısını iletir (Step 10): salt-inceleme — diff
+   * metni ya da (`stat: true`) yalnız istatistik. İş mantığı `SessionManager`'da.
+   */
+  executeDiff(request: SplashDiffRequest): Promise<SplashDiffResult> {
+    return this.#manager.diff(request);
+  }
+
+  /**
+   * Bir `splash_close` çağrısını iletir (Step 10): export → imha → yetkili
+   * durum silme. İş mantığı ve hata sınırları `SessionManager`'da.
+   */
+  executeClose(request: SplashCloseRequest): Promise<SplashCloseResult> {
+    return this.#manager.close(request);
+  }
+
+  /**
+   * Step 9/10 kapatım yaşam döngüsü (spec 128-131): yeni iş reddedilir,
+   * in-flight çalışmalara (task/refine/diff/close) BEKLENİR, RAM temizlenir;
+   * KALICI OTURUMLARA DOKUNULMAZ (worktree/sessions silinmez — imha yalnız
+   * `splash_close`).
    */
   dispose(): Promise<void> {
     return this.#manager.dispose();

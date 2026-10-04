@@ -3,13 +3,14 @@
  * üzerinden gerçek `McpServer` + `Client` konuşur.
  *
  * Gerçeklik karışımı: gerçek `createSplashRuntime` kompozisyonu (zod şema,
- * `splash_task`/`splash_refine`/`splash_ping`, runtime dispose) — backend
- * SAHTE (model çağrısı yok), coordinator GERÇEK (fake lock/scanner
- * dikişleriyle).
+ * `splash_task`/`splash_refine`/`splash_diff`/`splash_close`, runtime
+ * dispose) — backend SAHTE (model çağrısı yok), coordinator GERÇEK (fake
+ * lock/scanner dikişleriyle).
  *
  * Çiviler:
- * - 121: `splash_task` + `splash_refine` (zod şemalı) + geçici `splash_ping`
- *   kayıtlı; başlangıç TEBEL (HTTP/dizin yok).
+ * - 121: yayın yüzeyi TAM OLARAK dört araç (`splash_task`, `splash_refine`,
+ *   `splash_diff`, `splash_close`; geçici `splash_ping` KALDIRILDI);
+ *   başlangıç TEBEL (HTTP/dizin yok).
  * - 123/124: MCP yanıtı compact metadata — snake_case; source/diff/patch/
  *   context içeriği YOK; süreç-tek coordinator paylaşımlı.
  * - 125: güvenli hata serialization'ı + Step 9 runtime dispose (kapatım
@@ -264,7 +265,7 @@ function collectKeys(value: unknown, into: Set<string> = new Set()): Set<string>
 
 // ── Testler ─────────────────────────────────────────────────────────────────
 
-test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, no HTTP)", async (t) => {
+test("121: exactly the four production tools are registered (no splash_ping); construction is LAZY (no I/O, no HTTP)", async (t) => {
   const fixture = await makeMcpFixture(t);
   // Başlangıç TEBEL (spec 84/85): hiçbir dizin/HTTP yok — yalnız kurulum.
   assert.ok(!(await pathExists(fixture.sessionsDir)), "başlangıçta sessions dizini OLUŞMAMALI");
@@ -272,8 +273,30 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
   const session = await makeMcpSession(t, fixture);
   const tools = (await session.client.listTools()).tools;
   const names = tools.map((tool) => tool.name).sort();
-  // Step 9: `splash_refine` ikinci production aracı olarak kayıtlı.
-  assert.deepEqual(names, ["splash_ping", "splash_refine", "splash_task"]);
+  // Step 10: final v1 yayın yüzeyi TAM OLARAK dört araç — geçici dev ping YOK.
+  assert.deepEqual(names, ["splash_close", "splash_diff", "splash_refine", "splash_task"]);
+  // Sunucu kimliği (eski ping'in doğruladığı servis adı/sürümü) `initialize`'da:
+  assert.deepEqual(session.client.getServerVersion(), { name: SERVICE_NAME, version: SERVICE_VERSION });
+
+  // `splash_diff` şeması: `session_id` zorunlu; `files`/`stat` isteğe bağlı;
+  // bilinmeyen alan YOK (`.strict()` → additionalProperties: false).
+  const diffSchema = tools.find((tool) => tool.name === "splash_diff")?.inputSchema as {
+    properties: Record<string, unknown>;
+    required?: string[];
+    additionalProperties?: boolean;
+  };
+  assert.deepEqual(Object.keys(diffSchema.properties).sort(), ["files", "session_id", "stat"]);
+  assert.deepEqual(diffSchema.required, ["session_id"]);
+  assert.equal(diffSchema.additionalProperties, false);
+  // `splash_close` şeması: YALNIZ `session_id` (apply/force/output_path YOK).
+  const closeSchema = tools.find((tool) => tool.name === "splash_close")?.inputSchema as {
+    properties: Record<string, unknown>;
+    required?: string[];
+    additionalProperties?: boolean;
+  };
+  assert.deepEqual(Object.keys(closeSchema.properties), ["session_id"]);
+  assert.deepEqual(closeSchema.required, ["session_id"]);
+  assert.equal(closeSchema.additionalProperties, false);
 
   // `splash_refine` şeması (spec 19-20): `session_id` + `feedback` ZORUNLU;
   // `files` (salt-okunur referans) İSTEKLİ.
@@ -313,13 +336,13 @@ test("121: splash_task + splash_ping registered; construction is LAZY (no I/O, n
     assert.ok(Object.hasOwn(optionsSchema.properties, option), `options.${option} şemada olmalı`);
   }
 
-  // `splash_ping` — hiçbir şeye dokunmaz:
+  // Kaldırılan `splash_ping` artık bilinmeyen araç → hata sonucu:
   const ping = (await session.client.callTool({ name: "splash_ping", arguments: {} })) as WireContent;
-  assert.ok(!ping.isError);
-  assert.deepEqual(parseWire(ping), { service: SERVICE_NAME, version: SERVICE_VERSION, status: "ok" });
-  // Ping repository/model ile etkileşmedi:
+  assert.equal(ping.isError, true, "splash_ping must no longer be callable");
+  assert.ok(String(ping.content?.[0]?.text).includes("not found"));
+  // Hiçbir şeye dokunulmadı (repository/model/oturum yok):
   assert.equal(session.backend.runCalls.length, 0);
-  assert.ok(!(await pathExists(fixture.sessionsDir)), "ping sessions dizini OLUŞTURMAMALI");
+  assert.ok(!(await pathExists(fixture.sessionsDir)), "başlangıç sessions dizini OLUŞTURMAMALI");
 });
 
 test("BLOCKER 4: MCP context_tier is a canonical enum (numeric / unknown rejected)", async (t) => {
@@ -497,9 +520,19 @@ test("8: `files` missing → MCP schema rejection; task service NEVER called (no
   // Görev servisine ASLA inemedi — workspace/inference/oturum YOK:
   assert.equal(session.backend.runCalls.length, 0);
   assert.ok(!(await pathExists(fixture.sessionsDir)), "şema-geçersiz çağrıda sessions dizini OLUŞMAMALI");
-  // Çalışma zamanı hâlâ ayakta (şema reddi runtime'ı bozmaz):
-  const ping = (await session.client.callTool({ name: "splash_ping", arguments: {} })) as WireContent;
-  assert.ok(!ping.isError);
+  // Çalışma zamanı hâlâ ayakta (şema reddi runtime'ı bozmaz) — yan-etkisiz
+  // kanıt: protokol isteği yanıtlanır VE bir araç çağrısı servise kadar iner
+  // (bilinmeyen oturum → güvenli tip'li `session_not_found`; dizin/inference YOK).
+  const names = (await session.client.listTools()).tools.map((tool) => tool.name).sort();
+  assert.deepEqual(names, ["splash_close", "splash_diff", "splash_refine", "splash_task"]);
+  const probe = (await session.client.callTool({
+    name: "splash_diff",
+    arguments: { session_id: "00000000-0000-4000-8000-000000000000" },
+  })) as WireContent;
+  assert.equal(probe.isError, true);
+  assert.deepEqual(parseWire(probe), { kind: "session_not_found", message: "The session was not found" });
+  assert.equal(session.backend.runCalls.length, 0);
+  assert.ok(!(await pathExists(fixture.sessionsDir)), "yan-etkisiz kanıt sessions dizini OLUŞTURMAMALI");
 });
 
 test("8: `files: []` (explicit empty array, create-only task) is still accepted", async (t) => {
@@ -667,4 +700,116 @@ test("Step 8: rules resolution failure over MCP → safe typed error; no session
   // Resolution workspace/session ÖNCESİ düşer — hiçbir iz kalmamalı:
   assert.equal(backend.runCalls.length, 0);
   assert.ok(!(await pathExists(fixture.sessionsDir)), "no session directory must be created");
+});
+
+// ── Step 10: splash_diff / splash_close MCP seviyesinde ──────────────────────
+
+test("Step 10: diff/close schema rejections (missing session_id, unknown fields) keep the session OPEN", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const session = await makeMcpSession(t, fixture);
+  session.backend.runBehavior = async () => ({ content: workerOkJson(), usage: { inputTokens: 1, outputTokens: 1 } });
+  const task = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "Change the value", files: ["src/a.ts"] },
+  })) as WireContent;
+  assert.ok(!task.isError, `beklenmedik hata: ${task.content?.[0]?.text}`);
+  const sessionId = parseWire(task).session_id as string;
+  const sessionDir = path.join(fixture.sessionsDir, sessionId);
+
+  const rejected: Array<{ name: string; arguments: Record<string, unknown> }> = [
+    { name: "splash_diff", arguments: {} },
+    { name: "splash_diff", arguments: { session_id: "" } },
+    { name: "splash_diff", arguments: { session_id: sessionId, force: true } },
+    { name: "splash_diff", arguments: { session_id: sessionId, stat: "yes" } },
+    { name: "splash_close", arguments: {} },
+    { name: "splash_close", arguments: { session_id: sessionId, apply: true } },
+    { name: "splash_close", arguments: { session_id: sessionId, output_path: path.join(fixture.root, "evil.patch") } },
+    { name: "splash_close", arguments: { session_id: sessionId, force: true } },
+  ];
+  for (const call of rejected) {
+    const res = (await session.client.callTool(call)) as WireContent;
+    assert.equal(res.isError, true, `şema reddi beklenir: ${JSON.stringify(call)}`);
+  }
+  // Oturum AÇIK: workspace + yetkili durum yerinde; hiçbir patch export edilmedi.
+  assert.ok(await pathExists(path.join(sessionDir, "session.json")), "reddedilen close oturumu KAPATMAMALI");
+  assert.ok(await pathExists(path.join(sessionDir, "workspace")));
+  assert.ok(!(await pathExists(path.join(fixture.outputRoot, "patches"))), "reddedilen close patch ÜRETMEMELİ");
+  assert.ok(!(await pathExists(path.join(fixture.root, "evil.patch"))), "çağıran patch yolunu SEÇEMEZ");
+  assert.equal(session.runtime.server.isConnected(), true);
+});
+
+test("Step 10: unknown / unsafe session over MCP → safe typed errors (no path, no payload)", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const session = await makeMcpSession(t, fixture);
+  for (const name of ["splash_diff", "splash_close"]) {
+    const missing = (await session.client.callTool({
+      name,
+      arguments: { session_id: "11111111-1111-4111-8111-111111111111" },
+    })) as WireContent;
+    assert.equal(missing.isError, true);
+    assert.deepEqual(parseWire(missing), { kind: "session_not_found", message: "The session was not found" });
+
+    const unsafe = (await session.client.callTool({ name, arguments: { session_id: "../../etc" } })) as WireContent;
+    assert.equal(unsafe.isError, true);
+    assert.deepEqual(parseWire(unsafe), { kind: "invalid_input", message: "The session id is not a safe identifier" });
+  }
+  const badPath = (await session.client.callTool({
+    name: "splash_diff",
+    arguments: { session_id: "11111111-1111-4111-8111-111111111111", files: ["../outside.ts"] },
+  })) as WireContent;
+  assert.equal(badPath.isError, true);
+  assert.deepEqual(parseWire(badPath), {
+    kind: "invalid_input",
+    message: "The diff files must be safe repository-relative paths",
+  });
+  assert.equal(session.backend.runCalls.length, 0);
+  assert.ok(!(await pathExists(fixture.sessionsDir)));
+});
+
+test("Step 10: handler wiring — diff returns raw text / stat JSON; close returns compact metadata only", async (t) => {
+  const fixture = await makeMcpFixture(t);
+  const session = await makeMcpSession(t, fixture);
+  session.backend.runBehavior = async () => ({ content: workerOkJson(), usage: { inputTokens: 1, outputTokens: 1 } });
+  const task = (await session.client.callTool({
+    name: "splash_task",
+    arguments: { task: "Change the value", files: ["src/a.ts"] },
+  })) as WireContent;
+  const sessionId = parseWire(task).session_id as string;
+
+  // splash_diff (varsayılan): ham unified diff metni — sarmalayıcı JSON YOK.
+  const diff = (await session.client.callTool({ name: "splash_diff", arguments: { session_id: sessionId } })) as WireContent;
+  assert.ok(!diff.isError);
+  const diffText = String(diff.content?.[0]?.text);
+  assert.ok(diffText.startsWith("diff --git a/src/a.ts b/src/a.ts"), diffText);
+  assert.ok(diffText.includes("+const value = 2;"));
+
+  // stat:true → YALNIZ yapısal istatistik.
+  const stat = (await session.client.callTool({
+    name: "splash_diff",
+    arguments: { session_id: sessionId, stat: true },
+  })) as WireContent;
+  assert.ok(!stat.isError);
+  assert.equal(stat.content?.[0]?.text, '{"diff_stats":{"files":1,"insertions":1,"deletions":1}}');
+
+  // splash_close → compact metadata (içerik YOK); patch diskte; oturum kapandı.
+  const close = (await session.client.callTool({ name: "splash_close", arguments: { session_id: sessionId } })) as WireContent;
+  assert.ok(!close.isError, `beklenmedik hata: ${close.content?.[0]?.text}`);
+  const wire = parseWire(close);
+  assert.deepEqual(Object.keys(wire).sort(), ["base_status", "diff_stats", "files_changed", "patch_path", "summary"]);
+  assert.equal(wire.base_status, "fresh");
+  assert.deepEqual(wire.files_changed, ["src/a.ts"]);
+  assert.deepEqual(wire.diff_stats, { files: 1, insertions: 1, deletions: 1 });
+  assert.equal(wire.summary, "Changed value to 2.");
+  const closeText = String(close.content?.[0]?.text);
+  assert.ok(!closeText.includes("const value"), "close yanıtı kaynak/diff içeriği TAŞIMAZ");
+  assert.ok(!closeText.includes("NEVER_ON_WIRE"));
+  const patchPath = wire.patch_path as string;
+  assert.ok(path.isAbsolute(patchPath) && (await readFile(patchPath, "utf8")).includes("+const value = 2;"));
+  assert.ok(!(await pathExists(path.join(fixture.sessionsDir, sessionId))), "oturum kapandı");
+  // Ana checkout dokunulmadı (Splash patch'i ASLA uygulamaz):
+  assert.equal(await readFile(path.join(fixture.repoRoot, "src/a.ts"), "utf8"), "const value = 1;\n");
+
+  const after = (await session.client.callTool({ name: "splash_diff", arguments: { session_id: sessionId } })) as WireContent;
+  assert.equal(after.isError, true);
+  assert.equal(parseWire(after).kind, "session_not_found");
 });

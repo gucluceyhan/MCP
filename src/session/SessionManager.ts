@@ -9,12 +9,20 @@
  * kayıt defteri YOK).
  *
  * SORUMLULUK SINIRI (spec 5): SAHİP OLDUKLARI: create / load / restore /
- * aynı-oturum kilit (FIFO) / refine / persist / stale denetimi / tur sayısı /
- * geçmiş sınıflandırması / salt-okunur kümesi / max-round guard / shutdown
- * ayrılması. SAHİP OLMADIKLARI: model implementasyonu, prompt inşası, patch
+ * aynı-oturum kilit (FIFO) / refine / diff / close / persist / stale
+ * denetimi / tur sayısı / geçmiş sınıflandırması / salt-okunur kümesi /
+ * max-round guard / shutdown ayrılması. SAHİP OLMADIKLARI: model implementasyonu, prompt inşası, patch
  * semantik doğrulaması, Git detayları, kural keşfi — bunlar mevcut
  * bileşenlerde (ContextAssembler / Workspace / RulesResolver / Coordinator)
  * kalır ve injected olarak tüketilir.
+ *
+ * Step 10 (DESIGN.md §3, §7.5, §7.6): aynı yaşam döngüsü sahibi iki işlemi
+ * daha yürütür — `diff` (salt-inceleme: kilit + RAM/kurtarma → workspace
+ * diff/stat; inference/kalıcılık/durum mutasyonu YOK) ve `close` (kilit +
+ * RAM/kurtarma → refine ile AYNI stale denetimi → metadata → patch export →
+ * workspace imhası → yetkili durum silme → RAM silme). Stale taban close'u
+ * ENGELLEMEZ; Splash patch'i ana checkout'a ASLA uygulamaz. Git export
+ * mantığı `Workspace`'te, dar silme `SessionStore`'da kalır.
  *
  * Otorite (spec 8): DISK = yetkili kaynak; RAM = aktif önbellek. Süreç
  * yeniden başlatması bir açık oturumu GEÇERSİZ KILMAZ — oturum yalnız diski
@@ -40,6 +48,7 @@ import {
   WorkerContractError,
   type CompactContextMetadata,
   type CompactResult,
+  type DiffStats,
   type RulesSource,
   type SelectedContextTier,
   type ValidationResult,
@@ -122,6 +131,56 @@ export interface SplashRefineRequest {
   signal?: AbortSignal;
 }
 
+/**
+ * Bir `splash_diff` çağrısının girdisi (Step 10 spec 4/7/8). Salt-inceleme:
+ * inference / tur artışı / durum mutasyonu YOK.
+ */
+export interface SplashDiffRequest {
+  /** Açık oturumun kimliği. */
+  sessionId: string;
+  /** İsteğe bağlı repository-göreceli LİTERAL yol filtresi (boş = filtresiz). */
+  files?: readonly string[];
+  /** `true` → yalnız yapısal istatistik (kaynak/diff metni YOK). */
+  stat?: boolean;
+}
+
+/**
+ * `splash_diff` sonucu — `mode` üzerinden ayrımlı union (spec 8/9):
+ * - `diff` → base-göreceli unified diff metni (oluşturulan kodu taşıyan TEK
+ *   MCP aracı — kasıtlı içerik istisnası);
+ * - `stat` → yalnız files/insertions/deletions (kaynak YOK).
+ */
+export type SplashDiffResult =
+  | { mode: "diff"; diff: string }
+  | { mode: "stat"; diffStats: DiffStats };
+
+/** Bir `splash_close` çağrısının girdisi (spec 10) — başka girdi KABUL EDİLMEZ. */
+export interface SplashCloseRequest {
+  /** Kapatılacak açık oturumun kimliği. */
+  sessionId: string;
+}
+
+/** `splash_close` sonucunun tüm taban durumlarında ortak alanları (içerik YOK). */
+interface SplashCloseCommon {
+  /** Export edilen patch'in mutlak yolu (`<outputRoot>/patches/<repo-id>/<session-id>.patch`). */
+  patchPath: string;
+  /** Son kalıcı üretilmiş sonucun doğrulanmış değişen yolları (tur 0 → `[]`). */
+  filesChanged: string[];
+  /** Export'tan hemen önce canlı workspace'ten (git numstat) yapısal istatistik. */
+  diffStats: DiffStats;
+  /** Son kalıcı compact özet (ham worker çıktısı/geri bildirim/kural YOK). */
+  summary: string;
+}
+
+/**
+ * `splash_close` sonucu — taban tazeliği AYRIMLI union (`CompactResult`'taki
+ * fresh/stale kalıbı): `fresh` → `staleFiles` olamaz; `stale` → ZORUNLU.
+ * Stale export'u ENGELLEMEZ (spec 13); yalnız orkestratörün otomatik
+ * uygulamasını yasaklar.
+ */
+export type SplashCloseResult = SplashCloseCommon &
+  ({ baseStatus: "fresh"; staleFiles?: never } | { baseStatus: "stale"; staleFiles: string[] });
+
 // ── Görünüm arayüzları (küçük DI; service locator YOK) ──────────────────────
 
 /**
@@ -152,6 +211,12 @@ export interface SessionStoreLike {
   load(sessionId: string): Promise<PersistedSession>;
   /** Atomik yazım (tmp → fsync → rename → dizin fsync). */
   save(session: PersistedSession): Promise<void>;
+  /**
+   * Dar kapsamlı yetkili durum silme (Step 10 spec 18/19): yalnız `unlink` +
+   * tek-dizin `rmdir`; rekürsif silme YOK. Commit noktası = `session.json`
+   * unlink'i — sonrasındaki temizlik best-effort'tur, hata dışarı atılmaz.
+   */
+  delete(sessionId: string): Promise<void>;
 }
 
 export interface SessionManagerDeps {
@@ -219,6 +284,13 @@ const INFERENCE_BUSY_SUMMARY = "Inference is temporarily unavailable; no worker 
 const MAX_ROUNDS_SUMMARY = "The maximum refinement rounds were reached; no refinement was run.";
 
 /**
+ * Kalıcı compact özeti OLMAYAN oturumun close özeti (Step 10 spec 22):
+ * tur 0'da `latestResult` yoksa (ör. kalıcılık aşamaları arasında duran
+ * süreç) — sabit, içeriksiz.
+ */
+const NO_GENERATED_RESULT_SUMMARY = "The session was closed without a generated worker result.";
+
+/**
  * `SessionManager` yaşam döngüsü (Step 9).
  *
  * Konstrüksiyon tembel kalır (spec 18/259): I/O YAPMAZ — oturum tarama,
@@ -244,16 +316,18 @@ export class SessionManager {
   /**
    * Aynı-oturum FIFO kilitleri (spec 76/78): anahtar = `session_id`
    * (nesne kimliği DEĞİL) — iki eşzamanlı çağrı (disk load tetikleyeni de
-   * dahil) sıralanır. Farklı oturumlar paralel (spec 77).
+   * dahil) sıralanır. Farklı oturumlar paralel (spec 77). Step 10:
+   * refine / diff / close AYNI zinciri paylaşır (`#runExclusive`).
    */
   #locks = new Map<string, Promise<void>>();
   /**
-   * Şu an yürüyen (terminale ulaşmamış) task/refine çalışmaları — `dispose()`
-   * bu defteri BEKLER (spec 131: in-flight işler güvenli terminal yollarına
-   * ulaşana kadar kapatım çözülmez; fire-and-forget YOK).
+   * Şu an yürüyen (terminale ulaşmamış) task/refine/diff/close çalışmaları —
+   * `dispose()` bu defteri BEKLER (spec 131: in-flight işler güvenli terminal
+   * yollarına ulaşana kadar kapatım çözülmez; fire-and-forget YOK). Tek
+   * kayıt yolu: `#trackInFlight`.
    */
-  #inFlight = new Set<Promise<CompactResult>>();
-  /** `dispose()` sonrası yeni task/refine kabul edilmez (spec 128/131). */
+  #inFlight = new Set<Promise<unknown>>();
+  /** `dispose()` sonrası yeni task/refine/diff/close kabul edilmez (spec 128/131). */
   #disposed = false;
 
   constructor(deps: SessionManagerDeps) {
@@ -313,13 +387,7 @@ export class SessionManager {
     }
     // in-flight kaydı, `#disposed` denetiminden sonra SENKRON yapılır —
     // dispose, kayıttan önce araya giremez (tek iplik; yield yok).
-    const execution = this.#runTask(request);
-    this.#inFlight.add(execution);
-    try {
-      return await execution;
-    } finally {
-      this.#inFlight.delete(execution);
-    }
+    return this.#trackInFlight(this.#runTask(request));
   }
 
   /** `createTask` gövdesi — in-flight defterinde izlenir. */
@@ -561,29 +629,7 @@ export class SessionManager {
     }
 
     // ── aynı-oturum FIFO kilit (anahtar = session_id, spec 76/78) ───────────
-    // Gövde kilit SAHİBİ tamamlayınca başlar; öncesinin HATASI kuyruğu
-    // zehirlemez (spec 319/320). Kuyruktaki (başlamamış) iş `#inFlight`'te
-    // izlenir — dispose hepsini bekler (spec 131).
-    const previous = this.#locks.get(request.sessionId) ?? Promise.resolve();
-    const execution = previous.then(
-      () => this.#runRefine(request),
-      () => this.#runRefine(request),
-    );
-    const tail = execution.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.#locks.set(request.sessionId, tail);
-    this.#inFlight.add(execution);
-    try {
-      return await execution;
-    } finally {
-      this.#inFlight.delete(execution);
-      // Zincirin SON halkası buysa kilit kayıttan düşer (hafıza sızısı YOK).
-      if (this.#locks.get(request.sessionId) === tail) {
-        this.#locks.delete(request.sessionId);
-      }
-    }
+    return this.#runExclusive(request.sessionId, () => this.#runRefine(request));
   }
 
   /** `refine` gövdesi — per-session FIFO zincirinde sırayla yürür. */
@@ -597,25 +643,11 @@ export class SessionManager {
     // ── stale-base denetimi — inference ÖNCESİ (spec 29) ────────────────────
     // Model çağrılmadan, tokenizer'a inmeden, bağlam kurulmadan: sürüklenme
     // biliniyorsa token BOŞA harcanmaz. Operasyonel yakalama hatası
-    // (EACCES/EIO/swap symlink) = TOOL HATASI — stale DEĞİLDİR (spec 44);
-    // oturum korunur, hata güvenli tip'li olarak yayılır.
-    let live: LiveBaseState;
-    try {
-      live = await this.#contextAssembler.captureLiveBase({
-        repoRoot: session.repoRoot,
-        basePaths: session.workspaceRecovery.editablePaths,
-        createdPaths: session.currentCreatedPaths,
-      });
-    } catch (err) {
-      throw err; // ContextAssemblyError — güvenli sabit mesaj (wire tanırlı)
-    }
-    const staleFiles = decideStale({
-      repoRoot: session.repoRoot,
-      editablePaths: session.workspaceRecovery.editablePaths,
-      baseFingerprints: new Map(session.workspaceRecovery.baseFingerprints),
-      createdPaths: session.currentCreatedPaths,
-      live,
-    });
+    // (EACCES/EIO; ölçüm sırasında yaprak takası → ELOOP vb.) = TOOL HATASI —
+    // stale DEĞİLDİR (spec 44); oturum korunur, hata güvenli tip'li olarak
+    // yayılır. Atası symlink'e dönüşmüş yol (sentinel) ve ENOTDIR (taban:
+    // yokluk / created: çakışma) ise ÖLÇÜMDÜR → stale.
+    const staleFiles = await this.#detectStale(session);
     if (staleFiles.length > 0) {
       // Sürüklenmiş taban: inference YOK, tur YOK, oturum AÇIK kalır
       // (spec 43/207/241: destroy/sil/rebase/recapture YOK).
@@ -691,6 +723,11 @@ export class SessionManager {
 
     const displayRound = session.round + 1; // no-generation display (spec 58)
 
+    if (outcome.kind === "needs_split" || outcome.kind === "inference_busy") {
+      // Tur üretilmedi: workspace doğrulaması yalnız COMMIT edilmiş salt-okunur
+      // kümeyi görmeli — aday küme sonraki işlemlere sızmaz (derin savunma).
+      entry.workspace.setReadonlyPaths(session.readonlyPaths);
+    }
     if (outcome.kind === "needs_split") {
       return this.#refineNoGenerationResult(session, displayRound, outcome.needsSplit, outcome.rulesSource);
     }
@@ -750,6 +787,220 @@ export class SessionManager {
     return result;
   }
 
+  // ── splash_diff (Step 10 — salt-inceleme) ─────────────────────────────────
+
+  /**
+   * Bir `splash_diff` çağrısını yürütür (Step 10 spec 4-9):
+   *
+   *   girdi → aynı-oturum FIFO → (RAM önbellek + commit edilmiş state
+   *   doğrulaması | lazy disk load + kurtarma)
+   *   → `workspace.diff` (varsayılan: tüm workspace, -U3) | `workspace.stat`
+   *
+   * Gösterilen = close'un export edeceği: RAM'deki worktree dışarıdan
+   * değiştiyse önce commit edilmiş duruma döndürülür (`#ensureCommittedWorkspace`).
+   *
+   * Salt-incelemedir: inference / coordinator / bağlam kurma / kural çözme /
+   * stale denetimi / tur artışı / kalıcılık / RAM durum mutasyonu YOK. Stale
+   * ana ağaç diff'i ENGELLEMEZ (spec 6) — çıktı her zaman immutable base →
+   * workspace katkısıdır. Kilit sayesinde yarım `applyPatchSet` gözlemlenemez.
+   * Yol filtresi Workspace'in literal (`:(literal)`) pathspec disiplinini
+   * kullanır; burada yalnız derin savunma (fs'e erişmeden red) yapılır.
+   */
+  async diff(request: SplashDiffRequest): Promise<SplashDiffResult> {
+    if (this.#disposed) {
+      throw new SplashTaskError("shutting_down", "Splash is shutting down");
+    }
+    // Güvenli kimlik + girdi denetimi dosya sistemine/kilide ERİŞİMDEN ÖNCE.
+    if (!isSafeSessionId(request.sessionId)) {
+      throw new SplashTaskError("invalid_input", "The session id is not a safe identifier");
+    }
+    let files: string[] | undefined;
+    if (request.files !== undefined) {
+      if (!Array.isArray(request.files) || request.files.some((file) => typeof file !== "string")) {
+        throw new SplashTaskError("invalid_input", "The diff files must be an array of strings");
+      }
+      for (const file of request.files) {
+        if (normalizeRepoPath(file) === null) {
+          throw new SplashTaskError("invalid_input", "The diff files must be safe repository-relative paths");
+        }
+      }
+      // Savunmacı kopya: kuyrukta beklerken çağıranın mutasyonu doğrulanmış
+      // filtreyi değiştiremez.
+      files = [...request.files];
+    }
+    if (request.stat !== undefined && typeof request.stat !== "boolean") {
+      throw new SplashTaskError("invalid_input", "The diff stat flag must be a boolean");
+    }
+    const sessionId = request.sessionId;
+    const statOnly = request.stat === true;
+    return this.#runExclusive(sessionId, async (): Promise<SplashDiffResult> => {
+      const cached = this.#cache.get(sessionId);
+      const entry =
+        cached !== undefined ? await this.#ensureCommittedWorkspace(cached) : await this.#loadAndRecover(sessionId);
+      if (statOnly) {
+        return { mode: "stat", diffStats: await entry.workspace.stat({ files }) };
+      }
+      return { mode: "diff", diff: await entry.workspace.diff({ files }) };
+    });
+  }
+
+  // ── splash_close (Step 10 — export + kapatma) ─────────────────────────────
+
+  /**
+   * Bir `splash_close` çağrısını yürütür (Step 10 spec 10-23, DESIGN §7.5):
+   * son patch'i export eder ve oturumu kapatır. Girdi YALNIZ `sessionId`;
+   * patch yolu yalnız güvenilen `config.outputRoot`'tan türetilir.
+   *
+   * Stale taban close'u ENGELLEMEZ (spec 13): `baseStatus: "stale"` +
+   * `staleFiles` döner, export yine yapılır — orkestratör stale patch'i
+   * otomatik UYGULAMAMALIDIR. Splash patch'i ana checkout'a ASLA uygulamaz.
+   * Inference / bağlam kurma / kural çözme / tur artışı / `max_rounds` /
+   * `store.save` YOK; `max_rounds`'taki ve tur-0 oturum normal kapanır.
+   */
+  async close(request: SplashCloseRequest): Promise<SplashCloseResult> {
+    if (this.#disposed) {
+      throw new SplashTaskError("shutting_down", "Splash is shutting down");
+    }
+    // Güvenli kimlik denetimi dosya sistemine ERİŞİMDEN ÖNCE.
+    if (!isSafeSessionId(request.sessionId)) {
+      throw new SplashTaskError("invalid_input", "The session id is not a safe identifier");
+    }
+    const sessionId = request.sessionId;
+    return this.#runExclusive(sessionId, () => this.#runClose(sessionId));
+  }
+
+  /**
+   * `close` gövdesi — sıra KESİNDİR (spec 11); her hata sınırı açıktır:
+   *
+   * 1. RAM (commit edilmiş state doğrulaması) | lazy load + kurtarma — hata
+   *    aynen; hiçbir şey silinmez.
+   * 2. Stale denetimi (refine ile AYNI `#detectStale`) — operasyonel hata
+   *    aynen; hiçbir şey silinmez. Stale sonucu export'u ENGELLEMEZ.
+   * 3. Metadata (workspace canlıyken): `stat()` + kalıcı son sonuçtan
+   *    `filesChanged`/`summary` — diff metni PARSE EDİLMEZ.
+   * 4. Export — hata aynen; workspace + session.json + RAM girdisi geçerli
+   *    kalır (retry edilebilir; spec 16).
+   * 5. Workspace imhası — hata: RAM girdisi düşer (canlılık belirsiz), hata
+   *    aynen; patch + session.json KALIR (sonraki çağrı kurtarır; spec 17).
+   * 6. Yetkili durum silme — hata: RAM girdisi düşer (workspace imha edildi);
+   *    session.json yetkili kalır, retry kurtarma ile workspace'i yeniden
+   *    kurar ve export'u deterministik tekrarlar (spec 20).
+   * 7. RAM girdisi düşer → sonuç (içerik YOK).
+   */
+  async #runClose(sessionId: string): Promise<SplashCloseResult> {
+    // 1) load/restore (lazy; kurtarma model-free) | RAM: commit edilmiş
+    //    duruma bağlama (dış değişiklik export'a GİRMEZ).
+    const cached = this.#cache.get(sessionId);
+    const entry =
+      cached !== undefined ? await this.#ensureCommittedWorkspace(cached) : await this.#loadAndRecover(sessionId);
+    const { session, workspace } = entry;
+
+    // 2) stale-base denetimi — export ÖNCESİ, refine ile birebir aynı algoritma.
+    const staleFiles = await this.#detectStale(session);
+
+    // 3) metadata — workspace canlıyken (export'tan hemen önce).
+    const diffStats = await workspace.stat();
+    const filesChanged =
+      session.round > 0 && session.latestResult !== undefined ? [...session.latestResult.filesChanged] : [];
+    const summary = session.latestResult?.summary ?? NO_GENERATED_RESULT_SUMMARY;
+
+    // 4) export — başarısızsa HİÇBİR ŞEY silinmez (workspace export_failed'de korunur).
+    const patchPath = await workspace.exportPatch(this.#config.outputRoot);
+
+    // 5) workspace imhası — patch artık dayanıklı kurtarma artifact'ı.
+    try {
+      await workspace.destroy();
+    } catch (err) {
+      // Canlılığı belirsiz workspace RAM'de "kullanılır" görünmez; disk
+      // yetkili kalır — sonraki çağrı lazy kurtarma ile yeniden kurar.
+      this.#cache.delete(sessionId);
+      throw err;
+    }
+
+    // 6) yetkili kalıcı durum silme (commit noktası = session.json unlink'i).
+    try {
+      await this.#store.delete(sessionId);
+    } catch (err) {
+      // İmha edilmiş workspace RAM'de bırakılmaz; session.json yetkili kalır.
+      this.#cache.delete(sessionId);
+      throw err instanceof SessionError ? err : sessionError("session_operation_failed", err);
+    }
+
+    // 7) RAM girdisi — kapanan oturum RAM'den diriltilemez.
+    this.#cache.delete(sessionId);
+    const common = { patchPath, filesChanged, diffStats, summary };
+    return staleFiles.length > 0
+      ? { ...common, baseStatus: "stale", staleFiles }
+      : { ...common, baseStatus: "fresh" };
+  }
+
+  // ── kilit / in-flight / stale yardımcıları (refine + diff + close) ─────────
+
+  /**
+   * Bir işlemi in-flight defterinde izler: ekle → bekle → (her yolda) sil.
+   * Kayıt, çağrı anında SENKRON yapılır (ilk `await`'ten önce) — `dispose`
+   * araya giremez. task/refine/diff/close'un TEK izleme yolu.
+   */
+  async #trackInFlight<T>(operation: Promise<T>): Promise<T> {
+    this.#inFlight.add(operation);
+    try {
+      return await operation;
+    } finally {
+      this.#inFlight.delete(operation);
+    }
+  }
+
+  /**
+   * Aynı-oturum FIFO kilidi (spec 76/78; Step 10 spec 24): gövde, kuyruktaki
+   * önceki işlem tamamlanınca başlar; öncesinin HATASI kuyruğu zehirlemez
+   * (spec 319/320). Kilit + in-flight kaydı ilk `await`'ten ÖNCE senkron
+   * kurulur — kuyruktaki (başlamamış) iş de `dispose` tarafından beklenir
+   * (spec 131). refine / diff / close bu TEK yardımcıyı kullanır.
+   */
+  async #runExclusive<T>(sessionId: string, body: () => Promise<T>): Promise<T> {
+    const previous = this.#locks.get(sessionId) ?? Promise.resolve();
+    const execution = previous.then(body, body);
+    const tail = execution.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#locks.set(sessionId, tail);
+    try {
+      return await this.#trackInFlight(execution);
+    } finally {
+      // Zincirin SON halkası buysa kilit kayıttan düşer (hafıza sızısı YOK).
+      if (this.#locks.get(sessionId) === tail) {
+        this.#locks.delete(sessionId);
+      }
+    }
+  }
+
+  /**
+   * Stale-base denetimi (spec 29-44; Step 10 spec 12) — refine ve close'un
+   * TEK algoritması: `captureLiveBase` (strict no-follow canlı ölçüm) +
+   * saf `decideStale` karşılaştırması (içerik/varlık/tip/mod + worker-create
+   * çakışması). Taban immutable kalır (rebase/recapture YOK). Operasyonel
+   * yakalama hatası (EACCES/EIO, ölçüm sırasında yaprak takası → ELOOP vb.;
+   * `ContextAssemblyError`) stale DEĞİLDİR — aynen yayılır. Atası symlink'e
+   * dönüşmüş yol (sentinel parmak izi) ve `ENOTDIR` (taban: yokluk /
+   * worker-oluşturulan: çakışma) ise ölçümdür → stale. Dönüş: kanonik, dedup,
+   * sıralı stale yollar (boş = fresh).
+   */
+  async #detectStale(session: PersistedSession): Promise<string[]> {
+    const live: LiveBaseState = await this.#contextAssembler.captureLiveBase({
+      repoRoot: session.repoRoot,
+      basePaths: session.workspaceRecovery.editablePaths,
+      createdPaths: session.currentCreatedPaths,
+    });
+    return decideStale({
+      repoRoot: session.repoRoot,
+      editablePaths: session.workspaceRecovery.editablePaths,
+      baseFingerprints: new Map(session.workspaceRecovery.baseFingerprints),
+      createdPaths: session.currentCreatedPaths,
+      live,
+    });
+  }
+
   // ── lazy load + kurtarma (spec 103-127, 259-265, 394-405) ────────────────
 
   /**
@@ -783,40 +1034,10 @@ export class SessionManager {
       throw err;
     }
 
-    // Determinizm doğrulaması (model-free — spec 405).
+    // Determinizm doğrulaması (model-free — spec 405): başarısız tur geri
+    // yüklemesiyle AYNI yardımcı (`#reapplyCommittedState`).
     try {
-      if (session.latestWorkerResult !== undefined) {
-        // Önceki üretilmiş turun TAM ikame yeniden-uygulaması (spec 119).
-        const reapply = await workspace.applyPatchSet(session.latestWorkerResult);
-        const lastResult = session.latestResult;
-        if (lastResult === undefined) {
-          // Store doğrulaması (spec 374) bunu garanti eder; savunma dalı.
-          throw new Error("internal: generated session without latest result");
-        }
-        if (
-          !validationEqual(reapply.validation, lastResult.validation) ||
-          !filesChangedEqual(reapply.filesChanged, lastResult.filesChanged) ||
-          !diffStatsEqual(reapply.diffStats, lastResult.diffStats) ||
-          !createdPathsEqual(reapply.createdPaths, session.currentCreatedPaths)
-        ) {
-          // Sessiz sapma KABUL EDİLMEZ (spec 120/253).
-          throw new Error("internal: reapply divergence");
-        }
-        if (session.latestWorkspaceStateHash !== undefined) {
-          const hash = await workspace.recoveryStateHash();
-          if (hash !== session.latestWorkspaceStateHash) {
-            throw new Error("internal: state hash mismatch");
-          }
-        }
-      } else {
-        // Tur 0 oturumu: beklenen state = immutable taban (spec 380).
-        if (session.latestWorkspaceStateHash !== undefined) {
-          const hash = await workspace.recoveryStateHash();
-          if (hash !== session.latestWorkspaceStateHash) {
-            throw new Error("internal: base state hash mismatch");
-          }
-        }
-      }
+      await this.#reapplyCommittedState(workspace, session);
     } catch (err) {
       // Bozuk/kalibre edilemeyen kurtarma: fail-closed; artifact KALIR
       // (spec 164: bozuk oturum dosyası otomatik silinmez).
@@ -832,17 +1053,20 @@ export class SessionManager {
   // ── shutdown (spec 128-131) ────────────────────────────────────────────────
 
   /**
-   * Step 9 kapatım yaşam döngüsü:
+   * Step 9/10 kapatım yaşam döngüsü:
    *   1. yeni iş kabul edilmez (`#disposed` — ilk await'ten ÖNCE),
-   *   2. in-flight TÜM task/refine çalışmaları güvenli terminal yollarına
-   *      (kalıcılık / self-cleanup / koruma) ulaşıncaya KADAR BEKLENİR
-   *      (fire-and-forget YOK — spec 131); consistency redleri (kalıcılık/
-   *      kurtarma hatası + cleanup hatası) dispose'a YAYILIR,
+   *   2. in-flight TÜM task/refine/diff/close çalışmaları (kuyrukta bekleyen
+   *      dahil) güvenli terminal yollarına (kalıcılık / self-cleanup /
+   *      koruma / kapanış) ulaşıncaya KADAR BEKLENİR (fire-and-forget YOK —
+   *      spec 131); consistency redleri (kalıcılık/kurtarma hatası + cleanup
+   *      hatası) dispose'a YAYILIR,
    *   3. RAM önbellek + kilit kayıtları temizlenir,
    *   4. KALICI OTURUMLARA DOKUNULMAZ (spec 128-130): worktree'ler imha
    *      EDİLMEZ, session dizinleri/si DELETE EDİLMEZ — süreç kapanışı
    *      implicit close DEĞİL; hayatta kalan geçerli worktree sonraki
-   *      süreç tarafından reuse edilir (Step 10 `splash_close` imha eder).
+   *      süreç tarafından reuse edilir. Dispose bitmeden BAŞARIYLA kapanan
+   *      oturum kapalı kalır; export'u başarısız close'un oturumu diskte
+   *      dayanıklı kalır (Step 10 spec 25).
    */
   async dispose(): Promise<void> {
     if (this.#disposed) {
@@ -912,24 +1136,98 @@ export class SessionManager {
   /**
    * Tur içi işletme hatası SONRASI workspace'i ÖNCEKİ doğrulanmış state'e
    * geri getirir (spec 72-73): önceki worker sonucu varsa TAM ikame
-   * yeniden-uygulama; yoksa (tur 0) base'e sıfırlama. Başarısızsa
-   * `session_recovery_failed` YAYILIR — önceki workspace "saglam" olarak
+   * yeniden-uygulama; yoksa (tur 0) base'e sıfırlama — ardından kurtarma ile
+   * AYNI BİREBİR doğrulama (`#reapplyCommittedState`).
+   *
+   * Salt-okunur küme önce COMMIT edilmiş kümeye döner: turun ADAY kümesi
+   * (ör. önceki turun oluşturduğu yolu salt-okunur referans veren refine)
+   * yeniden-uygulamadaki create/modify'ı sessizce reddeder ve workspace'i
+   * kalıcı durumdan saptırırdı.
+   *
+   * Başarısız ya da uyuşmazsa: RAM girdisi DÜŞER (belirsiz workspace
+   * tutulmaz; sonraki çağrı diskten hash doğrulamalı kurtarır) +
+   * `session_recovery_failed` YAYILIR — önceki workspace "sağlam" olarak
    * ASLA raporlanmaz (spec 73/153).
    */
   async #restoreAfterFailedRound(workspace: Workspace, session: PersistedSession, original: unknown): Promise<void> {
     let restoreFailed = false;
     try {
-      if (session.latestWorkerResult !== undefined) {
-        await workspace.applyPatchSet(session.latestWorkerResult);
-      } else {
+      workspace.setReadonlyPaths(session.readonlyPaths);
+      if (session.latestWorkerResult === undefined) {
         await workspace.resetToBase();
       }
+      await this.#reapplyCommittedState(workspace, session);
     } catch {
       restoreFailed = true;
     }
     if (restoreFailed) {
+      this.#cache.delete(session.sessionId);
       throw sessionError("session_recovery_failed", original);
     }
+  }
+
+  /**
+   * Kalıcı son doğrulanmış workspace durumunu yeniden kurar + BİREBİR
+   * doğrular (model-free; spec 119-121/253/380). Kurtarma (`#loadAndRecover`)
+   * ve başarısız tur geri yüklemesi (`#restoreAfterFailedRound`) bu TEK
+   * yardımcıyı kullanır:
+   * - üretilmiş tur varsa: TAM ikame yeniden-uygulama; validation / değişen
+   *   yollar / istatistik / oluşturulan yollar kalıcı son durumla BİREBİR;
+   * - kalıcı state hash'i varsa: güncel hash BİREBİR (tur 0'da = taban).
+   * Sessiz sapma KABUL EDİLMEZ — her uyuşmazlık atar (sınıflandırma çağıranda).
+   */
+  async #reapplyCommittedState(workspace: Workspace, session: PersistedSession): Promise<void> {
+    if (session.latestWorkerResult !== undefined) {
+      const reapply = await workspace.applyPatchSet(session.latestWorkerResult);
+      const lastResult = session.latestResult;
+      if (lastResult === undefined) {
+        // Store doğrulaması (spec 374) bunu garanti eder; savunma dalı.
+        throw new Error("internal: generated session without latest result");
+      }
+      if (
+        !validationEqual(reapply.validation, lastResult.validation) ||
+        !filesChangedEqual(reapply.filesChanged, lastResult.filesChanged) ||
+        !diffStatsEqual(reapply.diffStats, lastResult.diffStats) ||
+        !createdPathsEqual(reapply.createdPaths, session.currentCreatedPaths)
+      ) {
+        throw new Error("internal: reapply divergence");
+      }
+    }
+    if (session.latestWorkspaceStateHash !== undefined) {
+      // Step 9 formülüyle kaydedilmiş hash de kabul (Workspace sözleşmesi).
+      if (!(await workspace.matchesRecoveryStateHash(session.latestWorkspaceStateHash))) {
+        throw new Error("internal: state hash mismatch");
+      }
+    }
+  }
+
+  /**
+   * RAM'deki (cache-hit) workspace'i diff/close ÖNCESİ commit edilmiş kalıcı
+   * duruma bağlar (Codex P2 — PR #34): son turdan sonra worktree dışarıdan
+   * (editör/araç) değiştiyse doğrulanmamış içerik gösterilmez/export edilmez.
+   * Hash eşleşirse iş YOK; eşleşmezse commit edilmiş salt-okunur küme altında
+   * TAM yeniden uygulama + doğrulama (tur 0: base'e sıfırlama). Kalıcılık
+   * YOK. Başarısızsa: RAM girdisi düşer + `session_recovery_failed` (hiçbir
+   * şey silinmez/export edilmez). Lazy kurtarma zaten doğruladığı için yalnız
+   * cache-hit yolunda çağrılır.
+   */
+  async #ensureCommittedWorkspace(entry: ActiveSession): Promise<ActiveSession> {
+    const { session, workspace } = entry;
+    const expected = session.latestWorkspaceStateHash;
+    try {
+      if (expected === undefined || (await workspace.matchesRecoveryStateHash(expected))) {
+        return entry;
+      }
+      workspace.setReadonlyPaths(session.readonlyPaths);
+      if (session.latestWorkerResult === undefined) {
+        await workspace.resetToBase();
+      }
+      await this.#reapplyCommittedState(workspace, session);
+    } catch (err) {
+      this.#cache.delete(session.sessionId);
+      throw sessionError("session_recovery_failed", err);
+    }
+    return entry;
   }
 
   /**
@@ -1364,7 +1662,9 @@ function createdPathsEqual(a: readonly string[], b: readonly string[]): boolean 
  * - diğer bilinen tip'li hatalar (Workspace/Coordinator/Backend/Worker/
  *   ContextAssembly/RulesResolution + güvenli `invalid_input`/
  *   `session_not_found`/`session_corrupt`/`session_operation_failed`) →
- *   oturum/workspace tutarlı korunuyor — GÜVENLİ.
+ *   oturum/workspace tutarlı korunuyor — GÜVENLİ. (Step 10 close hataları
+ *   buraya düşer: `export_failed` / imha `workspace_operation_failed` /
+ *   silme `session_operation_failed` — disk yetkili ve kurtarılabilir kalır.)
  * - kanıtlanamayan (tanınmayan) red → fail-closed TEMİZLİK BAŞARISIZ.
  */
 function inFlightRejectionFailsShutdown(reason: unknown): boolean {

@@ -19,9 +19,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  lstat as realLstat,
   mkdir as realMkdir,
   mkdtemp,
+  readdir as realReaddir,
   readFile as realReadFile,
+  readlink as realReadlink,
   rm,
   stat as realStat,
   symlink as realSymlink,
@@ -155,6 +158,12 @@ class MemFs implements SessionStoreFs {
   failOpenWrite = false;
   failOpenReadNoFollow = false;
   readFileCode: string | undefined;
+  /** Yol → errno: `removeFile` bu yolda verilen errno ile reddeder (Step 10 delete). */
+  removeFileFaults = new Map<string, string>();
+  /** Yol → errno: `removeDir` bu yolda verilen errno ile reddeder (Step 10 delete). */
+  removeDirFaults = new Map<string, string>();
+  /** Silme çağrılarının SIRALI kaydı (`removeFile <p>` / `removeDir <p>`). */
+  removeOps: string[] = [];
 
   async mkdir(dir: string, mode: number, recursive: boolean): Promise<void> {
     if (this.symlinks.has(dir)) throw err("EEXIST", `mkdir ${dir}`);
@@ -241,12 +250,30 @@ class MemFs implements SessionStoreFs {
   }
 
   async removeFile(file: string): Promise<void> {
+    this.removeOps.push(`removeFile ${file}`);
+    const fault = this.removeFileFaults.get(file);
+    if (fault !== undefined) throw err(fault, `removeFile ${file}`);
     if (this.symlinks.has(file)) {
       this.symlinks.delete(file);
       return;
     }
     if (this.dirs.has(file)) throw err("EISDIR", `removeFile ${file}`);
     this.files.delete(file);
+  }
+
+  /** Tek dizin `rmdir` (rekürsif DEĞİL): symlink/dosya → ENOTDIR, yok → ENOENT, dolu → ENOTEMPTY. */
+  async removeDir(dir: string): Promise<void> {
+    this.removeOps.push(`removeDir ${dir}`);
+    const fault = this.removeDirFaults.get(dir);
+    if (fault !== undefined) throw err(fault, `removeDir ${dir}`);
+    if (this.symlinks.has(dir) || this.files.has(dir)) throw err("ENOTDIR", `removeDir ${dir}`);
+    if (!this.dirs.has(dir)) throw err("ENOENT", `removeDir ${dir}`);
+    const entries = [...this.files.keys(), ...this.dirs, ...this.symlinks.keys()];
+    if (entries.some((entry) => entry !== dir && path.dirname(entry) === dir)) {
+      throw err("ENOTEMPTY", `removeDir ${dir}`);
+    }
+    this.dirs.delete(dir);
+    this.dirModes.delete(dir);
   }
 
   async openDir(dir: string) {
@@ -510,6 +537,78 @@ test("corrupt: round/result round mismatch fails closed (real fs)", async () => 
   });
 });
 
+// ── Tur geri bildirimi (feedback) kuralı ─────────────────────────────────────
+// 1. turda feedback İSTEĞE BAĞLI: `splash_task` 1. turu taşımaz; tur 0'da
+// kalan (needs_split/inference_busy) oturumun 1. turunu `splash_refine`
+// üretirse taşır. `round > 1` için feedback ZORUNLU kalır.
+
+test("round 1 WITH feedback (round-0 session refined) round-trips and keeps the feedback (real fs)", async () => {
+  await withRealStore(async (store) => {
+    await store.create(SESSION_ID);
+    const session = makeSession();
+    const first = session.rounds[0];
+    if (first === undefined) {
+      throw new Error("test fixture");
+    }
+    // SessionManager.refine biçimi: displayRound = 0 + 1 = 1, feedback ham.
+    first.feedback = "fix the off-by-one";
+    await store.save(session);
+    const loaded = await store.load(SESSION_ID);
+    assert.deepEqual(loaded, session);
+    assert.equal(loaded.rounds[0]?.feedback, "fix the off-by-one");
+  });
+});
+
+test("round 1 WITHOUT feedback (splash_task first round) still loads with no feedback key (real fs)", async () => {
+  await withRealStore(async (store) => {
+    await store.create(SESSION_ID);
+    const session = makeSession();
+    await store.save(session);
+    const loaded = await store.load(SESSION_ID);
+    assert.deepEqual(loaded, session);
+    const first = loaded.rounds[0];
+    assert.ok(first !== undefined);
+    assert.equal(Object.hasOwn(first, "feedback"), false);
+  });
+});
+
+test("corrupt: round 2 WITHOUT feedback still fails closed with session_corrupt (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.create(SESSION_ID);
+    const workerResult = { schemaVersion: 1, summary: "done", edits: [] } as WorkerResult;
+    const validation = { editsRequested: 1, editsApplied: 1, rejected: [] };
+    const second = makeResult(2, "done");
+    const twoRounds = (secondFeedback: string | undefined): PersistedSession =>
+      makeSession({
+        round: 2,
+        rounds: [
+          { round: 1, workerResult, validation, result: makeResult(1, "done") },
+          {
+            round: 2,
+            ...(secondFeedback === undefined ? {} : { feedback: secondFeedback }),
+            workerResult,
+            validation,
+            result: second,
+          },
+        ],
+        latestWorkerResult: workerResult,
+        latestResult: second,
+      });
+
+    // Pozitif kontrol: aynı iki-turlu fixture, 2. turda feedback ile YÜKLENİR.
+    await writeRawSessionFile(store, outputRoot, twoRounds("tighten the guard"));
+    assert.equal((await store.load(SESSION_ID)).rounds[1]?.feedback, "tighten the guard");
+
+    await writeRawSessionFile(store, outputRoot, twoRounds(undefined));
+    await assert.rejects(store.load(SESSION_ID), (e: unknown) => {
+      assert.ok(e instanceof SessionError);
+      assert.equal(e.kind, "session_corrupt");
+      assert.equal(e.cause, "session_corrupt:round:refine-feedback-missing");
+      return true;
+    });
+  });
+});
+
 test("corrupt: invalid workspace state hash format fails closed (real fs)", async () => {
   await withRealStore(async (store, outputRoot) => {
     await store.create(SESSION_ID);
@@ -691,6 +790,44 @@ test("deep validation: workspace recovery malformed tree entry fails closed (rea
     } as unknown as WorkspaceRecoveryState;
     await writeRawSessionFile(store, outputRoot, session);
     await assert.rejects(store.load(SESSION_ID), (e: unknown) => e instanceof SessionError && e.kind === "session_corrupt");
+  });
+});
+
+test("deep validation: the live-only sentinel mode (symlinked-ancestor) in a persisted base fingerprint fails closed; other 'other' modes still load (real fs)", async () => {
+  // Üretim sabiti (dinamik import — bu dosyanın import bloğuna dokunmadan):
+  // store'un reddettiği değer canlı sentinel'den AYRIŞIRSA bu test kırmızı.
+  const { SYMLINKED_ANCESTOR_FINGERPRINT } = await import("../dist/context/ContextAssembler.js");
+  assert.deepEqual(SYMLINKED_ANCESTOR_FINGERPRINT, { exists: true, type: "other", mode: "symlinked-ancestor" });
+
+  // Kontrol: AYNI şekil, git modu (gitlink 160000) → yüklenir (mod beyaz listesi YOK;
+  // mevcut geçerli oturumlar etkilenmez — red YALNIZ sentinel değerine özgü).
+  await withRealStore(async (store, outputRoot) => {
+    await store.create(SESSION_ID);
+    const session = makeSession({
+      workspaceRecovery: makeWorkspaceRecovery({
+        baseFingerprints: [["src/a.ts", { exists: true, type: "other", mode: "160000" }]],
+      }),
+    });
+    await writeRawSessionFile(store, outputRoot, session);
+    assert.deepEqual(await store.load(SESSION_ID), session);
+  });
+
+  // Tamper: canlı-ölçüm sentinel'i kalıcı TABAN parmak izi olarak → `session_corrupt`
+  // (kabul edilseydi atal-symlink sürüklenmesi `fresh` görünürdü).
+  await withRealStore(async (store, outputRoot) => {
+    await store.create(SESSION_ID);
+    const session = makeSession({
+      workspaceRecovery: makeWorkspaceRecovery({
+        baseFingerprints: [["src/a.ts", { ...SYMLINKED_ANCESTOR_FINGERPRINT }]],
+      }),
+    });
+    await writeRawSessionFile(store, outputRoot, session);
+    await assert.rejects(store.load(SESSION_ID), (e: unknown) => {
+      assert.ok(e instanceof SessionError);
+      assert.equal(e.kind, "session_corrupt");
+      assert.equal(e.message, "The session state is corrupt and cannot be recovered");
+      return true;
+    });
   });
 });
 
@@ -966,4 +1103,302 @@ test("audit A: backslash stays REJECTED in untrusted (selected) fields — two t
       (e: unknown) => e instanceof SessionError && e.kind === "session_corrupt",
     );
   }
+});
+
+// ── Step 10: dar kapsamlı yetkili durum silme (spec 18/19/40) ──────────────
+//
+// `SessionStore.delete`: yol YALNIZ güvenilen outputRoot + kimlikten türer;
+// yalnız `unlink` + tek-dizin `rmdir` (rekürsif silme YOK). Commit noktası =
+// `session.json` unlink'i; sonrası best-effort (hata dışarı atılmaz).
+// Statik symlink savunması (Threat Model A): symlink'li `sessions` / oturum
+// dizini / `session.json` → red, hedef AYNEN kalır. Export edilmiş patch
+// (`<outputRoot>/patches/...`) bu fonksiyonun hiç dokunmadığı yerdedir.
+
+/** Bir dizin ağacının (symlink TAKİP EDİLMEDEN) yol → tür/içerik/hedef haritası. */
+async function snapshotTree(root: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  async function walk(dir: string, rel: string): Promise<void> {
+    const entries = await realReaddir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const abs = path.join(dir, entry.name);
+      const key = rel === "" ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isSymbolicLink()) {
+        out.set(key, `link:${await realReadlink(abs)}`);
+      } else if (entry.isDirectory()) {
+        out.set(key, "dir");
+        await walk(abs, key);
+      } else {
+        out.set(key, `file:${(await realReadFile(abs)).toString("base64")}`);
+      }
+    }
+  }
+  await walk(root, "");
+  return out;
+}
+
+function isSessionErrorKind(kind: SessionError["kind"]): (e: unknown) => boolean {
+  return (e: unknown) => e instanceof SessionError && e.kind === kind;
+}
+
+test("delete: removes session.json, the empty workspace dir and the session dir; sessions dir stays; load → session_not_found (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.create(SESSION_ID);
+    await store.save(makeSession());
+    const sessionsDir = path.join(outputRoot, "sessions");
+    const dir = path.join(sessionsDir, SESSION_ID);
+    // destroy SONRASI kalabilecek BOŞ worktree dizini — tek-dizin rmdir ile gider.
+    await realMkdir(path.join(dir, "workspace"));
+
+    await store.delete(SESSION_ID);
+
+    await assert.rejects(realLstat(path.join(dir, "session.json")), { code: "ENOENT" });
+    await assert.rejects(realLstat(dir), { code: "ENOENT" });
+    // Paylaşılan ata ASLA silinmez (eşzamanlı create yarışı).
+    assert.equal((await realLstat(sessionsDir)).isDirectory(), true);
+    await assert.rejects(store.load(SESSION_ID), isSessionErrorKind("session_not_found"));
+  });
+});
+
+test("delete: a leftover session.json.tmp is removed together with session.json and the dir (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.save(makeSession());
+    const dir = path.join(outputRoot, "sessions", SESSION_ID);
+    await realWriteFile(path.join(dir, "session.json.tmp"), "{ partial crash leftover");
+
+    await store.delete(SESSION_ID);
+
+    await assert.rejects(realLstat(path.join(dir, "session.json")), { code: "ENOENT" });
+    await assert.rejects(realLstat(path.join(dir, "session.json.tmp")), { code: "ENOENT" });
+    await assert.rejects(realLstat(dir), { code: "ENOENT" });
+  });
+});
+
+test("delete: the exported patch under <outputRoot>/patches survives byte-for-byte (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    const patchDir = path.join(outputRoot, "patches", "0123456789abcdef");
+    await realMkdir(patchDir, { recursive: true });
+    const patchPath = path.join(patchDir, `${SESSION_ID}.patch`);
+    const patchBytes = Buffer.concat([
+      Buffer.from("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n", "utf8"),
+      Buffer.from([0x00, 0xff, 0x42]),
+    ]);
+    await realWriteFile(patchPath, patchBytes);
+    await store.save(makeSession());
+
+    await store.delete(SESSION_ID);
+
+    assert.ok((await realReadFile(patchPath)).equals(patchBytes), "exported patch must remain byte-identical");
+    await assert.rejects(realLstat(path.join(outputRoot, "sessions", SESSION_ID)), { code: "ENOENT" });
+  });
+});
+
+test("delete: an unexpected extra file keeps the dir — session.json removed, delete resolves, extra file untouched (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.save(makeSession());
+    const dir = path.join(outputRoot, "sessions", SESSION_ID);
+    const extra = path.join(dir, "unexpected-notes.txt");
+    await realWriteFile(extra, "do-not-delete\n");
+
+    await store.delete(SESSION_ID); // RESOLVE: commit noktası geçildi; rmdir ENOTEMPTY yutulur
+
+    await assert.rejects(realLstat(path.join(dir, "session.json")), { code: "ENOENT" });
+    assert.equal((await realLstat(dir)).isDirectory(), true, "non-empty dir stays (no recursive delete)");
+    assert.equal(await realReadFile(extra, "utf8"), "do-not-delete\n");
+    await assert.rejects(store.load(SESSION_ID), isSessionErrorKind("session_not_found"));
+  });
+});
+
+test("delete: a symlinked session dir (→ external dir) is rejected; external files and the link stay (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    const externalDir = path.join(outputRoot, "external-session-dir");
+    await realMkdir(externalDir, { recursive: true });
+    await realWriteFile(path.join(externalDir, "session.json"), "EXTERNAL_SESSION_JSON\n");
+    await realWriteFile(path.join(externalDir, "other.txt"), "external-other\n");
+    await realMkdir(path.join(outputRoot, "sessions"), { recursive: true });
+    const dir = path.join(outputRoot, "sessions", SESSION_ID);
+    await realSymlink(externalDir, dir);
+    const before = await snapshotTree(outputRoot);
+
+    await assert.rejects(store.delete(SESSION_ID), isSessionErrorKind("session_operation_failed"));
+
+    assert.deepEqual(await snapshotTree(outputRoot), before);
+    assert.equal((await realLstat(dir)).isSymbolicLink(), true);
+    assert.equal(await realReadFile(path.join(externalDir, "session.json"), "utf8"), "EXTERNAL_SESSION_JSON\n");
+  });
+});
+
+test("delete: a symlinked sessions dir itself is rejected; the target stays (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    const externalRoot = path.join(outputRoot, "external-sessions");
+    await realMkdir(path.join(externalRoot, SESSION_ID), { recursive: true });
+    await realWriteFile(path.join(externalRoot, SESSION_ID, "session.json"), "EXTERNAL_ROOT_SESSION\n");
+    await realSymlink(externalRoot, path.join(outputRoot, "sessions"));
+    const before = await snapshotTree(outputRoot);
+
+    await assert.rejects(store.delete(SESSION_ID), isSessionErrorKind("session_operation_failed"));
+
+    assert.deepEqual(await snapshotTree(outputRoot), before);
+    assert.equal(
+      await realReadFile(path.join(externalRoot, SESSION_ID, "session.json"), "utf8"),
+      "EXTERNAL_ROOT_SESSION\n",
+    );
+  });
+});
+
+test("delete: a symlinked session.json is rejected; the link and its target stay (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.create(SESSION_ID);
+    const external = path.join(outputRoot, "external-session.txt");
+    const marker = "VERY_SECRET_DELETE_TARGET_MARKER_5D2A\n";
+    await realWriteFile(external, marker);
+    const file = path.join(outputRoot, "sessions", SESSION_ID, "session.json");
+    await realSymlink(external, file);
+    const before = await snapshotTree(outputRoot);
+
+    await assert.rejects(store.delete(SESSION_ID), isSessionErrorKind("session_operation_failed"));
+
+    assert.deepEqual(await snapshotTree(outputRoot), before);
+    assert.equal((await realLstat(file)).isSymbolicLink(), true);
+    assert.equal(await realReadFile(external, "utf8"), marker);
+  });
+});
+
+test("delete: an unsafe session id reds with session_not_found and changes nothing (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.save(makeSession());
+    // `../escape` → `<outputRoot>/escape` olurdu: yem dosyası dokunulmadan kalmalı.
+    await realMkdir(path.join(outputRoot, "escape"), { recursive: true });
+    await realWriteFile(path.join(outputRoot, "escape", "session.json"), "BAIT\n");
+    const before = await snapshotTree(outputRoot);
+
+    for (const bad of ["../escape", "..", ".", "", "a/b", "a\\b", "x\0y"]) {
+      await assert.rejects(store.delete(bad), isSessionErrorKind("session_not_found"));
+    }
+
+    assert.deepEqual(await snapshotTree(outputRoot), before);
+    assert.equal((await store.load(SESSION_ID)).sessionId, SESSION_ID);
+  });
+});
+
+test("delete: idempotent — absent sessions dir / absent session dir resolve; a dir without session.json is rmdir'd (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    const sessionsDir = path.join(outputRoot, "sessions");
+    const dir = path.join(sessionsDir, SESSION_ID);
+
+    // `sessions` atası bile yok.
+    await store.delete(SESSION_ID);
+    await assert.rejects(realLstat(sessionsDir), { code: "ENOENT" });
+
+    // Ata var, oturum dizini yok.
+    await realMkdir(sessionsDir, { recursive: true });
+    await store.delete(SESSION_ID);
+    assert.equal((await realLstat(sessionsDir)).isDirectory(), true);
+
+    // Dizin var ama `session.json` yok (zaten silinmiş) → resolve + boş dizin rmdir.
+    await store.create(SESSION_ID);
+    await store.delete(SESSION_ID);
+    await assert.rejects(realLstat(dir), { code: "ENOENT" });
+    assert.equal((await realLstat(sessionsDir)).isDirectory(), true);
+  });
+});
+
+test("delete: two consecutive deletes both resolve (real fs)", async () => {
+  await withRealStore(async (store, outputRoot) => {
+    await store.save(makeSession());
+    await store.delete(SESSION_ID);
+    await store.delete(SESSION_ID);
+    await assert.rejects(realLstat(path.join(outputRoot, "sessions", SESSION_ID)), { code: "ENOENT" });
+    await assert.rejects(store.load(SESSION_ID), isSessionErrorKind("session_not_found"));
+  });
+});
+
+test("delete: unlink(session.json) EACCES → session_operation_failed, state intact, load still works, no rmdir (fake fs)", async () => {
+  const mem = new MemFs();
+  const store = storeWith(mem);
+  await store.create(SESSION_ID);
+  await store.save(makeSession());
+  const dir = path.join("/tmp/splash-out", "sessions", SESSION_ID);
+  const file = path.join(dir, "session.json");
+  const contentBefore = mem.files.get(file)?.content;
+  mem.removeFileFaults.set(file, "EACCES");
+  mem.removeOps = [];
+
+  await assert.rejects(store.delete(SESSION_ID), (e: unknown) => {
+    assert.ok(e instanceof SessionError);
+    assert.equal(e.kind, "session_operation_failed");
+    assert.equal(e.message, "The session operation failed");
+    // `cause` yalnız kısa etiket + errno — yol/mesaj taşımaz.
+    assert.equal(typeof e.cause, "string");
+    assert.ok(!String(e.cause).includes("/tmp/splash-out"));
+    assert.ok(String(e.cause).includes("EACCES"));
+    return true;
+  });
+
+  assert.equal(mem.files.get(file)?.content, contentBefore, "authoritative session.json stays intact");
+  assert.equal(mem.dirs.has(dir), true);
+  assert.deepEqual(mem.removeOps, [`removeFile ${file}`], "no cleanup runs before the commit point succeeds");
+  assert.equal((await store.load(SESSION_ID)).sessionId, SESSION_ID);
+});
+
+test("delete: a post-commit removeDir failure still resolves; session.json is gone (fake fs)", async () => {
+  const mem = new MemFs();
+  const store = storeWith(mem);
+  await store.create(SESSION_ID);
+  await store.save(makeSession());
+  const dir = path.join("/tmp/splash-out", "sessions", SESSION_ID);
+  mem.dirs.add(path.join(dir, "workspace"));
+  mem.removeDirFaults.set(path.join(dir, "workspace"), "EACCES");
+  mem.removeDirFaults.set(dir, "EIO");
+
+  await store.delete(SESSION_ID); // RESOLVE — kozmetik rmdir hatası kapatmayı başarısız saydırmaz
+
+  assert.equal(mem.files.has(path.join(dir, "session.json")), false);
+  assert.equal(mem.dirs.has(dir), true, "harmless non-authoritative dir may remain");
+  await assert.rejects(store.load(SESSION_ID), isSessionErrorKind("session_not_found"));
+});
+
+test("delete: a post-commit tmp removal failure still resolves (fake fs)", async () => {
+  const mem = new MemFs();
+  const store = storeWith(mem);
+  await store.create(SESSION_ID);
+  await store.save(makeSession());
+  const dir = path.join("/tmp/splash-out", "sessions", SESSION_ID);
+  const tmp = path.join(dir, "session.json.tmp");
+  mem.files.set(tmp, { mode: 0o600, content: "{ partial" });
+  mem.removeFileFaults.set(tmp, "EACCES");
+
+  await store.delete(SESSION_ID);
+
+  assert.equal(mem.files.has(path.join(dir, "session.json")), false);
+  assert.equal(mem.files.has(tmp), true, "the undeletable tmp is left in place");
+  assert.equal(mem.dirs.has(dir), true, "non-empty dir stays (ENOTEMPTY swallowed)");
+  await assert.rejects(store.load(SESSION_ID), isSessionErrorKind("session_not_found"));
+});
+
+test("delete: call order — unlink(session.json) precedes every rmdir; only narrow unlink/rmdir, sessions dir never targeted (fake fs)", async () => {
+  const mem = new MemFs();
+  const store = storeWith(mem);
+  await store.create(SESSION_ID);
+  await store.save(makeSession());
+  const sessionsDir = path.join("/tmp/splash-out", "sessions");
+  const dir = path.join(sessionsDir, SESSION_ID);
+  const file = path.join(dir, "session.json");
+  const tmp = path.join(dir, "session.json.tmp");
+  const workspace = path.join(dir, "workspace");
+  mem.files.set(tmp, { mode: 0o600, content: "{ partial" });
+  mem.dirs.add(workspace);
+  mem.removeOps = [];
+
+  await store.delete(SESSION_ID);
+
+  assert.deepEqual(mem.removeOps, [
+    `removeFile ${file}`,
+    `removeFile ${tmp}`,
+    `removeDir ${workspace}`,
+    `removeDir ${dir}`,
+  ]);
+  assert.ok(!mem.removeOps.some((op) => op.endsWith(` ${sessionsDir}`)), "shared ancestor is never removed");
+  assert.equal(mem.dirs.has(sessionsDir), true);
+  assert.equal(mem.dirs.has(dir), false);
+  assert.equal(mem.dirs.has(workspace), false);
 });
