@@ -13,9 +13,22 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import http from "node:http";
+import https from "node:https";
 import type { AddressInfo } from "node:net";
-import { OpenAICompatBackend } from "../dist/backend/OpenAICompatBackend.js";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  CONTROL_REQUEST_TIMEOUT_MS,
+  MEASUREMENT_REQUEST_TIMEOUT_MS,
+  OpenAICompatBackend,
+  createNodeHttpTransport,
+  type RuntimeHttpRequest,
+} from "../dist/backend/OpenAICompatBackend.js";
+import { InferenceCoordinator } from "../dist/backend/InferenceCoordinator.js";
+import { INFERENCE_LOCK_DIR } from "../dist/backend/RuntimeLock.js";
 import { BackendError } from "../dist/backend/errors.js";
 import type { InferenceMessage, ReasoningEffort } from "../dist/backend/InferenceBackend.js";
 import type { BackendConfig } from "../dist/config.js";
@@ -1264,6 +1277,12 @@ test("H1: a generation that withholds the response headers longer than the fetch
   const server = await startDelayingServer("headers", 2_000, CHAT_OK);
   t.after(() => server.close());
   await withShrunkGlobalFetchTimeouts(100, async () => {
+    // Kontrol (LOW-6): küçültülmüş tavan GERÇEKTEN etkin — ham fetch düşer;
+    // aksi hâlde aşağıdaki başarı hiçbir şey kanıtlamazdı.
+    await assert.rejects(
+      fetch(`${server.baseUrl}/v1/chat/completions`, { method: "POST", body: "{}" }),
+      (err: unknown) => (err as { cause?: { code?: string } }).cause?.code === "UND_ERR_HEADERS_TIMEOUT",
+    );
     const backend = new OpenAICompatBackend(makeConfig(server.baseUrl));
     const result = await backend.run(MESSAGES);
     assert.equal(result.content, "TAMAM");
@@ -1274,6 +1293,12 @@ test("H1: a response body that arrives later than the fetch body default still c
   const server = await startDelayingServer("body", 2_000, { tokens: [1, 2, 3] });
   t.after(() => server.close());
   await withShrunkGlobalFetchTimeouts(100, async () => {
+    // Kontrol (LOW-6): ham fetch'in gövde okuması küçültülmüş tavanda düşer.
+    const raw = await fetch(`${server.baseUrl}/tokenize`, { method: "POST", body: "{}" });
+    await assert.rejects(raw.text(), (err: unknown) => {
+      const e = err as { code?: string; cause?: { code?: string } };
+      return e.code === "UND_ERR_BODY_TIMEOUT" || e.cause?.code === "UND_ERR_BODY_TIMEOUT";
+    });
     const backend = new OpenAICompatBackend(makeConfig(server.baseUrl));
     const result = await backend.tokenize("hello");
     assert.equal(result.count, 3);
@@ -1441,4 +1466,141 @@ test("L5: an API key with CR/LF never leaks into message, cause or stack (direct
   const surface = `${caught.message}|${String(caught.cause)}|${caught.stack ?? ""}|${JSON.stringify(caught.cause ?? null)}`;
   assert.ok(!surface.includes("LEAKYKEY"), "the key must not appear anywhere on the error");
   assert.equal(mock.requests.length, 0, "a header-injection attempt must never reach the wire");
+});
+
+// ── İz 2 audit düzeltmeleri (MEDIUM-1 / LOW-7) ───────────────────────────
+
+test("MEDIUM-1: control/measurement calls carry a bounded timeout; ONLY generation is unbounded", async () => {
+  const seen = new Map<string, RuntimeHttpRequest>();
+  const backend = new OpenAICompatBackend(makeConfig("http://127.0.0.1:9"), {
+    transport: async (request) => {
+      seen.set(request.url.pathname, request);
+      const body =
+        request.url.pathname === "/status"
+          ? STATUS_OK
+          : request.url.pathname === "/v1/models"
+            ? MODELS_OK
+            : request.url.pathname === "/tokenize"
+              ? { tokens: [1] }
+              : request.url.pathname === "/apply-template"
+                ? { prompt: "p" }
+                : CHAT_OK;
+      return { status: 200, text: async () => JSON.stringify(body) };
+    },
+  });
+  await backend.refreshRuntimeInfo();
+  await backend.countPromptTokens(MESSAGES);
+  await backend.run(MESSAGES);
+  assert.equal(CONTROL_REQUEST_TIMEOUT_MS, 60_000);
+  assert.equal(MEASUREMENT_REQUEST_TIMEOUT_MS, 300_000);
+  assert.equal(seen.get("/status")?.timeoutMs, 60_000);
+  assert.equal(seen.get("/v1/models")?.timeoutMs, 60_000);
+  assert.equal(seen.get("/apply-template")?.timeoutMs, 300_000);
+  assert.equal(seen.get("/tokenize")?.timeoutMs, 300_000);
+  const chat = seen.get("/v1/chat/completions");
+  assert.ok(chat !== undefined);
+  assert.equal(Object.hasOwn(chat, "timeoutMs"), false, "generation has no timeout at all");
+});
+
+test("MEDIUM-1: the node transport honours timeoutMs while waiting for headers AND while the body idles (ETIMEDOUT)", async (t) => {
+  const headers = await startDelayingServer("headers", 2_000, { ok: true });
+  const body = await startDelayingServer("body", 2_000, { ok: true });
+  t.after(() => Promise.all([headers.close(), body.close()]));
+  const transport = createNodeHttpTransport();
+
+  const started = Date.now();
+  await assert.rejects(
+    transport({ url: new URL(`${headers.baseUrl}/status`), method: "GET", headers: {}, timeoutMs: 150 }),
+    (err: unknown) => (err as { code?: string }).code === "ETIMEDOUT",
+  );
+  assert.ok(Date.now() - started < 1_500, "the timeout fires long before the delayed headers");
+
+  const response = await transport({ url: new URL(`${body.baseUrl}/status`), method: "GET", headers: {}, timeoutMs: 150 });
+  assert.equal(response.status, 200);
+  await assert.rejects(response.text(1_024), (err: unknown) => (err as { code?: string }).code === "ETIMEDOUT");
+});
+
+test("MEDIUM-1: a hung runtime /status inside dispatch → honest 'Timed out' and the coordinator lock is released", async (t) => {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      if (req.url === "/status") {
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ...STATUS_OK, instance: { pid: 4242 } }));
+        }, 2_000);
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.url === "/v1/models" ? MODELS_OK : CHAT_OK));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  t.after(
+    () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+  );
+  const { port } = server.address() as AddressInfo;
+  const root = await mkdtemp(path.join(tmpdir(), "splash-m1-timeout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtimeDir = path.join(root, "runtime");
+  const backend = new OpenAICompatBackend(makeConfig(`http://127.0.0.1:${port}`), {
+    requestTimeoutsMs: { control: 150, measurement: 150 },
+  });
+  const coordinator = new InferenceCoordinator({
+    backend,
+    runtimeDir,
+    scanner: async () => [{ pid: 4242, ppid: 1, command: "splash serve" }],
+  });
+
+  const err = await expectBackendError(
+    coordinator.dispatch({ ownerId: "s-1", messages: MESSAGES }),
+    "network",
+  );
+  assert.equal(err.message, "Timed out waiting for the inference runtime (/status)");
+  assert.equal(err.cause, "ETIMEDOUT");
+  await assert.rejects(stat(path.join(runtimeDir, INFERENCE_LOCK_DIR)), { code: "ENOENT" });
+  assert.equal(coordinator.activeOwnerId, null);
+});
+
+test("LOW-7: aborting while waiting for the response headers (real transport) rejects promptly as network/aborted", async (t) => {
+  const server = await startDelayingServer("headers", 2_000, CHAT_OK);
+  t.after(() => server.close());
+  const controller = new AbortController();
+  const backend = new OpenAICompatBackend(makeConfig(server.baseUrl));
+  const started = Date.now();
+  const pending = backend.run(MESSAGES, { signal: controller.signal });
+  setTimeout(() => controller.abort(), 50);
+  const err = await expectBackendError(pending, "network");
+  assert.equal(err.message, "Request aborted (/v1/chat/completions)");
+  assert.ok(Date.now() - started < 1_500, "the abort is not delayed until the headers arrive");
+});
+
+test("LOW-7: an https base URL uses TLS; a self-signed runtime certificate is rejected with only the error code as cause", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "splash-tls-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const keyPath = path.join(dir, "key.pem");
+  const certPath = path.join(dir, "cert.pem");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyPath, "-out", certPath, "-days", "1", "-subj", "/CN=127.0.0.1"], { stdio: "ignore" });
+  const server = https.createServer({ key: await readFile(keyPath), cert: await readFile(certPath) }, (req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(STATUS_OK));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  t.after(
+    () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+  );
+  const { port } = server.address() as AddressInfo;
+  const backend = new OpenAICompatBackend(makeConfig(`https://127.0.0.1:${port}`, "k-tls"));
+  const err = await expectBackendError(backend.refreshRuntimeInfo(), "network");
+  assert.equal(err.message, "Could not reach the inference runtime (/status)");
+  assert.equal(err.cause, "DEPTH_ZERO_SELF_SIGNED_CERT");
 });

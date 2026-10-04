@@ -972,3 +972,63 @@ test("M4 probe: this process's OWN in-flight dispatch is not a conflict (same-pr
   assert.equal((await pending).status, "completed");
   await waitForIdle(h);
 });
+
+// ── İz 2 audit düzeltmeleri (LOW-1 / LOW-2) ──────────────────────────────
+
+test("LOW-1 probe: an already-aborted signal → typed 'aborted' before any lock peek or runtime call", async (t) => {
+  const FOREIGN = 999_901;
+  const h = await makeHarness(t, { liveness: (pid) => (pid === FOREIGN ? "alive" : "unknown") });
+  await plantForeignLock(h, FOREIGN, "foreign-token", "other");
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    h.coordinator.probe(controller.signal),
+    (err: unknown) => err instanceof CoordinatorError && err.kind === "aborted",
+  );
+  assert.equal(h.backend.refreshCalls, 0);
+  assert.equal(h.scannerCounts.count, 0);
+});
+
+test("LOW-1 probe: an abort that lands DURING the lock peek → typed 'aborted' (no runtime refresh, no scan)", async (t) => {
+  const controller = new AbortController();
+  const lock: RuntimeLockLike = {
+    acquire: async () => ({ acquired: true, token: "t" }),
+    release: async () => {},
+    peek: async () => {
+      controller.abort();
+      return "free";
+    },
+  };
+  const h = await makeHarness(t, { lock });
+
+  await assert.rejects(
+    h.coordinator.probe(controller.signal),
+    (err: unknown) => err instanceof CoordinatorError && err.kind === "aborted",
+  );
+  assert.equal(h.backend.refreshCalls, 0);
+  assert.equal(h.scannerCounts.count, 0);
+});
+
+test("LOW-2 probe: a same-process dispatch that starts WHILE the peek is in flight is not counted as a foreign owner", async (t) => {
+  let started: Promise<CoordinatedInferenceResult> | null = null;
+  let coordinatorRef: InferenceCoordinator | null = null;
+  const lock: RuntimeLockLike = {
+    acquire: async () => ({ acquired: true, token: "own" }),
+    release: async () => {},
+    peek: async () => {
+      // Peek beklenirken bu süreçte bir dispatch başlar ve kilidi alır:
+      // yoklamanın gördüğü sahip BİZİZ.
+      started = (coordinatorRef as InferenceCoordinator).dispatch(request("A"));
+      return "busy";
+    },
+  };
+  const h = await makeHarness(t, { lock });
+  coordinatorRef = h.coordinator;
+
+  assert.deepEqual(await h.coordinator.probe(), { status: "clear" });
+
+  await waitFor(() => h.backend.runStartOrder.includes("A"), "A to start generating");
+  h.backend.releaseRun("A");
+  assert.equal((await (started as unknown as Promise<CoordinatedInferenceResult>)).status, "completed");
+});

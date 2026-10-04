@@ -300,14 +300,22 @@ Seven components. Deliberately few; each is small.
   adapter is a leaf. **Generation** reaches it only through the coordinator's
   FIFO; the Context Assembler's **measurement** traffic (`/status`,
   `/v1/models`, `/apply-template`, `/tokenize`) is not serialized, but every
-  round first passes the coordinator's lock-free **probe** (Section 2.7) — a
-  busy host returns `inference_busy` before any measurement.
-  - **No transport timeout (final):** a non-stream generation may take longer
-    than any fixed limit (the built-in `fetch` would abort after 300 s while the
-    runtime keeps generating), so the adapter uses `node:http(s)` with no
-    timeout; the caller's `AbortSignal` is the only cancellation. Redirects are
-    never followed (a 3xx is a typed `http` error — the prompt never reaches
-    another origin), and response bodies are capped (64 MiB).
+  round first passes the coordinator's lock-free **probe** (Section 2.7): if
+  the lock is busy the runtime is not contacted at all; otherwise only the
+  identity refresh (`/status` + `/v1/models`) needed for the host scan runs —
+  no tokenize/template measurement. A busy host returns `inference_busy`
+  before any measurement.
+  - **No timeout for generation (final):** a non-stream generation may take
+    longer than any fixed limit (the built-in `fetch` would abort after 300 s
+    while the runtime keeps generating), so the adapter uses `node:http(s)`
+    and `/v1/chat/completions` has no timeout; the caller's `AbortSignal` is
+    the only cancellation. Control and measurement calls are bounded by fixed
+    socket-idle limits (not configurable): `/status`, `/v1/models` 60 s;
+    `/tokenize`, `/apply-template` 300 s — a hung runtime can never hold the
+    coordinator lock indefinitely; the expiry is the honest "timed out"
+    `network` error. Redirects are never followed (a 3xx is a typed `http`
+    error — the prompt never reaches another origin), and response bodies are
+    capped (64 MiB).
   - **Core independence:** no Splash core component references the concrete
     engine or the model name — those are config data consumed only by the
     backend adapter.
@@ -398,10 +406,20 @@ Seven components. Deliberately few; each is small.
   — never silently reported as success. Stale-lock recovery is bound to the
   inspected lock instance (inode, re-verified under an `inference.lock.reclaim`
   guard); a lock that vanished during inspection is never "reclaimed".
+  **Remaining heuristic bound:** a reclaim guard older than the 5 s grace is
+  treated as abandoned (crashed reclaimer) and removed; a reclaimer that is
+  merely *paused* for ≥ 5 s inside its microsecond critical section (e.g.
+  SIGSTOP) could therefore overlap a second reclaimer. The same grace bound
+  already governs incomplete owner records; it is a documented limit, not a
+  guarantee.
 - **Pre-measurement probe:** before a round's context is measured, the
-  coordinator runs a lock-free probe (live foreign lock owner + the same host
-  conflict check). Busy → immediate `inference_busy` with no measurement
-  traffic; the dispatch still re-checks everything (the probe is advisory).
+  coordinator runs a lock-free probe. If the lock has a live foreign owner (or
+  cannot be verified) it answers immediately without contacting the runtime;
+  otherwise it performs only the identity refresh needed for the host
+  conflict check — no tokenize/template measurement. A same-process dispatch
+  is never a conflict, and an aborted request is rejected as aborted. Busy →
+  immediate `inference_busy` with no measurement traffic; the dispatch still
+  re-checks everything (the probe is advisory).
 - **On a detected conflict** — do **not** start another model and do **not**
   send the request: preserve the Splash session and **immediately return a
   compact `inference_busy` status** (Section 3) — the metadata names the
@@ -513,8 +531,8 @@ the orchestrator asks for it.
   session is **preserved** (persisted, Section 2): the orchestrator can
   continue explicitly, inspect via `splash_diff`, close, or start a new task.
 - **`inference_busy`** — a **conflicting external** local inference runtime
-  was detected at dispatch (the host inference resource is occupied;
-  Section 2.7). The request is **not** enqueued for hidden background work
+  was detected at the pre-measurement probe or at dispatch (the host
+  inference resource is occupied; Section 2.7). The request is **not** enqueued for hidden background work
   and no inference is run — the status is returned **immediately**; the
   session, workspace, and all persisted state are **preserved** (nothing is
   destroyed, nothing is re-routed to another engine); the `inference`

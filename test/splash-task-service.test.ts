@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  CoordinatorError,
   InferenceCoordinator,
   type RuntimeLockLike,
 } from "../dist/backend/InferenceCoordinator.js";
@@ -717,7 +718,17 @@ test("36/66: external runtime (mlx) → inference_busy; workspace retained; back
   assert.equal(h.lock.releaseCount, 0);
 });
 
-test("M4: a foreign LIVE Splash lock → inference_busy/splash BEFORE any measurement traffic; the foreign lock is untouched", async (t) => {
+/**
+ * İz 2 / M4 + LOW-1: GERÇEK `RuntimeLock` (peek dahil) + yabancı CANLI sahip
+ * kaydı ön-tesis edilmiş servis. Kilit yalnız `runtimeDir` + `liveness` ile
+ * kurulur (FakeLock DEĞİL — ön-kapının kilit adımı gerçekten koşar).
+ */
+async function makeForeignLockedService(t: TestContext): Promise<{
+  fixture: Fixture;
+  backend: FakeBackend;
+  service: SplashTaskService;
+  lockDir: string;
+}> {
   const fixture = await makeFixture(t);
   const FOREIGN = 999_801;
   const backend = new FakeBackend();
@@ -749,6 +760,11 @@ test("M4: a foreign LIVE Splash lock → inference_busy/splash BEFORE any measur
     path.join(lockDir, "owner.json"),
     JSON.stringify({ schema_version: 1, pid: FOREIGN, token: "foreign-token", owner_id: "other", acquired_at: "2026-01-01T00:00:00.000Z" }),
   );
+  return { fixture, backend, service, lockDir };
+}
+
+test("M4: a foreign LIVE Splash lock → inference_busy/splash BEFORE any measurement traffic; the foreign lock is untouched", async (t) => {
+  const { backend, service, lockDir } = await makeForeignLockedService(t);
 
   const result = await service.executeTask({ task: "Anything", files: ["src/a.ts"] });
 
@@ -763,6 +779,24 @@ test("M4: a foreign LIVE Splash lock → inference_busy/splash BEFORE any measur
   assert.deepEqual(result.warnings, []);
   // Oturum korunur (sonra yeniden denenebilir); yabancı kilit dokunulmaz.
   assert.equal(service.activeTasks().length, 1);
+  assert.ok((await readFile(path.join(lockDir, "owner.json"), "utf8")).includes("foreign-token"));
+});
+
+test("LOW-1: an ALREADY-ABORTED request behind a foreign live lock is rejected as aborted — no busy result, no session left", async (t) => {
+  const { fixture, backend, service, lockDir } = await makeForeignLockedService(t);
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    service.executeTask({ task: "Anything", files: ["src/a.ts"], signal: controller.signal }),
+    (err: unknown) => err instanceof Error && (err as { kind?: string }).kind === "aborted",
+  );
+  assert.equal(backend.refreshCount, 0);
+  assert.equal(backend.countCalls.length, 0);
+  assert.equal(service.activeTasks().length, 0);
+  const sessionsDir = path.join(fixture.outputRoot, "sessions");
+  const leftovers = (await pathExists(sessionsDir)) ? await readdir(sessionsDir) : [];
+  assert.deepEqual(leftovers, [], "an aborted request leaves no persisted session");
   assert.ok((await readFile(path.join(lockDir, "owner.json"), "utf8")).includes("foreign-token"));
 });
 
@@ -923,12 +957,14 @@ test("35: pre-aborted MCP signal → CoordinatorError(aborted) + cleanup; backen
   const controller = new AbortController();
   controller.abort("client cancelled"); // dispatch'ten ÖNCE iptal
 
-  // Step 7: iptal sinyali ÖNCE assembler'ın `refreshRuntimeInfo`'una düşer —
-  // tip'li backend hatası (network/aborted) aynen yayılır; dispatch'a inilmez.
+  // İz 2 audit LOW-1: iptal sinyali artık ölçüm-öncesi ön-kapıda (probe)
+  // yakalanır — dispatch'in iptal sözlüğüyle aynı tip'li `aborted`; ne
+  // runtime yenilemesi ne ölçüm ne dispatch yapılır.
   await assert.rejects(
     h.service.executeTask({ task: "Anything", files: ["src/a.ts"], signal: controller.signal }),
-    (err: unknown) => err instanceof BackendError && err.kind === "network",
+    (err: unknown) => err instanceof CoordinatorError && err.kind === "aborted",
   );
+  assert.equal(h.backend.refreshCount, 0);
   // İptal edilmiş istek: workspace imha + boş dizin temizliği; kayıt defteri boş:
   assert.equal(h.service.activeTasks().length, 0);
   assert.ok(!(await pathExists(path.join(h.sessionsDir, "aborted-sig"))));

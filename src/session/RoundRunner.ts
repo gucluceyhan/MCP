@@ -157,8 +157,10 @@ export class DefaultRoundRunner implements RoundRunner {
   async run(input: RoundInput): Promise<RoundOutcome> {
     // ── ön-kapı (İz 2 / M4): meşgulse ÖLÇMEDEN inference_busy ──────────────
     // Assembler'ın runtime ölçümleri FIFO'dan geçmez; kilit almayan yoklama
-    // başka bir Splash sahibini / dış runtime'ı ölçümden ÖNCE yakalar.
-    // Danışma niteliğinde: dispatch her şeyi yeniden denetler.
+    // başka bir Splash sahibini / dış runtime'ı ölçümden ÖNCE yakalar. Kilit
+    // meşgulse runtime'a HİÇ gidilmez; değilse yalnız kimlik yenilemesi
+    // (host taraması için) — tokenize/şablon ölçümü YOK. Danışma niteliğinde:
+    // dispatch her şeyi yeniden denetler.
     if (this.#coordinator.probe !== undefined) {
       const gate = await this.#coordinator.probe(input.signal);
       if (gate.status === "inference_busy") {

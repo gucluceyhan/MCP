@@ -113,6 +113,13 @@ export class CoordinatorError extends Error {
   }
 }
 
+/** Ön-kapı iptali: dispatch'in kuyruk-iptaliyle AYNI tip'li hata (LOW-1). */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal !== undefined && signal.aborted) {
+    throw new CoordinatorError("aborted", "Inference request was aborted before it started");
+  }
+}
+
 /**
  * Koordinatörün kullandığı kilit sözleşmesi (injeksiyon dikişi). Üretim
  * implementasyonu `RuntimeLock`'tur (süreçler arası, token-doğrulamalı);
@@ -276,16 +283,21 @@ export class InferenceCoordinator {
    * `dispatch` kilidi alıp her şeyi yeniden denetler.
    *
    * Sıra (dispatch'in haritasıyla birebir):
+   *  0. sinyal zaten iptalse → tip'li `aborted` (dispatch'in iptal sözlüğü);
    *  1. bu süreçte dispatch yoksa kilit yoklaması: canlı sahip → `splash`,
-   *     doğrulanamıyor → `unknown` (runtime'a hiç gidilmez). Bu süreçte
-   *     aktif bir dispatch varsa kilit BİZİMDİR — aynı süreç FIFO beklemesi
-   *     çakışma DEĞİLDİR, adım atlanır;
-   *  2. runtime kimliği YENİLENİR (asla önbellek — yeniden başlamış
-   *     runtime'ın PID'i); hata tip'li olarak AYNEN yayılır;
+   *     doğrulanamıyor → `unknown` — kilit meşgulse runtime'a HİÇ gidilmez.
+   *     Bu süreçte aktif bir dispatch varsa (yoklama öncesinde ya da
+   *     yoklama SÜRERKEN başlamışsa) kilit BİZİMDİR — aynı süreç FIFO
+   *     beklemesi çakışma DEĞİLDİR, sonuç sayılmaz (LOW-2). Yoklamadan
+   *     sonra sinyal iptalse → `aborted` (LOW-1);
+   *  2. host taraması için YALNIZ runtime kimliği yenilenir (`/status` +
+   *     `/v1/models`; asla önbellek — yeniden başlamış runtime'ın PID'i);
+   *     tokenize/şablon ölçümü YOK; hata tip'li olarak AYNEN yayılır;
    *  3. kimlik yok → `unknown`; tarama hatası → `unknown`; çakışma → tür.
    * Hiçbir kilit alınmaz, hiçbir dosya yazılmaz, jenerasyon yapılmaz.
    */
   async probe(signal?: AbortSignal): Promise<InferenceProbeResult> {
+    throwIfAborted(signal);
     if (this.#active === null && this.#lock.peek !== undefined) {
       let state: "free" | "busy" | "uncertain";
       try {
@@ -293,10 +305,13 @@ export class InferenceCoordinator {
       } catch {
         state = "uncertain";
       }
-      if (state === "busy") {
+      throwIfAborted(signal);
+      // Yoklama sürerken bu süreçte dispatch başladıysa gözlenen sahip biziz.
+      const ownDispatch = this.#active !== null;
+      if (state === "busy" && !ownDispatch) {
         return { status: "inference_busy", conflict: "splash" };
       }
-      if (state === "uncertain") {
+      if (state === "uncertain" && !ownDispatch) {
         return { status: "inference_busy", conflict: "unknown" };
       }
     }

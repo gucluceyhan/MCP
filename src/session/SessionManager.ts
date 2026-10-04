@@ -1549,12 +1549,6 @@ function previousOutcomeFields(session: PersistedSession): {
 }
 
 /**
- * Workspace semantik doğrulaması → tur durumu:
- * - red YOK → `applied` (no-op 0/0 dahil — geçerli tur)
- * - uygulama + red → `partial`
- * - yalnız red → `failed` (semantik red — MCP hatası DEĞİL)
- */
-/**
  * `inference_busy` bağlam telemetrisi: dispatch'te yakalandıysa ölçülen
  * bütçe (`input_tokens` 0 — prompt gönderilmedi); ön-kapıda (İz 2 / M4)
  * yakalandıysa ölçüm YOKTUR → son bilinen kalıcı telemetri (input 0) ya da
@@ -1585,6 +1579,12 @@ function busyContext(
   };
 }
 
+/**
+ * Workspace semantik doğrulaması → tur durumu:
+ * - red YOK → `applied` (no-op 0/0 dahil — geçerli tur)
+ * - uygulama + red → `partial`
+ * - yalnız red → `failed` (semantik red — MCP hatası DEĞİL)
+ */
 function mapValidationToStatus(validation: ValidationResult): "applied" | "partial" | "failed" {
   if (validation.rejected.length === 0) {
     return "applied";

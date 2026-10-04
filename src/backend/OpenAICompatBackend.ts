@@ -32,14 +32,18 @@ import type { BackendConfig } from "../config.js";
  *   teknik detayda anahtar `[REDACTED]` ile değiştirilir (bkz.
  *   `extractHttpDetail`) — anahtar ne `message`'de ne `cause`'ta yaşar.
  * - Her çağında caller'ın `AbortSignal`'i korunur; otomatik retry YOK.
- * - Transport ZAMAN AŞIMI YOK (İz 2 / H1): global `fetch` (undici) başlık/
- *   gövde için 300 sn varsayılan tavan uygular (ölçüldü: 300.99 sn'de
- *   `UND_ERR_HEADERS_TIMEOUT`) — `stream:false` uzun bir jenerasyonu
- *   runtime hâlâ üretirken "ağ hatası"na çevirirdi. Varsayılan transport
- *   `node:http(s)`'tir: istek başına bağlantı, zaman aşımı YOK, yönlendirme
+ * - JENERASYONDA transport zaman aşımı YOK (İz 2 / H1): global `fetch`
+ *   (undici) başlık/gövde için 300 sn varsayılan tavan uygular (ölçüldü:
+ *   300.99 sn'de `UND_ERR_HEADERS_TIMEOUT`) — `stream:false` uzun bir
+ *   jenerasyonu runtime hâlâ üretirken "ağ hatası"na çevirirdi. Varsayılan
+ *   transport `node:http(s)`'tir: istek başına bağlantı, yönlendirme
  *   İZLENMEZ (3xx = tip'li `http` hatası; prompt başka kökene gitmez — L4),
- *   yanıt gövdesi `maxResponseBytes` ile sınırlı. İptalin tek sahibi
- *   caller'ın sinyalidir. Transport enjekte edilebilir (test dikişi).
+ *   yanıt gövdesi `maxResponseBytes` ile sınırlı. `/v1/chat/completions`
+ *   SINIRSIZDIR (iptalin tek sahibi caller'ın sinyali); kontrol çağrıları
+ *   (`/status`, `/v1/models`) 60 sn, ölçüm çağrıları (`/tokenize`,
+ *   `/apply-template`) 300 sn soket-boşta tavanıyla sınırlıdır (İz 2 audit
+ *   MEDIUM-1: kilitlenmiş bir runtime, kilit TUTULURKEN `/status`'ta süresiz
+ *   bekletemez). Transport enjekte edilebilir (test dikişi).
  *
  * Uçlar (tam olarak, runtime'ın canlı API'sine göre):
  *   GET  /status                 → ready + maximum_context_tokens
@@ -59,6 +63,12 @@ export interface RuntimeHttpRequest {
   headers: Record<string, string>;
   body?: string;
   signal?: AbortSignal;
+  /**
+   * Soket-boşta tavanı (ms): başlık beklerken ya da gövde akışı durduğunda
+   * bu kadar veri gelmezse istek `ETIMEDOUT` koduyla düşer. YOKSA sınırsız
+   * (yalnız jenerasyon — MEDIUM-1).
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -78,7 +88,17 @@ export interface OpenAICompatBackendOptions {
   transport?: RuntimeHttpTransport;
   /** Yanıt gövdesi bayt tavanı (varsayılan: `DEFAULT_MAX_RESPONSE_BYTES`). */
   maxResponseBytes?: number;
+  /**
+   * TEST DİKİŞİ: kontrol/ölçüm tavanları (varsayılan: aşağıdaki sabitler).
+   * Kullanıcı yapılandırması DEĞİLDİR (config/env yolu yok).
+   */
+  requestTimeoutsMs?: { control: number; measurement: number };
 }
+
+/** Kontrol çağrıları (`/status`, `/v1/models`) soket-boşta tavanı: 60 sn. */
+export const CONTROL_REQUEST_TIMEOUT_MS = 60_000;
+/** Ölçüm çağrıları (`/tokenize`, `/apply-template`) soket-boşta tavanı: 300 sn. */
+export const MEASUREMENT_REQUEST_TIMEOUT_MS = 300_000;
 
 /**
  * Yanıt gövdesi tavanı: 64 MiB. Meşru en büyük yanıtlar (tam bağlam
@@ -98,8 +118,9 @@ export class ResponseTooLargeError extends Error {
 
 /**
  * Varsayılan transport: `node:http(s)`. Bilinçli olarak:
- * - zaman aşımı YOK (`timeout` verilmez; paylaşılan agent'ın soket
- *   politikası devreye girmesin diye `agent: false` — istek başına bağlantı),
+ * - varsayılan zaman aşımı YOK — yalnız istek `timeoutMs` taşıyorsa soket-
+ *   boşta tavanı (`ETIMEDOUT`); paylaşılan agent'ın soket politikası devreye
+ *   girmesin diye `agent: false` (istek başına bağlantı),
  * - yönlendirme izlenmez (node:http hiç izlemez),
  * - iptal yalnız caller'ın `signal`'i,
  * - gövde `TextDecoder` ile çözülür (`fetch().text()` ile aynı: UTF-8, BOM
@@ -113,13 +134,27 @@ export function createNodeHttpTransport(): RuntimeHttpTransport {
       if (request.body !== undefined) {
         headers["content-length"] = String(Buffer.byteLength(request.body));
       }
+      // Zaman aşımı hatası: gövde okuması da bunu (ECONNRESET değil) görsün
+      // diye burada tutulur — dürüst "timed out" eşlemesi.
+      let timeoutError: Error | null = null;
       const req = client.request(
         request.url,
         { method: request.method, headers, signal: request.signal, agent: false },
         (res) => {
-          resolve({ status: res.statusCode ?? 0, text: (maxBytes) => readBody(res, maxBytes) });
+          resolve({
+            status: res.statusCode ?? 0,
+            text: (maxBytes) => readBody(res, maxBytes, () => timeoutError),
+          });
         },
       );
+      if (request.timeoutMs !== undefined) {
+        // Soket-boşta tavanı (başlık bekleme + gövde akışı). Yalnız kontrol/
+        // ölçüm çağrılarında verilir; jenerasyon sınırsızdır (MEDIUM-1).
+        req.setTimeout(request.timeoutMs, () => {
+          timeoutError = Object.assign(new Error("Inference runtime request timed out"), { code: "ETIMEDOUT" });
+          req.destroy(timeoutError);
+        });
+      }
       // Yanıt sonrası gelen istek hatası (ör. gövde ortasında iptal) gövde
       // okumasında yüzeye çıkar; buradaki reject o noktada etkisizdir.
       req.on("error", reject);
@@ -127,8 +162,15 @@ export function createNodeHttpTransport(): RuntimeHttpTransport {
     });
 }
 
-/** Gövdeyi tavanla okur; erken kapanış/hata → red (asla takılmaz). */
-function readBody(res: http.IncomingMessage, maxBytes: number): Promise<string> {
+/**
+ * Gövdeyi tavanla okur; erken kapanış/hata → red (asla takılmaz). Soket
+ * zaman aşımıyla yıkıldıysa red nedeni o zaman aşımı hatasıdır.
+ */
+function readBody(
+  res: http.IncomingMessage,
+  maxBytes: number,
+  timedOut: () => Error | null,
+): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -136,7 +178,7 @@ function readBody(res: http.IncomingMessage, maxBytes: number): Promise<string> 
     const fail = (err: unknown): void => {
       if (!settled) {
         settled = true;
-        reject(err);
+        reject(timedOut() ?? err);
       }
     };
     res.on("data", (chunk: Buffer) => {
@@ -173,6 +215,8 @@ export class OpenAICompatBackend implements InferenceBackend {
     this.#http = {
       transport: options.transport ?? createNodeHttpTransport(),
       maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+      controlTimeoutMs: options.requestTimeoutsMs?.control ?? CONTROL_REQUEST_TIMEOUT_MS,
+      measurementTimeoutMs: options.requestTimeoutsMs?.measurement ?? MEASUREMENT_REQUEST_TIMEOUT_MS,
     };
   }
 
@@ -485,6 +529,10 @@ function extractHttpDetail(bodyText: string, apiKey: string | undefined): string
 interface HttpDeps {
   transport: RuntimeHttpTransport;
   maxResponseBytes: number;
+  /** Kontrol (`/status`, `/v1/models`) soket-boşta tavanı (ms). */
+  controlTimeoutMs: number;
+  /** Ölçüm (`/tokenize`, `/apply-template`) soket-boşta tavanı (ms). */
+  measurementTimeoutMs: number;
 }
 
 /**
@@ -546,8 +594,9 @@ const VISIBLE_ASCII = /^[\x21-\x7e]+$/;
 /**
  * Tüm çağrıların TEK modül-privat JSON gidiş-dönüşü yardımcısı.
  *
- * Tek istek, tek yanıt: retry YOK, planlama YOK, zaman aşımı YOK, yönlendirme
- * YOK (DESIGN.md 2.5). Hata haritası:
+ * Tek istek, tek yanıt: retry YOK, planlama YOK, yönlendirme YOK; zaman
+ * aşımı yalnız kontrol/ölçüm çağrılarında, jenerasyonda YOK (DESIGN.md 2.5).
+ * Hata haritası:
  *   bağlantı hatası                     → BackendError("network"); `cause` = hata kodu
  *   zaman aşımı kodu (TIMEOUT_CODES)    → BackendError("network") + "timed out"
  *   iptal (istek ya da gövde okuması)   → BackendError("network") + "aborted"
@@ -592,6 +641,15 @@ async function requestJson(
     headers["authorization"] = `Bearer ${config.apiKey}`;
   }
 
+  // Tavan uç noktaya göre SABİTTİR (MEDIUM-1): jenerasyon sınırsız;
+  // kontrol/ölçüm çağrıları sınırlı — kilit tutulurken asılı kalınmaz.
+  const timeoutMs =
+    path === "/v1/chat/completions"
+      ? undefined
+      : path === "/status" || path === "/v1/models"
+        ? deps.controlTimeoutMs
+        : deps.measurementTimeoutMs;
+
   let response: RuntimeHttpResponse;
   try {
     response = await deps.transport({
@@ -600,6 +658,7 @@ async function requestJson(
       headers,
       ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
       ...(signal !== undefined ? { signal } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     });
   } catch (err) {
     throw networkError(err, signal, path);

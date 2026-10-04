@@ -151,8 +151,10 @@ export function createSplashRuntime(config: SplashConfig, options: SplashRuntime
   // paylaşır. Yalnız JENERASYON coordinator'ın FIFO'sundan (tek seri kaynak)
   // geçer; assembler'ın ölçüm trafiği (/status, /v1/models, /apply-template,
   // /tokenize) FIFO'ya GİRMEZ — her turda ölçümden ÖNCE coordinator'ın kilit
-  // almayan ön-kapısı (`probe`, İz 2 / M4) meşguliyeti yoklar; meşgulse ölçüm
-  // yapılmadan `inference_busy` döner.
+  // almayan ön-kapısı (`probe`, İz 2 / M4) meşguliyeti yoklar: kilit meşgulse
+  // runtime'a HİÇ gidilmez; değilse host taraması için YALNIZ kimlik
+  // yenilemesi (/status + /v1/models) yapılır — tokenize/şablon ölçümü YOK.
+  // Meşgulse ölçüm yapılmadan `inference_busy` döner.
   const contextAssembler = options.contextAssembler ?? new ContextAssembler({ runtime: backend });
   // SÜREÇ TEK (Step 8): stateless resolver — tek instance tüm çağrılar için.
   // Konstrüksiyon tembel: filesystem'e hiçbir şey dokunmaz.
