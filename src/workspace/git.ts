@@ -246,7 +246,7 @@ async function readRepoConfig(repoRoot: string, args: readonly string[]): Promis
 }
 
 /**
- * Repo bir promisor remote taşıyor mu? Üç sinyalden biri yeter:
+ * Repo bir promisor remote taşıyor mu? Dört sinyalden biri yeter:
  * - `extensions.partialClone` (eski biçim) — anahtarın VARLIĞI yeter; boş
  *   değer de (`""`) promisor'dır (ölçüldü, Git 2.50.1: boş ad → `fetch ''`);
  * - herhangi bir `remote.<ad>.promisor=true` (ölçüldü, Git 2.50.1
@@ -255,6 +255,16 @@ async function readRepoConfig(repoRoot: string, args: readonly string[]): Promis
  *   boş değer dahil; anahtarın varlığı yeter (git `promisor-remote.c`
  *   `promisor_remote_config()` bu anahtarı görünce `promisor_remote_new()`
  *   çağırır; ölçüldü v2.44.0, v2.50.0).
+ * - repo-kontrollü kapsamlardan (`local` = `.git/config`, `worktree` =
+ *   `extensions.worktreeConfig` açıkken `.git/config.worktree`; `git worktree
+ *   add` bu dosyayı yeni worktree'ye kopyalar) herhangi bir `include.*` /
+ *   `includeIf.*` yönergesi → promisor VAR sayılır; koşullu include
+ *   (`gitdir:`) promisor'ı yalnız bağlı worktree bağlamında görünür
+ *   kılabilir, ana repo bağlamındaki sorgular onu göremez. Sorgu
+ *   `--no-includes --show-scope` ile yönergelerin kendisini kapsamlarıyla
+ *   listeler; `global`/`system` kapsamı güvenilir sayılır. `--worktree`
+ *   bayrağı kullanılmaz (worktreeConfig kapalıyken çok worktree'de hata
+ *   verir). Yalnız korumasız git'te redde dönüşür.
  * İki seviyeli `remote.promisor` / `remote.partialCloneFilter` (alt bölümsüz)
  * da sayılır: `parse_config_key` sonrası `name == NULL` koruması yok (v2.44.0
  * kaynağı) → boş adlı promisor üretilir (ölçüldü, Git 2.50.1: `fetch ''`) —
@@ -264,6 +274,10 @@ async function readRepoConfig(repoRoot: string, args: readonly string[]): Promis
 async function promisorConfigured(repoRoot: string): Promise<boolean> {
   try {
     if ((await readRepoConfig(repoRoot, ["--get", "extensions.partialclone"])) !== null) {
+      return true;
+    }
+    const includes = await readRepoConfig(repoRoot, ["--no-includes", "--show-scope", "--get-regexp", "^include(if)?\\."]);
+    if (includes !== null && includes.split("\n").some((line) => line.startsWith("local\t") || line.startsWith("worktree\t"))) {
       return true;
     }
     const remotes = await readRepoConfig(repoRoot, ["--bool", "--get-regexp", "^remote\\.(.*\\.)?promisor$"]);
