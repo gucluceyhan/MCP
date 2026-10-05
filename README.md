@@ -212,7 +212,13 @@ Splash measures every prompt exactly with the runtime's tokenizer endpoints, not
 - Splash reserves output headroom: 32,768 tokens minimum, 65,536 preferred when it fits the selected tier.
 - Editable files are never truncated.
 - If the full context does not fit, Splash reduces it in this order: old refinement history, then old worker responses, then read-only reference files (whole files).
-- If the editable files plus the minimum output reserve cannot fit at all, nothing is sent to the model, and the result is `status: "needs_split"` with a `split_hint`.
+- Before that, Splash checks the **required** prompt on its own. The required prompt is Splash's fixed worker instructions plus:
+  - the task text,
+  - the complete editable files,
+  - the pinned project rules,
+  - on refine, the current feedback together with the latest validation verdict.
+
+  Read-only references and older history are not part of this check. If the required prompt plus the minimum output reserve (or `output_reserve_tokens`, if set) does not fit the runtime maximum (or the forced `context_tier`), nothing is sent to the model, and the result is `status: "needs_split"` with a `split_hint`. See [Common situations](#common-situations) for remedies.
 
 ### Stale base
 
@@ -296,7 +302,7 @@ Runs another round in an open session, with correction feedback.
 |-------|------|----------|-------------|
 | `session_id` | string | yes | Session to refine. |
 | `feedback` | string | yes | Concrete correction for the worker. Must be non-empty after trimming. The original task stays in force; feedback does not replace it. |
-| `files` | string[] | no | Additional **read-only** reference files. They accumulate across rounds and never become editable; paths that are already editable are ignored. To make another file editable, start a new session. |
+| `files` | string[] | no | Additional **read-only** reference files. They never become editable, and paths that are already editable are ignored. They are added to the session only when the call produces a generated result (`applied`, `partial` or `failed`); after that they carry over to later rounds. If the call returns `stale_base`, `max_rounds`, `needs_split` or `inference_busy`, or fails with an error, they are not kept, so pass `files` again when you retry. To make another file editable, start a new session. |
 
 Example input:
 
@@ -463,13 +469,21 @@ Rejection reasons in `validation.rejected[].reason` come from a fixed vocabulary
 | `partial` | yes | Some edits applied, some rejected (see `validation.rejected`). | `splash_refine` with feedback. |
 | `failed` | yes | Every edit was rejected. This is a normal result, not a tool error. | `splash_refine` with feedback. |
 | `stale_base` | no | A base file drifted in your working tree. Nothing was run. | Restore the drift and refine, or `splash_close` and start a new task. |
-| `needs_split` | no | The editable files plus the minimum output reserve do not fit the runtime's context window. | `splash_close` (empty patch), then delegate smaller tasks. |
+| `needs_split` | no | The required prompt (task, editable files, project rules, and on refine the current feedback and validation verdict) plus the output reserve does not fit the context window. | Shrink the required prompt, usually by closing and splitting into smaller sessions; see [Common situations](#common-situations). |
 | `max_rounds` | no | The `SPLASH_MAX_ROUNDS` guardrail was reached. The session is preserved. | Call `splash_refine` again to continue on purpose, or inspect / close. |
 | `inference_busy` | no | A competing local runtime or another Splash process holds the inference resource. The session is preserved. | Retry later with `splash_refine`, or close. |
 
 ## Configuration
 
-Splash MCP is configured only through environment variables. Values are trimmed, and an empty value means "use the default". If any value is invalid, the server refuses to start and prints `[splash] fatal: <reason>` to stderr. The message never contains the raw value.
+Splash MCP is configured only through environment variables. Values are trimmed, and an empty value means "use the default".
+
+If any value is invalid, the server refuses to start. It prints `[splash] fatal: Internal Splash error` to stderr and exits with status 1. In v0.1.0 this message does not say which variable is wrong. Runtime construction is lazy, so at startup this message usually means a `SPLASH_*` value is invalid. To find the culprit, check the variables one by one against the table below. Alternatively, run the configuration loader directly from the `splash-mcp` directory, prefixed with the same `SPLASH_*` variables your client passes:
+
+```sh
+SPLASH_MAX_ROUNDS=5 node -e 'import(require("node:url").pathToFileURL(require("node:path").resolve("dist/config.js")).href).then((m) => { m.loadConfig(); console.log("config OK"); }).catch((e) => { console.error(e.message); process.exit(1); })'
+```
+
+This prints the specific reason, for example `Invalid SPLASH_MAX_ROUNDS: expected a positive integer, got "abc"`, without starting the server.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -553,7 +567,7 @@ Splash is a **local developer tool** that runs under your own OS account. Its go
 **The tools do not appear in Claude Code.**
 1. Tools appear only in new sessions, so start one.
 2. Make sure `npm run build` succeeded and the registered path is absolute and points to `dist/index.js`.
-3. Run `node /absolute/path/to/splash-mcp/dist/index.js` manually. It should print `[splash] splash v0.1.0 running on stdio`. A `[splash] fatal: Invalid SPLASH_...` line means a configuration value is invalid.
+3. Run `node /absolute/path/to/splash-mcp/dist/index.js` manually. It should print `[splash] splash v0.1.0 running on stdio`. A `[splash] fatal: Internal Splash error` line at startup usually means a `SPLASH_*` value is invalid; see [Configuration](#configuration) for how to find which one.
 
 **The backend is not running.** `splash_task` returns:
 
@@ -576,7 +590,14 @@ Stop the competing runtime, or wait. Then retry with `splash_refine` on the same
 
 **Stale base.** Your working tree changed the editable files after the session started. Restore them and refine again, or `splash_close` and start a new task. Never auto-apply a stale patch.
 
-**`needs_split`.** The editable files are too large for the runtime's context window plus the minimum output reserve. Nothing was sent to the model. Close the session (it exports an empty patch), then delegate smaller tasks with fewer editable files. `split_hint.pressure_files` names the largest files.
+**`needs_split`.** The required prompt plus the output reserve does not fit the context window, so nothing was sent to the model. Each part of the required prompt has its own remedy:
+
+- **Editable files.** Select fewer or smaller files and split the work across several sessions. `split_hint.pressure_files` names up to eight of the largest.
+- **Task text.** Shorten it.
+- **Pinned project rules.** Shrink the root `CLAUDE.md` / `AGENTS.md`, or pass shorter caller-supplied rules in `options.rules`, which replace the files.
+- **On refine, the current feedback and latest validation verdict.** Shorten the feedback, or start a new session, which has no history.
+
+The task, editable files and rules are pinned when the session is created, so a refine cannot shrink them. In that case, close the session and start new, smaller sessions; the patch is empty if nothing was generated yet. Also make sure a forced `context_tier` or a large `output_reserve_tokens` is not taking up the room.
 
 **`max_rounds`.** After `SPLASH_MAX_ROUNDS` generated rounds, the next `splash_refine` returns `max_rounds` without running the model. Calling `splash_refine` again continues explicitly. The acknowledgement survives restarts.
 
