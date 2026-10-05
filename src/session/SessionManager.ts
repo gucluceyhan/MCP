@@ -28,7 +28,7 @@
  * yeniden başlatması bir açık oturumu GEÇERSİZ KILMAZ — oturum yalnız diski
  * doğrulanabilir + yeniden kurulabilir olduğunda geçerlidir.
  *
- * Güvenlik (spec 12/17): `SessionError.message` SABİТ + KISAdır; kalıcı
+ * Güvenlik (spec 12/17): `SessionError.message` SABİT + KISAdır; kalıcı
  * içerik ASLA loglanmaz; teknik detay (`cause`) yalnız geliştirici kanalıdır.
  */
 
@@ -273,14 +273,14 @@ export interface ActiveSessionInfo {
 
 // ── Sabit güvenli metinler ───────────────────────────────────────────────────
 
-/** `needs_split` turunun SABİТ compact özeti (spec 26/52/93). */
+/** `needs_split` turunun SABİT compact özeti (spec 26/52/93). */
 const NEEDS_SPLIT_SUMMARY =
   "The required context exceeds the context budget; the task was not started. Split the task into smaller file groups.";
 
-/** `inference_busy` turunun SABİТ compact özeti (spec 37/137). */
+/** `inference_busy` turunun SABİT compact özeti (spec 37/137). */
 const INFERENCE_BUSY_SUMMARY = "Inference is temporarily unavailable; no worker generation was run.";
 
-/** `max_rounds` guardrailinin SABİТ compact özeti (spec 64). */
+/** `max_rounds` guardrailinin SABİT compact özeti (spec 64). */
 const MAX_ROUNDS_SUMMARY = "The maximum refinement rounds were reached; no refinement was run.";
 
 /**
@@ -1577,7 +1577,7 @@ export class SessionManager {
 
   /**
    * `max_rounds` guardraili sonucu (spec 60-65/208): inference YOK, tur
-   * YOK, oturum AÇIK. Son outcome metadata'sı + SABİТ uyarı;
+   * YOK, oturum AÇIK. Son outcome metadata'sı + SABİT uyarı;
    * acknowledgement kalıcılaşır (spec 61-62).
    */
   #maxRoundsResult(session: PersistedSession): CompactResult {

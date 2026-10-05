@@ -51,7 +51,7 @@
  *   11. `messages` = ölçülen mesajların KENDİSİ — dispatch byte-bayt aynen
  *      onu taşır (`context.input_tokens` = bu tam ölçü, `usage.in` ASLA değil).
  *
- * Uyarılar SABİТ sözlüktür (kaynak/secret/path/komut YOK) — yalnız olay
+ * Uyarılar SABİT sözlüktür (kaynak/secret/path/komut YOK) — yalnız olay
  * türü bildirilir.
  */
 
@@ -396,7 +396,7 @@ export class ContextAssembler {
     // ── 5) salt-okunur bloklar (canlı ana ağaç — ContextFs) ──────────────
     // ÖNCE kanonik normalize (BLOCKER 1) + DEDUPE + sort. `normalizeRepoPath`
     // `null` → yol GÜVENLİ DEĞİL (`.git`, `..`, mutlak, backslash, NUL, UNC)
-    // → `unsafe_path` (SABİТ mesaj; ham yol yüzeye KATILMAZ). Alias'lar
+    // → `unsafe_path` (SABİT mesaj; ham yol yüzeye KATILMAZ). Alias'lar
     // (`src/./a.ts` ≡ `src//a.ts` ≡ `src/a.ts`) TEK kanonik yol → TEK blok.
     const readonlySeen = new Set<string>();
     const orderedReadonly: string[] = [];

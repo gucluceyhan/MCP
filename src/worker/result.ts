@@ -21,7 +21,7 @@
  *    bunlar Splash'ın kendisinin ürettigi (step 6+) olgularıdır; bu
  *    dosyada yalnızca ilerideki kompozisyon için tipler tanımlıdır.
  *
- * Güvenlik disiplini (DESIGN.md bölüm 9): parser hata mesajları SABIТ
+ * Güvenlik disiplini (DESIGN.md bölüm 9): parser hata mesajları SABIT
  * ve KISAdır — şema konumu (`edits[2].operations[0].search ...`) taşınır,
  * worker yükü (search/replace metni, dosya içeriği, yol, kurallar) ASLA
  * taşınmaz. MCP hata yolları kaynak kod sızıntı kanalı olamaz.
@@ -36,7 +36,7 @@ import type { InferenceConflict } from "../backend/InferenceCoordinator.js";
  * - `invalid_input`  → WorkerContract girdi doğrulaması (prompt inşası).
  * - `invalid_output` → worker çıktısının şema doğrulaması (parser).
  *
- * `message` her zaman SABİТ bir cümledir: durum + (gerekirse) şema
+ * `message` her zaman SABİT bir cümledir: durum + (gerekirse) şema
  * konumu. Worker ürettiği metin, ham model çıktısı, proje kuralları,
  * dosya içeriği, görev metni, search/replace metni — hiçbiri mesajda
  * ASLA yer almaz. `cause` ASLA bağlanmaz: V8 `SyntaxError` mesajı
@@ -188,7 +188,7 @@ export function parseWorkerResult(raw: string): WorkerResult {
   // Not: `fail` bilinçli olarak FONKSİYON DEKLARASYONU (const ok değil) —
   // bu TypeScript sürümünde const ok `never` çağrısı, guard kolundaki
   // akışı tip seviyesinde SONLANDIRMADIĞI için daraltma bozuluyor.
-  // (`message` her zaman SABİТ — worker payload'ı asla taşınmaz.)
+  // (`message` her zaman SABİT — worker payload'ı asla taşınmaz.)
   function fail(message: string): never {
     throw new WorkerContractError("invalid_output", message);
   }
@@ -201,7 +201,7 @@ export function parseWorkerResult(raw: string): WorkerResult {
   // boşlukları kabul eder; düz metin (önce/sonra), Markdown çiti ve
   // bozuk sözde-bilgi `JSON.parse` ile zaten başarısız olur. V8
   // `SyntaxError` mesajı girdi snippet'i taşır — yaygınlaştırmak YASAK;
-  // her iki red için SABİТ güvenli mesaj.
+  // her iki red için SABİT güvenli mesaj.
   //
   // Not: `parsed` bilinçli olarak `Record<string, unknown>` tipinde
   // (düşük `unknown`) — `let` değişkeninin daraltması closure'larda

@@ -7,7 +7,7 @@
  * sözlüğü paylaşır; `wire.ts` `serializeToolError` bunu tanıyarak
  * yalnız `kind` + sabit `message`'i yüzeye taşır (`cause` ASLA — spec 12/13).
  *
- * `message` her zaman KISA ve SABİТtir: ham JSON, kural içeriği, worker
+ * `message` her zaman KISA ve SABİTtir: ham JSON, kural içeriği, worker
  * patch'i, mutlak özel yol, git stderr, errno detayı ASLA mesajda YOK.
  * Teknik detay (`cause`) yalnız geliştirici kanalıdır.
  */

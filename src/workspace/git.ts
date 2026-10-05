@@ -22,7 +22,7 @@
  * verilir (proje git config'i ASLA değiştirilmez — spec 25/67).
  *
  * Hata disiplini: hata durumunda `WorkspaceError("git_operation_failed")`
- * fırlatılır; `message` SABİТtir, ham stderr yalnız `cause`'ta (iç kanal)
+ * fırlatılır; `message` SABİTtir, ham stderr yalnız `cause`'ta (iç kanal)
  * durur — asla MCP yüzeyine taşınmaz (DESIGN.md bölüm 9).
  */
 
@@ -355,7 +355,7 @@ function safeCauseDetail(stderr: Buffer, code: number | null): { stderr: string;
  * - argv: `config` çiftleri (`-c`) + alt komut + argümanlar — her biri ayrı girdi.
  * - stdout Buffer olarak toplanır (binary güvenli).
  * - Başarısız çıkış / spawn hatası / zaman aşımı → `WorkspaceError`
- *   (`git_operation_failed`, SABİТ message; detay `cause`'ta).
+ *   (`git_operation_failed`, SABİT message; detay `cause`'ta).
  */
 export function runGit(args: readonly string[], options: GitRunOptions): Promise<GitRunResult> {
   const gitArgs: string[] = [];
@@ -410,7 +410,7 @@ export function runGit(args: readonly string[], options: GitRunOptions): Promise
     timer.unref();
 
     child.on("error", (err: NodeJS.ErrnoException) => {
-      // Örn. git ikili yok (ENOENT) — ham detay `cause`'ta, mesaj SABİТ.
+      // Örn. git ikili yok (ENOENT) — ham detay `cause`'ta, mesaj SABİT.
       if (err.code === "ENOENT") {
         fail(new Error("git executable not found"));
       } else {

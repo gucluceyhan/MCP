@@ -3863,7 +3863,7 @@ test("recovery: lstat error (non-ENOENT) on the persisted dir fails closed with 
 
     // Kalıcı `workspaceDir` bir DÜZENLİ DOSYA'nın altına yönlendirilir:
     // `lstat` deterministik NON-ENOENT (ENOTDIR) verir. Yalnız ENOENT "yok"
-    // sayılır; diğer hata fail-closed SABİТ güvenli mesajla red.
+    // sayılır; diğer hata fail-closed SABİT güvenli mesajla red.
     await writeFile(anonFile, "file\n");
     const tampered = { ...state, workspaceDir: path.join(anonFile, "inner") } as WorkspaceRecoveryState;
 

@@ -5,7 +5,7 @@
  * Çiviler:
  * - bilinen secret aileleri (API anahtarı, private key, certificate, bearer,
  *   URL userinfo, credential ataması, e-posta, telefon) redakte edilir;
- * - placeholder'lar DETERMİNİSTİK + SABİТtir (kaynak değer ASLA kalmaz);
+ * - placeholder'lar DETERMİNİSTİK + SABİTtir (kaynak değer ASLA kalmaz);
  * - redaksiyon İDEMPOTAN ve DETERMİNİSTİK (aynı girdi → aynı çıktı);
  * - masum içerik (kod, yollar, normal metin) DEĞİŞMEZ (yanlış pozitif yok);
  * - secret dosya SINIFLANDIRMASI: `.env` ailesi / anahtar uzantıları /
