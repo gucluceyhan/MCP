@@ -8,7 +8,7 @@ Let a frontier coding agent hand scoped implementation work to a local LLM, with
 
 ## What is Splash MCP?
 
-Splash MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server (stdio). A frontier orchestrator such as Claude Code or OpenAI Codex uses it to send well-scoped implementation tasks to a model running on your own machine. The local model gets only the files the orchestrator selects, after secret redaction. It returns a structured patch, and Splash validates that patch and applies it inside an isolated Git worktree. The orchestrator does not get the generated source back. It gets compact review metadata: status, summary, changed files and diff statistics. It reads the actual diff only when it chooses to. So frontier tokens go to reviewing the work, not to generating code. When the orchestrator accepts the result, Splash exports a patch file and the orchestrator applies it with `git apply`. The local model never gets a shell, Git, or filesystem access, and Splash never writes to your working tree.
+Splash MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server (stdio). A frontier orchestrator such as Claude Code or OpenAI Codex uses it to send well-scoped implementation tasks to a model running on your own machine. The local model gets only the files the orchestrator selects, plus the repository's root `CLAUDE.md` / `AGENTS.md` as project rules (unless the caller supplies its own rules), all after secret redaction. It returns a structured patch, and Splash validates that patch and applies it inside an isolated Git worktree. The orchestrator does not get the generated source back. It gets compact review metadata: status, summary, changed files and diff statistics. It reads the actual diff only when it chooses to. So frontier tokens go to reviewing the work, not to generating code. When the orchestrator accepts the result, Splash exports a patch file and the orchestrator applies it with `git apply`. The local model never gets a shell, Git, or filesystem access, and Splash never writes to your working tree.
 
 Terminology used in this document:
 
@@ -26,7 +26,7 @@ Each item below matches a design decision in [DESIGN.md](DESIGN.md) and is imple
 
 - **Never writes to your repository.** Edits happen only in a dedicated Git worktree under `<outputRoot>/sessions/<session-id>/workspace` (default `~/.splash/...`). Splash has no apply operation. It does not modify your working tree, index, branches or refs.
 - **Never applies its own patch.** `splash_close` exports the patch to a file outside the repository. Applying it is up to the orchestrator, or you.
-- **Code reaches the orchestrator only on request.** `splash_task`, `splash_refine` and `splash_close` return metadata only. `splash_diff` is the only tool that returns generated content, and only when it is called.
+- **Generated code reaches the orchestrator only on request.** `splash_task`, `splash_refine` and `splash_close` return metadata: status, changed files, diff statistics and a short worker-written `summary`. The summary is redacted but not otherwise restricted, so a model could still put code in it. `splash_diff` is the only tool that returns the generated diff, and only when it is called.
 - **Secrets stay out of the prompt.** Before anything is sent to the model, Splash redacts common secret patterns and personal data (see [Safety model](#safety-model)). Files classified as secret files (for example `.env`, `*.pem`, `id_rsa`, `credentials.*`) are replaced by a placeholder entirely. The worker cannot write a redaction placeholder back into a file.
 - **Project rules are passed explicitly.** Splash resolves the rules once per session: either rules supplied by the caller, or the root `CLAUDE.md` / `AGENTS.md`. It pins them into every worker prompt. Responses never include the rules content, only a `rules_source` label.
 - **Structural patch validation.** Each edit is checked before it touches the worktree: the target must be in the editable set or be a new file, each `search` must match the base exactly once, and edits must not overlap. Rejected edits are reported and never applied.
@@ -118,12 +118,14 @@ Note: the root `CLAUDE.md` / `AGENTS.md` are also sent to the local worker as pr
 
 ### 5. Apply the result
 
-`splash_close` returns an absolute `patch_path`. If `base_status` is `"fresh"`, apply the patch from the repository root:
+`splash_close` returns an absolute `patch_path`. If `diff_stats.files` is `0`, the patch is empty and there is nothing to apply (plain `git apply` rejects an empty patch with `No valid patches in input`). Otherwise, if `base_status` is `"fresh"`, apply the patch from the repository root:
 
 ```sh
 git apply --check /Users/you/.splash/patches/<repo-id>/<session-id>.patch
 git apply /Users/you/.splash/patches/<repo-id>/<session-id>.patch
 ```
+
+Scripts that apply patches unconditionally can pass `--allow-empty` to both commands.
 
 If `base_status` is `"stale"`, do **not** apply the patch automatically. See [Stale base](#stale-base).
 
@@ -329,7 +331,7 @@ Returns the generated changes of an open session. This is the only tool that ret
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `session_id` | string | yes | Open session to inspect. |
-| `files` | string[] | no | Restrict the diff to these literal repository-relative paths. |
+| `files` | string[] | no | Restrict the diff to these literal repository-relative paths. An empty array is treated like an omitted filter and returns the whole diff. |
 | `stat` | boolean | no | If `true`, return statistics only, with no source. |
 
 - **Default:** the unified diff of the whole session worktree against its immutable base, with 3 lines of context, as raw text. Returns an empty string if nothing changed.
