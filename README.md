@@ -65,7 +65,7 @@ curl -s http://127.0.0.1:8000/status
 curl -s http://127.0.0.1:8000/v1/models
 ```
 
-Splash MCP requires `/status` to report `"ready": true` and a positive `maximum_context_tokens`. It also requires `/v1/models` to list the configured model id exactly.
+Splash MCP requires `/status` to report `"ready": true`, a positive `maximum_context_tokens`, and an `instance.pid` (a safe integer greater than 1). It also requires `/v1/models` to list the configured model id exactly. The Splash engine provides all of these. A backend without `instance.pid` passes the other checks, but every task returns `inference_busy` with `conflict: "unknown"`, because Splash cannot tell the runtime apart from a competing process.
 
 ### 2. Build Splash MCP
 
@@ -259,7 +259,8 @@ Before every `splash_refine` and at `splash_close`, Splash compares the live edi
 
 - Every tool returns one text content item.
 - `splash_task`, `splash_refine` and `splash_close` return a JSON object. `splash_diff` returns raw diff text, or JSON when `stat: true`.
-- On failure, a tool returns `isError: true` and a JSON body:
+- Arguments that fail the input schema (for example an empty `task` or `feedback`, a missing required field, or an unknown field on `splash_diff` / `splash_close`) are rejected by the MCP SDK before the tool runs. Those errors carry the SDK's own validation text, not the JSON shape below.
+- Every other failure returns `isError: true` and a JSON body:
 
   ```json
   { "kind": "session_not_found", "message": "The session was not found" }
@@ -532,7 +533,7 @@ Splash is a **local developer tool** that runs under your own OS account. Its go
 
 | `kind` | Meaning |
 |--------|---------|
-| `invalid_input` | An argument violates the tool contract. Examples: empty `task`/`feedback`, unsafe path, malformed `session_id`, `context_tier` above the runtime maximum, `output_reserve_tokens` below the minimum. |
+| `invalid_input` | An argument passes the input schema but violates the tool contract. Examples: unsafe path, malformed `session_id`, `context_tier` above the runtime maximum, `output_reserve_tokens` below the minimum. An empty `task` / `feedback` is rejected earlier by schema validation (see [Conventions](#conventions)). |
 | `invalid_repository` | The repository cannot be used. Causes: not a Git working tree, no `HEAD` commit, `SPLASH_REPO_ROOT` does not exist, an external Git filter (for example LFS), an unsupported partial-clone Git version, or an editable path whose existence or type in your working tree differs from what Git checked out (for example a sparse checkout). |
 | `unsafe_path` | A path escapes the repository, targets `.git`, or passes through an unsafe symlink. |
 | `git_operation_failed` | A Git command failed (for example on a Git release without `check-attr --source`). |
