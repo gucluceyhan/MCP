@@ -4662,3 +4662,65 @@ test("every promisor form git itself honors is gated on an unprotected git: two-
     assert.equal(await lstat(workspaceDir).catch(() => null), null, `${label}: no worktree is created`);
   }
 });
+
+test("a promisor remote that becomes visible only inside linked worktrees through a repository-local includeIf is gated on an unprotected git; a protected git creates (includeIf)", async () => {
+  // Ana repo bağlamında `gitdir:**/.git/worktrees/**` eşleşmediği için promisor
+  // görünmez; bağlı worktree bağlamında görünür. Kapı bu yüzden repo-yerel
+  // include yönergesini promisor sayar: korumasız git → red, korumalı git → oluşturulur.
+  const fixture = await buildPlainRepo("inc-gitdir");
+  await appendFile(path.join(fixture.repo, ".git", "promisor.inc"), '[remote "x"]\n\tpromisor = true\n\turl = file:///nonexistent\n');
+  await appendFile(path.join(fixture.repo, ".git", "config"), '[includeIf "gitdir:**/.git/worktrees/**"]\n\tpath = promisor.inc\n');
+  assert.ok(!/^remote\.x\.promisor=/m.test(await gitText(fixture.repo, ["config", "--list"])), "fixture: the promisor is invisible from the main repository context");
+  assert.ok(
+    (await gitText(fixture.repo, ["config", "--local", "--list"])).split("\n").some((line) => line.startsWith("includeif.")),
+    "fixture: includeIf directive set",
+  );
+  const input = (sessionId: string): WorkspaceCreateInput => ({
+    repoRoot: fixture.repo,
+    workspaceDir: path.join(fixture.out, "ws", sessionId),
+    sessionId,
+    editablePaths: ["f.txt"],
+    readonlyPaths: [],
+  });
+
+  // Korumasız git (sahte 2.43.0): oluşum red. Ayrı dizin ŞART: sürüm önbelleği `PATH` anahtarlı.
+  const old = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () =>
+    settle(() => createGitWorktreeWorkspace(input("s-inc-old"))),
+  );
+  if (old.value !== null) {
+    await old.value.destroy().catch(() => undefined);
+  }
+  assert.ok(old.error instanceof WorkspaceError, `expected WorkspaceError, got ${String(old.error)}`);
+  assert.equal(old.error.kind, "invalid_repository");
+  assert.equal(
+    old.error.message,
+    "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)",
+  );
+  assert.equal(await lstat(path.join(fixture.out, "ws", "s-inc-old")).catch(() => null), null, "no worktree is created");
+
+  // Korumalı git (sahte 2.45.1): davranış değişmez — oluşturulur. Ayrı dizin (sürüm önbelleği `PATH` anahtarlı).
+  await withFakeGitVersion(path.join(fixture.out, "v2.45.1"), "git version 2.45.1", async () => {
+    const modern = await createGitWorktreeWorkspace(input("s-inc-modern"));
+    await modern.destroy();
+  });
+});
+
+test("a promisor remote hidden behind an includeIf in .git/config.worktree (extensions.worktreeConfig) is gated on an unprotected git (includeIf, config.worktree)", async () => {
+  // Yönerge `.git/config`'te değil `.git/config.worktree`'de (extensions.worktreeConfig);
+  // `git worktree add` bu dosyayı yeni worktree'ye kopyalar. Kapı `worktree` kapsamındaki
+  // include yönergesini de promisor sinyali sayar: korumasız git → red.
+  const fixture = await buildPlainRepo("inc-wtconfig");
+  await gitOk(fixture.repo, ["config", "extensions.worktreeConfig", "true"]);
+  await appendFile(path.join(fixture.repo, ".git", "promisor.inc"), '[remote "x"]\n\tpromisor = true\n\turl = file:///nonexistent\n');
+  await appendFile(path.join(fixture.repo, ".git", "config.worktree"), '[includeIf "gitdir:**/.git/worktrees/**"]\n\tpath = ../../promisor.inc\n');
+  assert.ok(!/^remote\.x\.promisor=/m.test(await gitText(fixture.repo, ["config", "--list"])), "fixture: the promisor is invisible from the main repository context");
+  assert.ok(!(await gitText(fixture.repo, ["config", "--local", "--list"])).split("\n").some((line) => line.startsWith("include")), "fixture: .git/config itself has no include directive");
+  const sessionId = "s-inc-wtconfig";
+  const workspaceDir = path.join(fixture.out, "ws", sessionId);
+  const result = await withFakeGitVersion(path.join(fixture.out, "v2.43.0"), "git version 2.43.0", () => settle(() => createGitWorktreeWorkspace({ repoRoot: fixture.repo, workspaceDir, sessionId, editablePaths: ["f.txt"], readonlyPaths: [] })));
+  if (result.value !== null) { await result.value.destroy().catch(() => undefined); }
+  assert.ok(result.error instanceof WorkspaceError, `expected WorkspaceError, got ${String(result.error)}`);
+  assert.equal(result.error.kind, "invalid_repository");
+  assert.equal(result.error.message, "Partial clone repositories require a Git release that honors GIT_NO_LAZY_FETCH (2.45.1+ or a patched maintenance release)");
+  assert.equal(await lstat(workspaceDir).catch(() => null), null, "no worktree is created");
+});
