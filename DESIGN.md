@@ -894,9 +894,14 @@ the two-level `remote.promisor` / `remote.partialCloneFilter` forms count
 too, because git turns them into a promisor with an empty name) is
 rejected at workspace creation and recovery (`invalid_repository`), because
 a lazy fetch could run repository-configured transport programs on the
-host. The tracked delta (`git diff <sha> … --`) is captured against the
-**resolved** HEAD commit the worktree is created from, never the symbolic
-`HEAD` (a commit landing in between cannot skew the base).
+host. On such a git, a repository whose repository-local config (`.git/config`,
+or `.git/config.worktree` when `extensions.worktreeConfig` is on) contains
+any `include.*` or `includeIf.*` directive is rejected the same way: a
+conditional include (for example `gitdir:`) can make a promisor remote
+visible only inside the linked worktree, where the main-repository check
+cannot see it. The tracked delta (`git diff <sha> … --`) is captured
+against the **resolved** HEAD commit the worktree is created from, never
+the symbolic `HEAD` (a commit landing in between cannot skew the base).
 
 **Selected-path symlink policy (required, fail-closed).** When copying
 selected untracked files (step 4), the source path in the main working
