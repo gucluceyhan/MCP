@@ -16,7 +16,7 @@
  *   (ENOENT ≠ EACCES/EIO/...) enjekte edebilir.
  *
  * Güvenlik disiplini (DESIGN.md §9): `ContextAssemblyError.message` KISA
- * ve SABİТtir — dosya içeriği, secret, yol detayı, ham I/O çıktısı ASLA
+ * ve SABİTtir — dosya içeriği, secret, yol detayı, ham I/O çıktısı ASLA
  * mesajda yer almaz; teknik detay yalnız `cause` (geliştirici kanalı).
  */
 
@@ -117,7 +117,7 @@ export type ContextAssemblyErrorKind =
   | "assembly_failed";
 
 /**
- * Bağlam katmanının tip'li hatası. `message` SABİТtir (kaynak/cause/stderr
+ * Bağlam katmanının tip'li hatası. `message` SABİTtir (kaynak/cause/stderr
  * YOK); `cause` yalnız geliştirici log kanalına aittir (DESIGN.md §9).
  */
 export class ContextAssemblyError extends Error {
@@ -232,7 +232,7 @@ export interface ContextAssemblyReady {
   selectedTierTokens: number;
   /** Salt-okunur referans bağlam azaltıldı mı? */
   truncatedReadonlyContext: boolean;
-  /** SABİТ sözlük uyarılar (kaynak/secret/path YOK). */
+  /** SABİT sözlük uyarılar (kaynak/secret/path YOK). */
   warnings: string[];
 }
 

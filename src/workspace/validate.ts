@@ -19,7 +19,7 @@
  *   — çakışan GRUPTAKİ TÜM düzenlemeler reddedilir; sonuç worker düzenleme
  *   SIRASINA bağımlı DEĞİLDİR (spec 46/47).
  *
- * Red nedenleri (spec 41): SABİТ, deterministik sözlük — search/replace
+ * Red nedenleri (spec 41): SABİT, deterministik sözlük — search/replace
  * metni, dosya içeriği, kaynak snippet'i ASLA nedende yer almaz. Güvenli
  * repository-göreceli yol `file`'da taşınabilir; path-güvenliğinden
  * GEÇEMEMEŞSİZ (potansiyelce keyfi metin) yollar `<invalid-path>` yer
@@ -84,7 +84,7 @@ export interface WorkspaceValidation {
 
 /**
  * Reddeder neden sözlüğü (spec 41 — testler bu dizgeleri pin'ler).
- * Hepsi SABİТtir; worker verisi (search/replace/içerik/yol) taşımaz.
+ * Hepsi SABİTtir; worker verisi (search/replace/içerik/yol) taşımaz.
  * `search`/`match` nedenlerinde güvenli tek ekleme: operasyon indeksi.
  */
 export const REJECTION_REASONS = {

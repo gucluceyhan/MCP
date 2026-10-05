@@ -4,7 +4,7 @@
  * Disiplin:
  * - SAF string → string: model/NLP/rastgelelik/saat YOK; aynı girdi her
  *   zaman aynı çıktı.
- * - SABİТ placeholder sözlüğü; HER geçiş güçsüz (idempotent): placeholder
+ * - SABİT placeholder sözlüğü; HER geçiş güçsüz (idempotent): placeholder
  *   çıktıları hiçbir geçişin (kendi dahil) desenine tekrar eşleşmez →
  *   yeniden uygulama kimliktir (testlenir).
  * - Yalnız doğrusal desenler (iç içe nicel gösteren geri tarama tuzağı

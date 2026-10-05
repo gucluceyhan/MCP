@@ -14,7 +14,7 @@
  * `.git`'in bayt-bayt dokunulmadığı iddia EDİLEMEZ (worktree yönetimi oraya yazar).
  *
  * Hata disiplini (Step 5 spec 8, DESIGN.md bölüm 9): `message` her zaman KISA
- * ve SABİТtir — kaynak dosya içeriği, search/replace metni, patch içeriği,
+ * ve SABİTtir — kaynak dosya içeriği, search/replace metni, patch içeriği,
  * ham git stdout/stderr, worker çıktısı ASLA mesajda yer almaz. Teknik detay
  * (`cause`) yalnızca geliştirici kanalıdır ve gelecekteki MCP sonuçlarına
  * otomatik taşınmaz.

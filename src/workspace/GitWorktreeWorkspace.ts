@@ -2975,7 +2975,7 @@ export async function restoreGitWorktreeWorkspace(
  * Diğer her hata (EACCES/EIO/ELOOP/ENOTDIR/...) "bilinmeyen durum"dur ve
  * fail-closed: durum doğrulanamayan dizin ASLA yokmuş gibi işlenemez — yok
  * saymak, sonradaki yıkıcı işlemleri (remove/rm/recreate) doğrulanmamış bir
- * hedefe yürütürdü. Hata SABİТ güvenli mesajla WorkspaceError'a çevrilir
+ * hedefe yürütürdü. Hata SABİT güvenli mesajla WorkspaceError'a çevrilir
  * (yol/errno/İÇERİK mesajda YOK).
  */
 async function lstatWorkspaceDirectory(target: string): Promise<Stats | null> {

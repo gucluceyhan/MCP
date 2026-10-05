@@ -15,7 +15,7 @@
  * - fail-closed: symlink/dizin/FIFO → hata (ASLA "yok" DEĞİL); ENOENT
  *   YALNIZ "yoktur"; diğer errno (EACCES/EIO/...) + realpath başarısızlığı
  *   → hata; fallback YOK; invalid UTF-8 → hata (replacement karakter YOK)
- * - tip'li hata: tek kind + SABİТ güvenli mesaj (yol/içerik/errno YOK);
+ * - tip'li hata: tek kind + SABİT güvenli mesaj (yol/içerik/errno YOK);
  *   `cause` yalnız geliştirici kanalı
  * - stateless: çağrı arası cache YOK; eşzamanlı çözümler bağımsız
  * - çağrı yüzeyi: yalnız realpath/lstat/readFile (git/yazma YOK)

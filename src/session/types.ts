@@ -15,7 +15,7 @@
  * başlatıldığında açık bir oturum GEÇERSİZ KILINMAZ (spec 8); yalnız diski
  * doğrulanabilir ve yeniden kurulabilir bir oturum geçerlidir.
  *
- * Güvenlik disiplini (spec 12/17): `SessionError.message` SABİТ ve KISAdır —
+ * Güvenlik disiplini (spec 12/17): `SessionError.message` SABİT ve KISAdır —
  * ham JSON, kural içeriği, worker patch'i, mutlak özel yol, git stderr, errno
  * detayı ASLA mesajda YOK. Teknik detay (`cause`) yalnız geliştirici kanalıdır
  * ve `serializeToolError` yalnız kind + message taşır, cause ASLA gitmez.
@@ -51,14 +51,14 @@ export type SessionSchemaVersion = typeof SESSION_SCHEMA_VERSION | typeof LEGACY
 // ── Sabit güvenli metinler (spec 42/408) ─────────────────────────────────────
 
 /**
- * `stale_base` turunun SABİТ compact özeti (spec 42): taban sürüklenmiş,
+ * `stale_base` turunun SABİT compact özeti (spec 42): taban sürüklenmiş,
  * rafine yürütülmedi. Kaynak içerik, dosya, secret, yol YOK — yalnız durum.
  */
 export const STALE_BASE_SUMMARY =
   "The session base changed in the main working tree; no refinement was run.";
 
 /**
- * `max_rounds` guardrailinin SABİТ uyarısı (spec 408): guardrail işini
+ * `max_rounds` guardrailinin SABİT uyarısı (spec 408): guardrail işini
  * yaptı; devam için çağrı tarafının BİLİNÇLİ yeniden çağrısı gerekir
  * (acknowledgement — spec 61). İçerik/geri bildirim YOK.
  */
@@ -188,7 +188,7 @@ export type SessionErrorKind =
   | "session_operation_failed"
   | "session_conflict";
 
-/** Tür başına SABİТ güvenli mesaj — hiçbir alan/yol/errno/içerik taşımaz. */
+/** Tür başına SABİT güvenli mesaj — hiçbir alan/yol/errno/içerik taşımaz. */
 const SESSION_ERROR_MESSAGES: Record<SessionErrorKind, string> = {
   session_not_found: "The session was not found",
   session_corrupt: "The session state is corrupt and cannot be recovered",
@@ -199,7 +199,7 @@ const SESSION_ERROR_MESSAGES: Record<SessionErrorKind, string> = {
 };
 
 /**
- * Güvenli oturum hatası. `message` her zaman SABİТtir (yukarıdaki sabit
+ * Güvenli oturum hatası. `message` her zaman SABİTtir (yukarıdaki sabit
  * küme); `cause` (geliştirici kanalı) teknik detay taşır ama `serializeToolError`
  * yalnız kind + message yüzeye taşır — cause/stack/yol/stderr/JSON ASLA gitmez
  * (spec 12/13).

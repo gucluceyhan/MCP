@@ -644,7 +644,7 @@ test("112: semantic rejection → `failed` (0 applied) is a NORMAL result; works
   assert.equal(result.validation.rejected.length, 1);
   assert.equal(result.validation.rejected[0]?.file, "src/a.ts");
   assert.equal(result.validation.rejected[0]?.edit, 0);
-  assert.ok(result.validation.rejected[0]?.reason.length > 0); // SABİТ sözlük; içerik YOK
+  assert.ok(result.validation.rejected[0]?.reason.length > 0); // SABİT sözlük; içerik YOK
   assert.deepEqual(result.filesChanged, []);
   // Workspace CANLI (refine edilebilir) — imha YOK:
   assert.equal(h.service.activeTasks().length, 1);
@@ -1184,7 +1184,7 @@ test("32: context assembly fails (fault-injected) → typed error propagates; no
     })
     .catch((e: unknown) => e);
   assert.ok(err instanceof ContextAssemblyError && err.kind === "assembly_failed");
-  // `cause` (fs errno) kamu yüzeyine taşınmaz — mesaj SABİТtir:
+  // `cause` (fs errno) kamu yüzeyine taşınmaz — mesaj SABİTtir:
   assert.ok(!String(err.message).includes("EACCES"));
   // Bağlam kurulamadı → dispatch YOK:
   assert.equal(h.backend.runCalls.length, 0);
@@ -1239,7 +1239,7 @@ test("32: required context + reserve > runtime max → needs_split; no model cal
   assert.deepEqual(result.filesChanged, []);
   assert.deepEqual(result.diffStats, { files: 0, insertions: 0, deletions: 0 });
   assert.deepEqual(result.validation, { editsRequested: 0, editsApplied: 0, rejected: [] });
-  assert.ok(result.warnings.length > 0); // SABİТ needs_split uyarısı (kaynak içerik YOK)
+  assert.ok(result.warnings.length > 0); // SABİT needs_split uyarısı (kaynak içerik YOK)
   for (const warning of result.warnings) {
     assert.ok(!warning.includes("src/"), "uyarı yol taşımaz");
   }

@@ -103,7 +103,7 @@ export function serializeToolError(err: unknown): ToolErrorWire {
   if (err instanceof SplashTaskError) {
     return { kind: err.kind, message: err.message };
   }
-  // Step 9 oturum katmanı: 6 tip'li hata — hepsi SABİТ güvenli mesaj (spec 12);
+  // Step 9 oturum katmanı: 6 tip'li hata — hepsi SABİT güvenli mesaj (spec 12);
   // `cause` (teknik detay) ASLA yüzeye gitmez.
   if (err instanceof SessionError) {
     return { kind: err.kind, message: err.message };
