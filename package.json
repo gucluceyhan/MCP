@@ -4,7 +4,7 @@
   "description": "Splash — local LLM coding worker behind MCP (stdio). The frontier orchestrator delegates implementation; see DESIGN.md.",
   "private": true,
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
